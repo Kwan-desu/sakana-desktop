@@ -188,6 +188,58 @@ export default function App() {
   const [prOpen, setPrOpen] = useState(false);
   const [newWtOpen, setNewWtOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [availableUpdate, setAvailableUpdate] = useState<{
+    currentVersion: string;
+    latestVersion: string;
+    body?: string;
+  } | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+
+    tauriApi
+      .onUpdateProgress((payload) => {
+        if (cancelled) return;
+        if (payload.total && payload.total > 0) {
+          setUpdateProgress(Math.min(100, Math.round((payload.downloaded / payload.total) * 100)));
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+
+    const checkUpdates = async () => {
+      try {
+        const res = await tauriApi.checkForUpdates();
+        if (!cancelled && res.available && res.latestVersion) {
+          setAvailableUpdate({
+            currentVersion: res.currentVersion,
+            latestVersion: res.latestVersion,
+            body: res.body ?? undefined,
+          });
+        }
+      } catch {
+        // Silent background check; manual check in System tab surfaces errors
+      }
+    };
+
+    const startupTimer = window.setTimeout(checkUpdates, 3000);
+    const intervalTimer = window.setInterval(checkUpdates, 6 * 60 * 60 * 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(startupTimer);
+      window.clearInterval(intervalTimer);
+      unlisten?.();
+    };
+  }, []);
 
   const showToast = (msg: string) => {
     const firstLine =
@@ -2029,6 +2081,84 @@ export default function App() {
         harnessModels={harnessModels}
         onCreate={handleCreateWorktree}
       />
+
+      {/* Auto-Update Banner */}
+      {availableUpdate && !updateDismissed && (
+        <div
+          className="sakana-popover pop-enter fixed bottom-5 left-5 z-[80] w-[360px] rounded-[12px] p-3.5 border"
+          style={{
+            background: 'var(--bg-elevated)',
+            borderColor: 'var(--border-subtle)',
+            color: 'var(--text-main)',
+          }}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <div className="text-[12.5px] font-semibold">
+                Update Available · v{availableUpdate.latestVersion}
+              </div>
+              <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-dim)' }}>
+                Current v{availableUpdate.currentVersion} → v{availableUpdate.latestVersion}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setUpdateDismissed(true)}
+              className="text-[11px] px-1.5 py-0.5 rounded hover:opacity-80"
+              style={{ color: 'var(--text-dim)' }}
+              disabled={installingUpdate}
+            >
+              Dismiss
+            </button>
+          </div>
+          {installingUpdate && (
+            <div className="mt-2.5">
+              <div
+                className="h-1.5 w-full rounded-full overflow-hidden"
+                style={{ background: 'var(--bg-hover)' }}
+              >
+                <div
+                  className="h-full transition-all duration-150"
+                  style={{
+                    width: `${updateProgress ?? 15}%`,
+                    background: 'var(--accent)',
+                  }}
+                />
+              </div>
+              <div className="text-[10.5px] mt-1" style={{ color: 'var(--text-dim)' }}>
+                {updateProgress !== null
+                  ? `Downloading update (${updateProgress}%)...`
+                  : 'Downloading and verifying signature...'}
+              </div>
+            </div>
+          )}
+          <div className="mt-3 flex items-center justify-end gap-2">
+            <button
+              type="button"
+              disabled={installingUpdate}
+              onClick={async () => {
+                setInstallingUpdate(true);
+                setUpdateProgress(0);
+                try {
+                  await tauriApi.installUpdate();
+                } catch (err) {
+                  setInstallingUpdate(false);
+                  setUpdateProgress(null);
+                  showToast(`Update failed: ${String(err)}`);
+                }
+              }}
+              className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-medium text-white disabled:opacity-60"
+              style={{ background: 'var(--accent)' }}
+            >
+              {installingUpdate
+                ? updateProgress !== null
+                  ? `Installing ${updateProgress}%...`
+                  : 'Installing...'
+                : 'Install & Restart'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Toast */}
       {toast && (

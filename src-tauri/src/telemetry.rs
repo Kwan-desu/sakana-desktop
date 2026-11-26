@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
@@ -243,10 +243,27 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     Ok(manager.is_enabled().unwrap_or(enabled))
 }
 
+fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    let mut builder = app.updater_builder();
+    if let Some(token) = crate::platform::get_env_or_dotenv("GITHUB_TOKEN")
+        .or_else(|| crate::platform::get_env_or_dotenv("GH_TOKEN"))
+    {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            builder = builder
+                .header("Authorization", format!("Bearer {trimmed}"))
+                .map_err(|e| format!("Invalid GitHub token header: {e}"))?;
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Updater unavailable: {e}"))
+}
+
 #[tauri::command]
 pub async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckResult, String> {
     let current_version = app.package_info().version.to_string();
-    let updater = match app.updater() {
+    let updater = match build_updater(&app) {
         Ok(u) => u,
         Err(err) => {
             return Ok(UpdateCheckResult {
@@ -254,7 +271,7 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckResult, Stri
                 current_version,
                 latest_version: None,
                 body: None,
-                error: Some(format!("Updater unavailable: {err}")),
+                error: Some(err),
             });
         }
     };
@@ -286,9 +303,7 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckResult, Stri
 
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
-    let updater = app
-        .updater()
-        .map_err(|e| format!("Updater unavailable: {e}"))?;
+    let updater = build_updater(&app)?;
     let Some(update) = updater
         .check()
         .await
@@ -297,8 +312,22 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         return Err("Already on the latest version".to_string());
     };
 
+    let mut downloaded: u64 = 0;
+    let app_for_progress = app.clone();
     update
-        .download_and_install(|_, _| {}, || {})
+        .download_and_install(
+            move |chunk_length, content_length| {
+                downloaded = downloaded.saturating_add(chunk_length as u64);
+                let _ = app_for_progress.emit(
+                    "update:progress",
+                    serde_json::json!({
+                        "downloaded": downloaded,
+                        "total": content_length,
+                    }),
+                );
+            },
+            || {},
+        )
         .await
         .map_err(|e| format!("Failed to install update: {e}"))?;
     app.restart();

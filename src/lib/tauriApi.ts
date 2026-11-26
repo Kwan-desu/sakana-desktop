@@ -531,6 +531,10 @@ export const tauriApi = {
     await tauriInvoke<void>('install_update');
   },
 
+  onUpdateProgress: (
+    handler: (payload: { downloaded: number; total?: number | null }) => void,
+  ) => tauriListen<{ downloaded: number; total?: number | null }>('update:progress', handler),
+
   listHarnessModels: async (refresh?: boolean): Promise<Record<string, HarnessModelOption[]>> =>
     (await tauriInvoke<Record<string, HarnessModelOption[]>>(
       'list_harness_models',

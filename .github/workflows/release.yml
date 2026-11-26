@@ -72,6 +72,6 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'Sakana Desktop v__VERSION__'
           releaseBody: 'Cross-platform Windows (NSIS/MSI) and Linux (AppImage/DEB) release for Sakana Desktop.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

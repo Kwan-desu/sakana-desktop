@@ -1,0 +1,214 @@
+/* Sakana v2 — 4-Theme Monochrome & Editorial Token System */
+
+:root {
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* 1. Paper (Crisp Monochrome Light) */
+html[data-theme="paper"] {
+  color-scheme: light;
+  --bg-sidebar: #F4F4F5;
+  --bg-app: #FAFAFA;
+  --bg-canvas: #FFFFFF;
+  --bg-card: #FFFFFF;
+  --bg-elevated: #F4F4F5;
+  --bg-hover: #E9E9EC;
+  --border-line: rgba(23, 23, 23, 0.09);
+  --border-strong: rgba(23, 23, 23, 0.19);
+  --text-main: #171717;
+  --text-body: #525252;
+  --text-muted: #737373;
+  --accent-blue: #1D6FA5;
+  --accent-blue-bg: rgba(29, 111, 165, 0.10);
+  --accent-green: #15803D;
+  --accent-green-bg: rgba(21, 128, 61, 0.10);
+  --accent-yellow: #A16207;
+  --accent-amber: var(--accent-yellow);
+  --accent-yellow-bg: rgba(161, 98, 7, 0.11);
+  --bg-surface: var(--bg-card);
+  --accent-red: #DC2626;
+  --accent-red-bg: rgba(220, 38, 38, 0.10);
+  --accent-discord: #5865F2;
+  --accent-discord-bg: rgba(88, 101, 242, 0.10);
+  --diff-add-bg: rgba(22, 163, 74, 0.09);
+  --diff-add-gutter: #16A34A;
+  --diff-del-bg: rgba(220, 38, 38, 0.09);
+  --diff-del-gutter: #DC2626;
+  --btn-solid-bg: #171717;
+  --btn-solid-text: #FFFFFF;
+  --scrollbar-thumb: rgba(23, 23, 23, 0.16);
+  --surface-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+  --popover-shadow: 0 10px 28px rgba(0, 0, 0, 0.09);
+  --effort-med: #4F46E5;
+  --effort-high: #7C3AED;
+  --effort-high-bg: rgba(124, 58, 237, 0.09);
+  --effort-high-border: rgba(124, 58, 237, 0.28);
+  --effort-xhigh-a: #7C3AED;
+  --effort-xhigh-b: #C026D3;
+  --effort-xhigh-c: #4F46E5;
+  --effort-xhigh-bg: rgba(124, 58, 237, 0.12);
+  --effort-xhigh-border: rgba(124, 58, 237, 0.38);
+  --effort-xhigh-glow: rgba(124, 58, 237, 0.22);
+  --syn-kw: #9A4D22;
+  --syn-str: #2F6F44;
+  --syn-num: #8F3F71;
+  --syn-cmt: #85858B;
+  --syn-fn: #2A6380;
+}
+
+/* 2. Noir (Pure OLED Dark) */
+html[data-theme="noir"] {
+  color-scheme: dark;
+  --bg-sidebar: #0A0A0B;
+  --bg-app: #0E0E10;
+  --bg-canvas: #111113;
+  --bg-card: #17171A;
+  --bg-elevated: #202024;
+  --bg-hover: #29292E;
+  --border-line: rgba(237, 237, 239, 0.08);
+  --border-strong: rgba(237, 237, 239, 0.18);
+  --text-main: #EDEDEF;
+  --text-body: #A1A1AA;
+  --text-muted: #787882;
+  --accent-blue: #60A5FA;
+  --accent-blue-bg: rgba(96, 165, 250, 0.13);
+  --accent-green: #4CC38A;
+  --accent-green-bg: rgba(76, 195, 138, 0.13);
+  --accent-yellow: #EAB308;
+  --accent-amber: var(--accent-yellow);
+  --accent-yellow-bg: rgba(234, 179, 8, 0.13);
+  --bg-surface: var(--bg-card);
+  --accent-red: #E5484D;
+  --accent-red-bg: rgba(229, 72, 77, 0.13);
+  --accent-discord: #818CF8;
+  --accent-discord-bg: rgba(129, 140, 248, 0.15);
+  --diff-add-bg: rgba(76, 195, 138, 0.11);
+  --diff-add-gutter: #4CC38A;
+  --diff-del-bg: rgba(229, 72, 77, 0.12);
+  --diff-del-gutter: #E5484D;
+  --btn-solid-bg: #EDEDEF;
+  --btn-solid-text: #111113;
+  --scrollbar-thumb: rgba(237, 237, 239, 0.16);
+  --surface-shadow: none;
+  --popover-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  --effort-med: #818CF8;
+  --effort-high: #A78BFA;
+  --effort-high-bg: rgba(167, 139, 250, 0.14);
+  --effort-high-border: rgba(167, 139, 250, 0.35);
+  --effort-xhigh-a: #A855F7;
+  --effort-xhigh-b: #E879F9;
+  --effort-xhigh-c: #818CF8;
+  --effort-xhigh-bg: rgba(168, 85, 247, 0.17);
+  --effort-xhigh-border: rgba(192, 132, 252, 0.45);
+  --effort-xhigh-glow: rgba(168, 85, 247, 0.28);
+  --syn-kw: #F4A261;
+  --syn-str: #6EE7B7;
+  --syn-num: #F472B6;
+  --syn-cmt: #7A7A85;
+  --syn-fn: #7DD3FC;
+}
+
+/* 3. Slate (Linear-Inspired Cool Dark) */
+html[data-theme="slate"] {
+  color-scheme: dark;
+  --bg-sidebar: #0D1017;
+  --bg-app: #10141D;
+  --bg-canvas: #12161F;
+  --bg-card: #191F2C;
+  --bg-elevated: #212938;
+  --bg-hover: #293346;
+  --border-line: rgba(230, 237, 243, 0.09);
+  --border-strong: rgba(230, 237, 243, 0.19);
+  --text-main: #E6EDF3;
+  --text-body: #9FB0C3;
+  --text-muted: #708299;
+  --accent-blue: #7C9BFF;
+  --accent-blue-bg: rgba(124, 155, 255, 0.14);
+  --accent-green: #3FB950;
+  --accent-green-bg: rgba(63, 185, 80, 0.14);
+  --accent-yellow: #D29922;
+  --accent-amber: var(--accent-yellow);
+  --accent-yellow-bg: rgba(210, 153, 34, 0.14);
+  --bg-surface: var(--bg-card);
+  --accent-red: #F85149;
+  --accent-red-bg: rgba(248, 81, 73, 0.14);
+  --accent-discord: #8B9BFF;
+  --accent-discord-bg: rgba(139, 155, 255, 0.15);
+  --diff-add-bg: rgba(63, 185, 80, 0.12);
+  --diff-add-gutter: #3FB950;
+  --diff-del-bg: rgba(248, 81, 73, 0.13);
+  --diff-del-gutter: #F85149;
+  --btn-solid-bg: #E6EDF3;
+  --btn-solid-text: #0D1017;
+  --scrollbar-thumb: rgba(230, 237, 243, 0.16);
+  --surface-shadow: none;
+  --popover-shadow: 0 12px 32px rgba(4, 8, 18, 0.6);
+  --effort-med: #7C9BFF;
+  --effort-high: #A78BFA;
+  --effort-high-bg: rgba(167, 139, 250, 0.14);
+  --effort-high-border: rgba(167, 139, 250, 0.35);
+  --effort-xhigh-a: #A855F7;
+  --effort-xhigh-b: #E879F9;
+  --effort-xhigh-c: #7C9BFF;
+  --effort-xhigh-bg: rgba(168, 85, 247, 0.18);
+  --effort-xhigh-border: rgba(192, 132, 252, 0.45);
+  --effort-xhigh-glow: rgba(168, 85, 247, 0.30);
+  --syn-kw: #FF9E64;
+  --syn-str: #9ECE6A;
+  --syn-num: #BB9AF7;
+  --syn-cmt: #6B7B93;
+  --syn-fn: #7AA2F7;
+}
+
+/* 4. Sand (Warm Editorial Light) */
+html[data-theme="sand"] {
+  color-scheme: light;
+  --bg-sidebar: #EFECE6;
+  --bg-app: #F4F1EB;
+  --bg-canvas: #F7F5F0;
+  --bg-card: #FCFBF8;
+  --bg-elevated: #EAE5DC;
+  --bg-hover: #E2DDD2;
+  --border-line: rgba(28, 25, 23, 0.09);
+  --border-strong: rgba(28, 25, 23, 0.19);
+  --text-main: #1C1917;
+  --text-body: #57534E;
+  --text-muted: #78716C;
+  --accent-blue: #B45309;
+  --accent-blue-bg: rgba(180, 83, 9, 0.10);
+  --accent-green: #15803D;
+  --accent-green-bg: rgba(21, 128, 61, 0.10);
+  --accent-yellow: #A16207;
+  --accent-amber: var(--accent-yellow);
+  --accent-yellow-bg: rgba(161, 98, 7, 0.12);
+  --bg-surface: var(--bg-card);
+  --accent-red: #B91C1C;
+  --accent-red-bg: rgba(185, 28, 28, 0.10);
+  --accent-discord: #4F46E5;
+  --accent-discord-bg: rgba(79, 70, 229, 0.10);
+  --diff-add-bg: rgba(21, 128, 61, 0.09);
+  --diff-add-gutter: #15803D;
+  --diff-del-bg: rgba(185, 28, 28, 0.09);
+  --diff-del-gutter: #B91C1C;
+  --btn-solid-bg: #1C1917;
+  --btn-solid-text: #FCFBF8;
+  --scrollbar-thumb: rgba(28, 25, 23, 0.16);
+  --surface-shadow: 0 1px 2px rgba(28, 25, 23, 0.04);
+  --popover-shadow: 0 10px 28px rgba(28, 25, 23, 0.10);
+  --effort-med: #B45309;
+  --effort-high: #7C3AED;
+  --effort-high-bg: rgba(124, 58, 237, 0.09);
+  --effort-high-border: rgba(124, 58, 237, 0.28);
+  --effort-xhigh-a: #7C3AED;
+  --effort-xhigh-b: #C026D3;
+  --effort-xhigh-c: #B45309;
+  --effort-xhigh-bg: rgba(124, 58, 237, 0.12);
+  --effort-xhigh-border: rgba(124, 58, 237, 0.38);
+  --effort-xhigh-glow: rgba(124, 58, 237, 0.22);
+  --syn-kw: #9A3412;
+  --syn-str: #166534;
+  --syn-num: #86198F;
+  --syn-cmt: #78716C;
+  --syn-fn: #0369A1;
+}

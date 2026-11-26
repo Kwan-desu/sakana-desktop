@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 280" width="1200" height="280" role="img" aria-label="Sakana Live Multi-Harness Workflow Preview">
+  <defs>
+    <linearGradient id="demoBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070A12"/>
+      <stop offset="100%" stop-color="#0D1424"/>
+    </linearGradient>
+    <linearGradient id="barGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#818CF8"/>
+    </linearGradient>
+    <style>
+      @keyframes step1 { 0%, 4% { opacity: 0; transform: translateY(4px); } 9%, 92% { opacity: 1; transform: translateY(0); } 100% { opacity: 0; } }
+      @keyframes step2 { 0%, 18% { opacity: 0; transform: translateY(4px); } 23%, 92% { opacity: 1; transform: translateY(0); } 100% { opacity: 0; } }
+      @keyframes step3 { 0%, 36% { opacity: 0; transform: translateY(4px); } 41%, 92% { opacity: 1; transform: translateY(0); } 100% { opacity: 0; } }
+      @keyframes step4 { 0%, 54% { opacity: 0; transform: translateY(4px); } 59%, 92% { opacity: 1; transform: translateY(0); } 100% { opacity: 0; } }
+      @keyframes step5 { 0%, 72% { opacity: 0; transform: translateY(4px); } 77%, 92% { opacity: 1; transform: translateY(0); } 100% { opacity: 0; } }
+      @keyframes progressFill { 0% { width: 0px; } 78% { width: 320px; } 92% { width: 320px; } 100% { width: 0px; } }
+      @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+      .s1 { animation: step1 10s ease-out infinite; }
+      .s2 { animation: step2 10s ease-out infinite; }
+      .s3 { animation: step3 10s ease-out infinite; }
+      .s4 { animation: step4 10s ease-out infinite; }
+      .s5 { animation: step5 10s ease-out infinite; }
+      .prog { animation: progressFill 10s ease-in-out infinite; }
+      .cur { animation: blink 1s step-end infinite; }
+      @media (prefers-reduced-motion: reduce) {
+        .s1, .s2, .s3, .s4, .s5, .prog, .cur { animation: none; opacity: 1; }
+      }
+    </style>
+  </defs>
+
+  <rect x="1" y="1" width="1198" height="278" rx="16" fill="url(#demoBg)" stroke="#1E293B" stroke-width="1.5"/>
+
+  <!-- Window Chrome -->
+  <circle cx="24" cy="24" r="5" fill="#EF4444" opacity="0.85"/>
+  <circle cx="42" cy="24" r="5" fill="#F59E0B" opacity="0.85"/>
+  <circle cx="60" cy="24" r="5" fill="#22C55E" opacity="0.85"/>
+  <text x="82" y="28" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">sakana-workspace — /home/kwan/projects/sakana (main)</text>
+  <rect x="1024" y="13" width="148" height="22" rx="11" fill="#111C33" stroke="#243B66" stroke-width="1"/>
+  <text x="1040" y="28" fill="#38BDF8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5" font-weight="600">STREAM-JSON · LIVE</text>
+  <line x1="1" y1="46" x2="1199" y2="46" stroke="#1E293B" stroke-width="1"/>
+
+  <!-- Left Pane: Live Agent Stream -->
+  <g transform="translate(28, 72)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">
+    <g class="s1">
+      <text x="0" y="0" fill="#38BDF8" font-weight="700">❯</text>
+      <text x="18" y="0" fill="#F8FAFC">/verify claude Audit the streaming harness &amp; run pytest</text>
+      <rect x="458" y="-12" width="7" height="15" rx="1" fill="#38BDF8" class="cur"/>
+    </g>
+
+    <g class="s2">
+      <rect x="0" y="18" width="706" height="32" rx="8" fill="#111827" stroke="#24324B" stroke-width="1"/>
+      <text x="14" y="38" fill="#60A5FA" font-size="11.5">[Orchestrator]</text>
+      <text x="122" y="38" fill="#CBD5E1" font-size="11.5">Spawned subagent → Claude Code CLI · session resumed</text>
+    </g>
+
+    <g class="s3">
+      <rect x="0" y="60" width="706" height="32" rx="8" fill="#111827" stroke="#24324B" stroke-width="1"/>
+      <text x="14" y="80" fill="#A5B4FC" font-size="11.5">[Claude tool]</text>
+      <text x="122" y="80" fill="#CBD5E1" font-size="11.5">pytest tests/test_harness_stream.py -v  →  7 passed in 0.64s</text>
+    </g>
+
+    <g class="s4">
+      <rect x="0" y="102" width="706" height="32" rx="8" fill="#111827" stroke="#1E3A5F" stroke-width="1"/>
+      <text x="14" y="122" fill="#4ADE80" font-size="11.5">[Terminal Guard]</text>
+      <text x="138" y="122" fill="#CBD5E1" font-size="11.5">Policy: guarded · 0 blocked commands · audit logged</text>
+    </g>
+
+    <g class="s5">
+      <rect x="0" y="144" width="706" height="36" rx="8" fill="#0E1F1A" stroke="#1E4D3B" stroke-width="1"/>
+      <text x="14" y="166" fill="#4ADE80" font-size="12" font-weight="700">✓ Verified &amp; synced to Discord #sakana-dev (2.4s · 0 regressions)</text>
+    </g>
+  </g>
+
+  <!-- Vertical Divider -->
+  <line x1="762" y1="46" x2="762" y2="279" stroke="#1E293B" stroke-width="1"/>
+
+  <!-- Right Pane: Trace & Progress Inspector -->
+  <g transform="translate(788, 72)">
+    <text x="0" y="0" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700" letter-spacing="1">TRACE INSPECTOR</text>
+
+    <rect x="0" y="16" width="384" height="64" rx="10" fill="#111827" stroke="#24324B" stroke-width="1"/>
+    <text x="14" y="38" fill="#E2E8F0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" font-weight="600">Pipeline Progress</text>
+    <text x="318" y="38" fill="#38BDF8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">ACTIVE</text>
+    <rect x="14" y="52" width="320" height="8" rx="4" fill="#1E293B"/>
+    <rect x="14" y="52" width="320" height="8" rx="4" fill="url(#barGrad)" class="prog"/>
+
+    <g transform="translate(0, 96)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5">
+      <rect x="0" y="0" width="186" height="42" rx="8" fill="#111827" stroke="#24324B" stroke-width="1"/>
+      <text x="12" y="18" fill="#64748B" font-size="10">HARNESS</text>
+      <text x="12" y="34" fill="#A5B4FC">AGY → Claude</text>
+
+      <rect x="198" y="0" width="186" height="42" rx="8" fill="#111827" stroke="#24324B" stroke-width="1"/>
+      <text x="210" y="18" fill="#64748B" font-size="10">MCP TOOLS</text>
+      <text x="210" y="34" fill="#38BDF8">Ask AI Ready</text>
+
+      <rect x="0" y="52" width="186" height="42" rx="8" fill="#111827" stroke="#24324B" stroke-width="1"/>
+      <text x="12" y="70" fill="#64748B" font-size="10">DIFF CAPTURE</text>
+      <text x="12" y="86" fill="#4ADE80">+166 / -46 lines</text>
+
+      <rect x="198" y="52" width="186" height="42" rx="8" fill="#111827" stroke="#24324B" stroke-width="1"/>
+      <text x="210" y="70" fill="#64748B" font-size="10">DISCORD SYNC</text>
+      <text x="210" y="86" fill="#E2E8F0">Chunked · Live</text>
+    </g>
+  </g>
+</svg>

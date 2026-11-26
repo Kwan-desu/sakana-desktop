@@ -1,0 +1,2044 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type {
+  AttachedContextChip,
+  AutomationItem,
+  ChatMessage,
+  DashboardSubtab,
+  DiffFile,
+  DiscordStatus,
+  DiscordUserRule,
+  EnvSecret,
+  HarnessId,
+  HarnessModelOption,
+  InspectorTab,
+  McpServer,
+  PendingApproval,
+  PrimarySection,
+  Project,
+  QueuedPrompt,
+  QuotaAccount,
+  RemoteHost,
+  RemoteStatus,
+  SkillItem,
+  SystemTelemetry,
+  ThemeId,
+  Thread,
+  ToolCall,
+  TraceSpan,
+  WorkspaceFile,
+} from './types';
+import { Sidebar } from './components/Sidebar';
+import { ChatPane } from './components/ChatPane';
+import { RightInspector } from './components/RightInspector';
+import { DashboardView } from './components/DashboardView';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { CommandPalette } from './components/CommandPalette';
+import { CreatePrModal } from './components/CreatePrModal';
+import { NewWorktreeModal } from './components/NewWorktreeModal';
+import { HARNESS_META } from './components/HarnessBadge';
+import { isTauriRuntime, setActiveHost, tauriApi } from './lib/tauriApi';
+
+function formatNowTime(): string {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function upsertAssistantMessage(
+  threads: Thread[],
+  threadId: string,
+  messageId: string,
+  updater: (msg: ChatMessage) => ChatMessage,
+  threadPatch?: Partial<Thread>,
+): Thread[] {
+  return threads.map((t) => {
+    if (t.id !== threadId) return t;
+    const exists = t.messages.some((m) => m.id === messageId);
+    const messages = exists
+      ? t.messages.map((m) => (m.id === messageId ? updater(m) : m))
+      : [
+          ...t.messages,
+          updater({
+            id: messageId,
+            role: 'assistant',
+            timestamp: formatNowTime(),
+            text: '',
+          }),
+        ];
+    return {
+      ...t,
+      ...threadPatch,
+      messages,
+    };
+  });
+}
+
+function readPersistedWidth(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
+  } catch {
+    return fallback;
+  }
+}
+
+export default function App() {
+  const [theme, setTheme] = useState<ThemeId>('paper');
+  const [primarySection, setPrimarySection] = useState<PrimarySection>('chat');
+  const [dashSubtab, setDashSubtab] = useState<DashboardSubtab>('overview');
+
+  const [leftOpen, setLeftOpen] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    try {
+      const raw = window.localStorage.getItem('sakana_left_open');
+      return raw === null ? true : raw === 'true';
+    } catch {
+      return true;
+    }
+  });
+  const [rightOpen, setRightOpen] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    try {
+      const raw = window.localStorage.getItem('sakana_right_open');
+      return raw === null ? true : raw === 'true';
+    } catch {
+      return true;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('sakana_left_open', String(leftOpen));
+    } catch {
+      // ignore storage errors
+    }
+  }, [leftOpen]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('sakana_right_open', String(rightOpen));
+    } catch {
+      // ignore storage errors
+    }
+  }, [rightOpen]);
+  const [rightExpanded, setRightExpanded] = useState(false);
+  const [leftWidth, setLeftWidth] = useState<number>(() =>
+    readPersistedWidth('sakana_left_width', 272, 220, 340),
+  );
+  const [rightWidth, setRightWidth] = useState<number>(() =>
+    readPersistedWidth('sakana_right_width', 440, 360, 680),
+  );
+  const [isResizing, setIsResizing] = useState<'left' | 'right' | null>(null);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('changes');
+  const [splitView, setSplitView] = useState(false);
+
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [selectedThreadId, setSelectedThreadId] = useState<string>('');
+  const [secondaryThreadId, setSecondaryThreadId] = useState<string>('');
+  const [harnessModels, setHarnessModels] = useState<Record<string, HarnessModelOption[]>>({});
+  const [refreshingModels, setRefreshingModels] = useState(false);
+  const [disabledHarnesses, setDisabledHarnesses] = useState<HarnessId[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = window.localStorage.getItem('sakana_disabled_harnesses');
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed as HarnessId[];
+      if (parsed && typeof parsed === 'object') {
+        return (Object.keys(parsed) as HarnessId[]).filter((k) => Boolean(parsed[k]));
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [diffs, setDiffs] = useState<DiffFile[]>([]);
+  const [turnScopeFilter, setTurnScopeFilter] = useState('all');
+  const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [traces] = useState<TraceSpan[]>([]);
+
+  const [attachedChips, setAttachedChips] = useState<AttachedContextChip[]>([]);
+  const [queues, setQueues] = useState<Record<string, QueuedPrompt[]>>({});
+
+  // Dashboard state
+  const [quotas, setQuotas] = useState<QuotaAccount[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [automations, setAutomations] = useState<AutomationItem[]>([]);
+  const [discordUsers, setDiscordUsers] = useState<DiscordUserRule[]>([]);
+  const [secrets, setSecrets] = useState<EnvSecret[]>([]);
+  const [telemetry, setTelemetry] = useState<SystemTelemetry | null>(null);
+  const [discordStatus, setDiscordStatus] = useState<DiscordStatus | null>(null);
+  const [remoteStatus, setRemoteStatus] = useState<RemoteStatus | null>(null);
+  const [remoteHosts, setRemoteHosts] = useState<RemoteHost[]>([]);
+  const [activeHostId, setActiveHostId] = useState<string>('local');
+
+  // Modals & Toast
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [prOpen, setPrOpen] = useState(false);
+  const [newWtOpen, setNewWtOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+
+  const showToast = (msg: string) => {
+    const firstLine =
+      msg
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.length > 0) ?? '';
+    const clamped = firstLine.slice(0, 180);
+    setToast(clamped);
+    setTimeout(() => setToast((cur) => (cur === clamped ? null : cur)), 2600);
+  };
+
+  const bootstrapActiveHost = useCallback(async () => {
+    try {
+      const state = await tauriApi.getBootstrapState();
+      if (!state) return;
+      if (state.theme) setTheme(state.theme);
+      setProjects(state.projects || []);
+      const sessions = state.sessions || [];
+      setThreads(sessions);
+      setSelectedThreadId((prev) =>
+        sessions.some((s) => s.id === prev) ? prev : sessions[0]?.id || '',
+      );
+      setQuotas(state.accounts ?? state.quotas ?? []);
+      setMcpServers(state.mcpServers || []);
+      setSkills(state.skills || []);
+      setAutomations(state.automations || []);
+      setDiscordUsers(state.discordRules ?? state.discordUsers ?? []);
+      setSecrets(state.envSecrets ?? state.secrets ?? []);
+    } catch (err) {
+      console.error('Failed to bootstrap Tauri state:', err);
+      showToast(`Bootstrap failed: ${String(err)}`);
+    }
+  }, []);
+
+  const refreshRemoteHosts = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const hosts = await tauriApi.listRemoteHosts();
+      setRemoteHosts(hosts);
+    } catch (err) {
+      console.error('list_remote_hosts failed:', err);
+    }
+  }, []);
+
+  const handleSwitchHost = useCallback(
+    async (nextHostId: string) => {
+      const target = nextHostId || 'local';
+      setActiveHost(target);
+      setActiveHostId(target);
+      setDiffs([]);
+      setFiles([]);
+      if (isTauriRuntime()) {
+        try {
+          if (target === 'local') {
+            await tauriApi.disconnectRemoteEvents();
+          } else {
+            await tauriApi.connectRemoteEvents(target);
+          }
+        } catch (err) {
+          console.error('remote event bridge error:', err);
+        }
+      }
+      await bootstrapActiveHost();
+      try {
+        const models = await tauriApi.listHarnessModels();
+        if (models && Object.keys(models).length > 0) {
+          setHarnessModels(models);
+        }
+      } catch {
+        // ignore
+      }
+      const label =
+        target === 'local'
+          ? 'Local Machine'
+          : remoteHosts.find((h) => h.id === target)?.name || 'Remote Host';
+      showToast(`Switched host: ${label}`);
+    },
+    [bootstrapActiveHost, remoteHosts],
+  );
+
+  // Bootstrap from Tauri SQLite backend when running inside Tauri v2
+  useEffect(() => {
+    void bootstrapActiveHost();
+    void refreshRemoteHosts();
+  }, [bootstrapActiveHost, refreshRemoteHosts]);
+
+  const refreshHarnessModels = useCallback(async (refresh = false) => {
+    setRefreshingModels(true);
+    try {
+      const models = await tauriApi.listHarnessModels(refresh);
+      if (models && Object.keys(models).length > 0) {
+        setHarnessModels(models);
+      }
+      if (refresh) {
+        showToast('Refreshed harness model catalog');
+      }
+    } catch (err) {
+      console.error('list_harness_models failed:', err);
+      if (refresh) {
+        showToast(`Failed to refresh models: ${String(err)}`);
+      }
+    } finally {
+      setRefreshingModels(false);
+    }
+  }, []);
+
+  const handleToggleHarness = useCallback((hid: HarnessId) => {
+    setDisabledHarnesses((prev) => {
+      const isCurrentlyDisabled = prev.includes(hid);
+      const next = isCurrentlyDisabled ? prev.filter((h) => h !== hid) : [...prev, hid];
+      try {
+        window.localStorage.setItem('sakana_disabled_harnesses', JSON.stringify(next));
+      } catch {
+        // ignore storage errors
+      }
+      showToast(`${isCurrentlyDisabled ? 'Enabled' : 'Disabled'} ${HARNESS_META[hid].name}`);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    void refreshHarnessModels(false);
+  }, [refreshHarnessModels]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('sakana_left_width', String(leftWidth));
+    } catch {
+      // ignore storage errors
+    }
+  }, [leftWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('sakana_right_width', String(rightWidth));
+    } catch {
+      // ignore storage errors
+    }
+  }, [rightWidth]);
+
+  useEffect(() => {
+    if (!isResizing) return;
+    const onMove = (e: MouseEvent) => {
+      if (isResizing === 'left') {
+        setLeftWidth(Math.min(340, Math.max(220, e.clientX)));
+      } else {
+        setRightWidth(Math.min(680, Math.max(360, window.innerWidth - e.clientX)));
+      }
+    };
+    const onUp = () => setIsResizing(null);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [isResizing]);
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCmdOpen((v) => !v);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        setLeftOpen((v) => !v);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') {
+        e.preventDefault();
+        setRightOpen((v) => !v);
+      } else if (e.key === 'Escape') {
+        setCmdOpen(false);
+        setPrOpen(false);
+        setNewWtOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  const handleSetTheme = (nextTheme: ThemeId) => {
+    setTheme(nextTheme);
+    showToast(`Theme: ${nextTheme}`);
+    void tauriApi.setTheme(nextTheme).catch((err) => {
+      console.error('set_theme failed:', err);
+    });
+  };
+
+  const activeThread: Thread =
+    threads.find((t) => t.id === selectedThreadId) ||
+    threads[0] || {
+      id: 'empty',
+      projectId: projects[0]?.id || '',
+      title: 'No active thread',
+      status: 'IDLE',
+      harness: 'agy-cli',
+      model: HARNESS_META['agy-cli'].models[0],
+      effort: 'medium',
+      account: 'default',
+      permissionMode: 'auto-edit',
+      worktreePath: '.',
+      branch: 'main',
+      sharedDeps: [],
+      additions: 0,
+      deletions: 0,
+      timeAgo: 'now',
+      messages: [],
+    };
+  const secondaryThread =
+    threads.find((t) => t.id === secondaryThreadId && t.id !== activeThread.id) ||
+    threads.find((t) => t.id !== activeThread.id);
+  const activeProject = projects.find((p) => p.id === activeThread.projectId);
+  const effectiveCwd =
+    activeThread.worktreePath && activeThread.worktreePath !== '.'
+      ? activeThread.worktreePath
+      : activeProject?.cwd || '';
+  const pendingApprovalCount = threads.filter((t) => t.pendingApproval).length;
+
+  const refreshDiffs = useCallback(
+    async (turnId?: string) => {
+      if (!isTauriRuntime()) return;
+      if (!effectiveCwd) {
+        setDiffs([]);
+        return;
+      }
+      try {
+        const scope = turnId ?? turnScopeFilter;
+        const nextDiffs =
+          scope && scope !== 'all'
+            ? await tauriApi.getCheckpointDiff(activeThread.id, scope)
+            : await tauriApi.getGitDiffs(effectiveCwd);
+        if (nextDiffs) {
+          setDiffs(nextDiffs);
+        }
+      } catch (err) {
+        console.error('Failed to load git diffs:', err);
+      }
+    },
+    [activeThread.id, effectiveCwd, turnScopeFilter],
+  );
+
+  const refreshTelemetry = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await tauriApi.getSystemTelemetry();
+      if (next) setTelemetry(next);
+    } catch (err) {
+      console.error('get_system_telemetry failed:', err);
+    }
+  }, []);
+
+  const refreshQuotas = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await tauriApi.listQuotaAccounts();
+      if (next) setQuotas(next);
+    } catch (err) {
+      console.error('list_quota_accounts failed:', err);
+    }
+  }, []);
+
+  const refreshMcp = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await tauriApi.listMcpServers();
+      if (next) setMcpServers(next);
+    } catch (err) {
+      console.error('list_mcp_servers failed:', err);
+    }
+  }, []);
+
+  const refreshSkills = useCallback(async () => {
+    const cwd = activeProject?.cwd || '.';
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await tauriApi.listSkills(cwd);
+      if (next) setSkills(next);
+    } catch (err) {
+      console.error('list_skills failed:', err);
+    }
+  }, [activeProject?.cwd]);
+
+  const refreshAutomations = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await tauriApi.listAutomations();
+      if (next) setAutomations(next);
+    } catch (err) {
+      console.error('list_automations failed:', err);
+    }
+  }, []);
+
+  const refreshDiscordStatus = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await tauriApi.getDiscordStatus();
+      if (next) {
+        setDiscordStatus(next);
+      }
+    } catch (err) {
+      console.error('get_discord_status failed:', err);
+    }
+  }, []);
+
+  const refreshRemoteStatus = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await tauriApi.getRemoteStatus();
+      if (next) setRemoteStatus(next);
+    } catch (err) {
+      console.error('get_remote_status failed:', err);
+    }
+  }, []);
+
+  const refreshSecrets = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await tauriApi.listEnvSecrets();
+      if (next) setSecrets(next);
+    } catch (err) {
+      console.error('list_env_secrets failed:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (primarySection !== 'dashboard' || !isTauriRuntime()) return;
+    if (dashSubtab === 'overview') {
+      void refreshTelemetry();
+      const timer = setInterval(() => void refreshTelemetry(), 5000);
+      return () => clearInterval(timer);
+    }
+    if (dashSubtab === 'harnesses') {
+      void refreshQuotas();
+    } else if (dashSubtab === 'mcp') {
+      void refreshMcp();
+      void refreshSkills();
+    } else if (dashSubtab === 'automations') {
+      void refreshAutomations();
+    } else if (dashSubtab === 'discord') {
+      void refreshDiscordStatus();
+    } else if (dashSubtab === 'remote') {
+      void refreshRemoteStatus();
+      void refreshSecrets();
+      void refreshTelemetry();
+    }
+  }, [
+    primarySection,
+    dashSubtab,
+    refreshTelemetry,
+    refreshQuotas,
+    refreshMcp,
+    refreshSkills,
+    refreshAutomations,
+    refreshDiscordStatus,
+    refreshRemoteStatus,
+    refreshSecrets,
+  ]);
+
+  useEffect(() => {
+    if (rightOpen && inspectorTab === 'changes') {
+      void refreshDiffs(turnScopeFilter);
+    }
+  }, [rightOpen, inspectorTab, activeThread.id, refreshDiffs, turnScopeFilter]);
+
+  const selectedThreadIdRef = useRef(selectedThreadId);
+  selectedThreadIdRef.current = selectedThreadId;
+  const threadsRef = useRef(threads);
+  threadsRef.current = threads;
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const attachedChipsRef = useRef(attachedChips);
+  attachedChipsRef.current = attachedChips;
+  const dispatchTurnRef = useRef<(threadId: string, promptText: string) => void>(() => {});
+
+  const dispatchTurn = useCallback((threadId: string, promptText: string) => {
+    const chips = attachedChipsRef.current;
+    const attachmentBlock =
+      chips.length > 0
+        ? '\n\n' +
+          chips
+            .map((c) => {
+              if (c.kind === 'image' && c.path) return `[Attached image: ${c.path}]`;
+              if (c.kind === 'pdf' && c.path) return `[Attached pdf: ${c.path}]`;
+              if (c.kind === 'file' && c.path) return `[Attached file: ${c.path}]`;
+              return `[Attached context: ${c.label}\n${c.payload}]`;
+            })
+            .join('\n')
+        : '';
+    const fullPrompt = promptText + attachmentBlock;
+    setAttachedChips([]);
+
+    const userMsgId = `u-${Date.now()}`;
+    setThreads((prev) =>
+      prev.map((t) =>
+        t.id === threadId
+          ? {
+              ...t,
+              status: 'RUNNING',
+              timeAgo: 'now',
+              messages: [
+                ...t.messages,
+                {
+                  id: userMsgId,
+                  role: 'user',
+                  timestamp: formatNowTime(),
+                  text: fullPrompt,
+                },
+              ],
+            }
+          : t,
+      ),
+    );
+
+    if (isTauriRuntime()) {
+      void tauriApi
+        .sendTurn(threadId, fullPrompt, chips)
+        .then((messageId) => {
+          if (!messageId) return;
+          setThreads((prev) =>
+            upsertAssistantMessage(prev, threadId, messageId, (m) => m, {
+              status: 'RUNNING',
+            }),
+          );
+        })
+        .catch((err) => {
+          console.error('send_turn failed:', err);
+          setThreads((prev) =>
+            prev.map((t) =>
+              t.id === threadId ? { ...t, status: 'IDLE' } : t,
+            ),
+          );
+          showToast(`Turn failed: ${String(err)}`);
+        });
+      return;
+    }
+
+    setTimeout(() => {
+      setThreads((prev) =>
+        prev.map((t) => {
+          if (t.id !== threadId) return t;
+          const nextTurnNum = t.messages.filter((m) => m.checkpoint).length + 1;
+          return {
+            ...t,
+            status: 'DONE',
+            unreadDone: true,
+            additions: t.additions + 18,
+            deletions: t.deletions + 4,
+            messages: [
+              ...t.messages,
+              {
+                id: `a-${Date.now()}`,
+                role: 'assistant',
+                timestamp: formatNowTime(),
+                thinkingDuration: '1.6s',
+                thinking: `Executed in isolated worktree ${t.worktreePath} (${t.branch}).`,
+                tools: [
+                  {
+                    id: `tl-${Date.now()}`,
+                    name: 'edit_file',
+                    target: 'backend/agent/worktree.py',
+                    status: 'ok',
+                    durationMs: 74,
+                  },
+                ],
+                text: `Applied changes for **"${promptText.slice(0, 60)}"** inside \`${t.branch}\` and verified tests pass.`,
+                checkpoint: {
+                  id: `cp-${Date.now()}`,
+                  turnNumber: nextTurnNum,
+                  commitHash: Math.random().toString(16).slice(2, 9),
+                  label: promptText.slice(0, 36),
+                  filesChanged: 1,
+                  additions: 18,
+                  deletions: 4,
+                },
+              },
+            ],
+          };
+        }),
+      );
+
+      // Auto-drain prompt queue if any
+      setQueues((prevQ) => {
+        const q = prevQ[threadId] || [];
+        if (q.length === 0) return prevQ;
+        const [next, ...rest] = q;
+        setTimeout(() => dispatchTurnRef.current(threadId, next.prompt), 250);
+        return { ...prevQ, [threadId]: rest };
+      });
+    }, 1100);
+  }, []);
+
+  dispatchTurnRef.current = dispatchTurn;
+
+  // Load skills for the active project
+  useEffect(() => {
+    const cwd = activeProject?.cwd;
+    if (!cwd || !isTauriRuntime()) return;
+    let cancelled = false;
+    void tauriApi
+      .listSkills(cwd)
+      .then((loaded) => {
+        if (!cancelled && loaded && loaded.length > 0) {
+          setSkills(loaded);
+        }
+      })
+      .catch((err) => {
+        console.error('list_skills failed:', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject?.cwd]);
+
+  const pendingTokensRef = useRef<Record<string, Record<string, string>>>({});
+  const tokenRafRef = useRef<number | null>(null);
+
+  // Subscribe to Phase 2 Tauri streaming & Terminal Guard events
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+
+    const flushPendingTokens = () => {
+      if (tokenRafRef.current !== null) {
+        cancelAnimationFrame(tokenRafRef.current);
+        tokenRafRef.current = null;
+      }
+      const batch = pendingTokensRef.current;
+      const sessionIds = Object.keys(batch);
+      if (sessionIds.length === 0) return;
+      pendingTokensRef.current = {};
+      setThreads((prev) => {
+        let next = prev;
+        for (const sessionId of sessionIds) {
+          const msgMap = batch[sessionId];
+          for (const [messageId, chunk] of Object.entries(msgMap)) {
+            if (!chunk) continue;
+            next = upsertAssistantMessage(
+              next,
+              sessionId,
+              messageId,
+              (m) => ({ ...m, text: `${m.text}${chunk}` }),
+              { status: 'RUNNING', timeAgo: 'now' },
+            );
+          }
+        }
+        return next;
+      });
+    };
+
+    const register = async () => {
+      const fns = await Promise.all([
+        tauriApi.onTurnToken(({ sessionId, messageId, token }) => {
+          if (!pendingTokensRef.current[sessionId]) {
+            pendingTokensRef.current[sessionId] = {};
+          }
+          pendingTokensRef.current[sessionId][messageId] =
+            (pendingTokensRef.current[sessionId][messageId] || '') + token;
+          if (tokenRafRef.current === null) {
+            tokenRafRef.current = requestAnimationFrame(flushPendingTokens);
+          }
+        }),
+        tauriApi.onTurnThinking(({ sessionId, messageId, thinking, durationMs }) => {
+          setThreads((prev) =>
+            upsertAssistantMessage(
+              prev,
+              sessionId,
+              messageId,
+              (m) => ({
+                ...m,
+                thinking: m.thinking ? `${m.thinking}\n${thinking}` : thinking,
+                thinkingDuration:
+                  durationMs !== undefined
+                    ? `${(durationMs / 1000).toFixed(1)}s`
+                    : m.thinkingDuration,
+              }),
+              { status: 'RUNNING' },
+            ),
+          );
+        }),
+        tauriApi.onTurnTool(({ sessionId, messageId, tool }) => {
+          setThreads((prev) =>
+            upsertAssistantMessage(
+              prev,
+              sessionId,
+              messageId,
+              (m) => {
+                const existing: ToolCall[] = m.tools || [];
+                const idx = existing.findIndex((t) => t.id === tool.id);
+                const nextTools =
+                  idx >= 0
+                    ? existing.map((t, i) => (i === idx ? tool : t))
+                    : [...existing, tool];
+                return { ...m, tools: nextTools };
+              },
+              { status: 'RUNNING' },
+            ),
+          );
+        }),
+        tauriApi.onTurnSubagent(({ sessionId, messageId, subagent }) => {
+          setThreads((prev) =>
+            upsertAssistantMessage(
+              prev,
+              sessionId,
+              messageId,
+              (m) => ({ ...m, subagent }),
+              { status: 'RUNNING' },
+            ),
+          );
+        }),
+        tauriApi.onTurnDone(({ sessionId, messageId, message, status }) => {
+          flushPendingTokens();
+          const nextStatus = status || 'DONE';
+          const currentThread = threadsRef.current.find((t) => t.id === sessionId);
+          const currentProject = currentThread
+            ? projectsRef.current.find((p) => p.id === currentThread.projectId)
+            : undefined;
+          const turnCwd =
+            currentThread?.worktreePath && currentThread.worktreePath !== '.'
+              ? currentThread.worktreePath
+              : currentProject?.cwd || '';
+          const nextTurnNumber =
+            (currentThread?.messages.filter((m) => m.checkpoint).length ?? 0) + 1;
+          const lastUserMsg = currentThread?.messages
+            .slice()
+            .reverse()
+            .find((m) => m.role === 'user');
+          const checkpointLabel = (
+            lastUserMsg?.text?.trim() ||
+            currentThread?.title ||
+            `Turn ${nextTurnNumber}`
+          ).slice(0, 48);
+
+          setThreads((prev) =>
+            upsertAssistantMessage(
+              prev,
+              sessionId,
+              messageId,
+              (m) =>
+                message
+                  ? {
+                      ...m,
+                      ...message,
+                      text: message.text || m.text,
+                      timestamp: message.timestamp || m.timestamp,
+                    }
+                  : m,
+              {
+                status: nextStatus,
+                unreadDone: selectedThreadIdRef.current !== sessionId,
+                timeAgo: 'now',
+              },
+            ),
+          );
+
+          if (turnCwd) {
+            void tauriApi
+              .createCheckpoint(sessionId, nextTurnNumber, checkpointLabel, turnCwd)
+              .then((cp) => {
+                if (!cp) return;
+                setThreads((prev) =>
+                  upsertAssistantMessage(prev, sessionId, messageId, (m) =>
+                    m.checkpoint ? m : { ...m, checkpoint: cp },
+                  ),
+                );
+              })
+              .catch(() => {});
+          }
+
+          // Auto-dispatch next queued prompt for this thread
+          setQueues((prevQ) => {
+            const q = prevQ[sessionId] || [];
+            if (q.length === 0) return prevQ;
+            const [next, ...rest] = q;
+            setTimeout(() => dispatchTurnRef.current(sessionId, next.prompt), 250);
+            return { ...prevQ, [sessionId]: rest };
+          });
+        }),
+        tauriApi.onTurnError(({ sessionId, messageId, error }) => {
+          flushPendingTokens();
+          setThreads((prev) =>
+            upsertAssistantMessage(
+              prev,
+              sessionId,
+              messageId,
+              (m) => ({
+                ...m,
+                text: m.text ? `${m.text}\n\n**Error:** ${error}` : `**Error:** ${error}`,
+              }),
+              { status: 'IDLE' },
+            ),
+          );
+          showToast(`Turn error: ${error}`);
+        }),
+        tauriApi.onGuardApproval((payload) => {
+          const sessionId =
+            'sessionId' in payload && payload.sessionId
+              ? payload.sessionId
+              : selectedThreadIdRef.current;
+          const approval: PendingApproval =
+            'approval' in payload ? payload.approval : payload;
+          setThreads((prev) =>
+            prev.map((t) =>
+              t.id === sessionId
+                ? { ...t, status: 'AWAITING_APPROVAL', pendingApproval: approval }
+                : t,
+            ),
+          );
+          showToast(`Terminal Guard: approval required for "${approval.command}"`);
+        }),
+        tauriApi.onAutomationRun((updated) => {
+          setAutomations((prev) => {
+            const exists = prev.some((a) => a.id === updated.id);
+            return exists
+              ? prev.map((a) => (a.id === updated.id ? updated : a))
+              : [updated, ...prev];
+          });
+          void tauriApi
+            .listAutomations()
+            .then((next) => {
+              if (next) setAutomations(next);
+            })
+            .catch(() => {});
+        }),
+        tauriApi.onDiscordPrompt((payload) => {
+          void tauriApi
+            .getBootstrapState()
+            .then((state) => {
+              if (!state) return;
+              if (state.projects) setProjects(state.projects);
+              if (state.sessions) setThreads(state.sessions);
+            })
+            .catch(() => {});
+          showToast(`Discord prompt from ${payload.author} in #${payload.channel}`);
+        }),
+        tauriApi.onGuardResolved(({ approvalId, sessionId, approved }) => {
+          setThreads((prev) =>
+            prev.map((t) => {
+              if (t.id !== sessionId && t.pendingApproval?.id !== approvalId) {
+                return t;
+              }
+              return {
+                ...t,
+                status: approved ? 'RUNNING' : 'IDLE',
+                pendingApproval: undefined,
+              };
+            }),
+          );
+        }),
+      ]);
+
+      if (disposed) {
+        fns.forEach((fn) => fn());
+      } else {
+        unlisteners.push(...fns);
+      }
+    };
+
+    void register();
+    return () => {
+      disposed = true;
+      if (tokenRafRef.current !== null) {
+        cancelAnimationFrame(tokenRafRef.current);
+        tokenRafRef.current = null;
+      }
+      unlisteners.forEach((fn) => fn());
+    };
+  }, []);
+
+  const handlePickAttachments = async () => {
+    if (!isTauriRuntime()) {
+      showToast('File attachment picker requires the Sakana desktop runtime');
+      return;
+    }
+    try {
+      const items = await tauriApi.pickAttachmentFiles();
+      if (!items || items.length === 0) return;
+      const newChips: AttachedContextChip[] = items.map((item) => ({
+        id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        label: item.name,
+        payload: item.path,
+        path: item.path,
+        kind: item.kind,
+        sizeBytes: item.sizeBytes,
+        previewDataUrl: item.previewDataUrl,
+      }));
+      setAttachedChips((prev) => [...prev, ...newChips]);
+    } catch (err) {
+      showToast(`Failed to pick attachments: ${String(err)}`);
+    }
+  };
+
+  const handleSendPrompt = (threadId: string, promptText: string) => {
+    const target = threads.find((t) => t.id === threadId);
+    if (target?.status === 'RUNNING') {
+      setQueues((prev) => ({
+        ...prev,
+        [threadId]: [...(prev[threadId] || []), { id: `q-${Date.now()}`, prompt: promptText }],
+      }));
+      showToast('Queued prompt — will run when current turn finishes');
+      return;
+    }
+    dispatchTurn(threadId, promptText);
+  };
+
+  const handleCreateProject = async (opts: {
+    name: string;
+    cwd: string;
+    runtime?: 'native' | 'wsl';
+    wslDistro?: string;
+  }) => {
+    try {
+      const created = await tauriApi.createProject(opts);
+      const proj: Project = created ?? {
+        id: `proj-${Date.now()}`,
+        name: opts.name,
+        cwd: opts.cwd,
+        runtime: opts.runtime,
+        wslDistro: opts.wslDistro,
+      };
+      setProjects((prev) => [...prev, proj]);
+      showToast(`Added project ${proj.name}`);
+    } catch (err) {
+      showToast(`Failed to create project: ${String(err)}`);
+    }
+  };
+
+  const handleDeleteProject = async (id: string) => {
+    try {
+      await tauriApi.deleteProject(id);
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+      setThreads((prev) => prev.filter((t) => t.projectId !== id));
+      showToast('Deleted project');
+    } catch (err) {
+      showToast(`Failed to delete project: ${String(err)}`);
+    }
+  };
+
+  const handleCreateWorktree = async (opts: {
+    projectId: string;
+    title: string;
+    branch: string;
+    harness: HarnessId;
+    model?: string;
+    sharedDeps: string[];
+  }) => {
+    const defaultModel =
+      opts.model ||
+      harnessModels[opts.harness]?.[0]?.id ||
+      HARNESS_META[opts.harness]?.models[0] ||
+      'gemini-4-argon';
+    const fallbackWtPath = `.sakana/worktrees/${opts.branch.replace(/[^a-z0-9-]/gi, '-')}`;
+    const project = projects.find((p) => p.id === opts.projectId);
+
+    const created = await tauriApi.createSession({
+      projectId: opts.projectId,
+      title: opts.title,
+      branch: opts.branch,
+      harness: opts.harness,
+      model: defaultModel,
+      effort: 'medium',
+      account: 'default',
+      permissionMode: 'auto-edit',
+      worktreePath: fallbackWtPath,
+      sharedDeps: opts.sharedDeps,
+    });
+
+    let actualWorktreePath = created?.worktreePath || fallbackWtPath;
+    if (isTauriRuntime() && created && project) {
+      try {
+        const wtPath = await tauriApi.createWorktree(
+          created.id,
+          project.cwd,
+          opts.branch,
+          opts.sharedDeps,
+        );
+        if (wtPath) {
+          actualWorktreePath = wtPath;
+        }
+      } catch (err) {
+        showToast(`Worktree git checkout warning: ${String(err)}`);
+      }
+    }
+
+    const newThread: Thread = created
+      ? { ...created, worktreePath: actualWorktreePath }
+      : {
+          id: `thr-${Date.now()}`,
+          projectId: opts.projectId,
+          title: opts.title,
+          status: 'IDLE',
+          harness: opts.harness,
+          model: defaultModel,
+          effort: 'medium',
+          account: 'default',
+          permissionMode: 'auto-edit',
+          worktreePath: actualWorktreePath,
+          branch: opts.branch,
+          sharedDeps: opts.sharedDeps,
+          additions: 0,
+          deletions: 0,
+          timeAgo: 'now',
+          messages: [],
+        };
+    setThreads((prev) => [newThread, ...prev]);
+    setSelectedThreadId(newThread.id);
+    setPrimarySection('chat');
+    showToast(`Spawned worktree ${opts.branch}`);
+  };
+
+  const handleQuickNewThread = async (projectId?: string) => {
+    const targetProject =
+      (projectId ? projects.find((p) => p.id === projectId) : undefined) ||
+      activeProject ||
+      projects[0];
+    if (!targetProject) {
+      showToast('Add a project folder first');
+      return;
+    }
+    const harness: HarnessId = activeThread.id !== 'empty' ? activeThread.harness : 'agy-cli';
+    const defaultModel =
+      (activeThread.id !== 'empty' && activeThread.model) ||
+      harnessModels[harness]?.[0]?.id ||
+      HARNESS_META[harness]?.models[0] ||
+      'gemini-4-argon';
+    const branch = activeThread.id !== 'empty' && activeThread.branch ? activeThread.branch : 'main';
+    const title = `New thread`;
+
+    try {
+      const created = await tauriApi.createSession({
+        projectId: targetProject.id,
+        title,
+        branch,
+        harness,
+        model: defaultModel,
+        effort: activeThread.id !== 'empty' ? activeThread.effort : 'medium',
+        account: 'default',
+        permissionMode: activeThread.id !== 'empty' ? activeThread.permissionMode : 'auto-edit',
+        worktreePath: targetProject.cwd,
+        sharedDeps: [],
+      });
+
+      const newThread: Thread = created ?? {
+        id: `thr-${Date.now()}`,
+        projectId: targetProject.id,
+        title,
+        status: 'IDLE',
+        harness,
+        model: defaultModel,
+        effort: 'medium',
+        account: 'default',
+        permissionMode: 'auto-edit',
+        worktreePath: targetProject.cwd,
+        branch,
+        sharedDeps: [],
+        additions: 0,
+        deletions: 0,
+        timeAgo: 'now',
+        messages: [],
+      };
+      setThreads((prev) => [newThread, ...prev]);
+      if (splitView && selectedThreadId) {
+        setSecondaryThreadId(newThread.id);
+      } else {
+        setSelectedThreadId(newThread.id);
+      }
+      setPrimarySection('chat');
+    } catch (err) {
+      showToast(`Failed to create thread: ${String(err)}`);
+    }
+  };
+
+  const handleDeleteThread = async (id: string) => {
+    try {
+      const target = threads.find((t) => t.id === id);
+      const project = target ? projects.find((p) => p.id === target.projectId) : undefined;
+      if (
+        isTauriRuntime() &&
+        target &&
+        project?.cwd &&
+        target.worktreePath &&
+        target.worktreePath !== '.' &&
+        target.worktreePath !== project.cwd
+      ) {
+        await tauriApi.removeWorktree(id, project.cwd).catch(() => {});
+      }
+      await tauriApi.deleteSession(id);
+      setThreads((prev) => {
+        const remaining = prev.filter((t) => t.id !== id);
+        if (selectedThreadId === id) {
+          setSelectedThreadId(remaining[0]?.id || '');
+        }
+        return remaining;
+      });
+      showToast('Deleted thread');
+    } catch (err) {
+      showToast(`Failed to delete thread: ${String(err)}`);
+    }
+  };
+
+  const handleUpdateThreadConfig = (
+    id: string,
+    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'permissionMode'>>,
+  ) => {
+    setThreads((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+    void tauriApi.updateSession({ id, ...patch }).catch((err) => {
+      console.error('update_session failed:', err);
+    });
+  };
+
+  return (
+    <div className={`h-[100dvh] w-screen flex overflow-hidden ${isResizing ? 'is-resizing' : ''}`}>
+      <ErrorBoundary paneName="Sidebar">
+        <Sidebar
+          open={leftOpen}
+        width={leftWidth}
+        onToggleOpen={() => setLeftOpen((v) => !v)}
+        primarySection={primarySection}
+        onSwitchSection={setPrimarySection}
+        projects={projects}
+        threads={threads}
+        selectedThreadId={activeThread.id}
+        onSelectThread={(id) => {
+          setSelectedThreadId(id);
+          setPrimarySection('chat');
+          setThreads((prev) => prev.map((t) => (t.id === id ? { ...t, unreadDone: false } : t)));
+        }}
+        onQuickNewThread={handleQuickNewThread}
+        onNewWorktreeThread={() => setNewWtOpen(true)}
+        onCreateProject={handleCreateProject}
+        onDeleteProject={handleDeleteProject}
+        onDeleteThread={handleDeleteThread}
+        dashSubtab={dashSubtab}
+        onSelectDashSubtab={(tab) => {
+          setDashSubtab(tab);
+          setPrimarySection('dashboard');
+        }}
+        quotas={quotas}
+        onRefreshQuotas={() => void refreshQuotas()}
+        pendingApprovalCount={pendingApprovalCount}
+        remoteHosts={remoteHosts}
+        activeHostId={activeHostId}
+        onSwitchHost={(hid) => void handleSwitchHost(hid)}
+        onManageHosts={() => {
+          setDashSubtab('remote');
+          setPrimarySection('dashboard');
+        }}
+      />
+      </ErrorBoundary>
+
+      {leftOpen && (
+        <div
+          className={`pane-resizer ${isResizing === 'left' ? 'is-dragging' : ''}`}
+          tabIndex={0}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            setIsResizing('left');
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowLeft') {
+              e.preventDefault();
+              setLeftWidth((w) => Math.max(220, w - 16));
+            } else if (e.key === 'ArrowRight') {
+              e.preventDefault();
+              setLeftWidth((w) => Math.min(340, w + 16));
+            }
+          }}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize left sidebar"
+          aria-valuenow={leftWidth}
+          aria-valuemin={220}
+          aria-valuemax={340}
+        />
+      )}
+
+      {primarySection === 'chat' ? (
+        <>
+          <ErrorBoundary paneName="Chat">
+            <ChatPane
+              thread={activeThread}
+            secondaryThread={secondaryThread}
+            secondaryThreadId={secondaryThread?.id}
+            onSelectSecondaryThread={setSecondaryThreadId}
+            onQuickNewThread={() => void handleQuickNewThread()}
+            project={activeProject}
+            allThreads={threads}
+            splitView={splitView}
+            onToggleSplitView={() => setSplitView((v) => !v)}
+            leftSidebarOpen={leftOpen}
+            onToggleLeftSidebar={() => setLeftOpen((v) => !v)}
+            rightInspectorOpen={rightOpen}
+            onToggleRightInspector={() => setRightOpen((v) => !v)}
+            onSelectThread={(id) => setSelectedThreadId(id)}
+            onSendPrompt={handleSendPrompt}
+            onStopStreaming={(id) => {
+              void tauriApi.cancelTurn(id).catch((err) => {
+                console.error('cancel_turn failed:', err);
+              });
+              setThreads((prev) => prev.map((t) => (t.id === id ? { ...t, status: 'IDLE' } : t)));
+              showToast('Stopped active turn');
+            }}
+            onUpdateThreadConfig={handleUpdateThreadConfig}
+            onResolveApproval={(id, decision) => {
+              const target = threads.find((t) => t.id === id);
+              const approval = target?.pendingApproval;
+              if (approval && isTauriRuntime()) {
+                const approved = decision !== 'deny';
+                const allowPrefix =
+                  decision === 'always_allow'
+                    ? approval.command.trim().split(/\s+/).slice(0, 2).join(' ')
+                    : undefined;
+                if (decision === 'enable_yolo') {
+                  void tauriApi.setGuardMode('yolo').catch((err) => {
+                    console.error('set_guard_mode failed:', err);
+                  });
+                }
+                void tauriApi
+                  .resolveApproval(approval.id, approved, allowPrefix)
+                  .catch((err) => {
+                    console.error('resolve_approval failed:', err);
+                    showToast(`Approval error: ${String(err)}`);
+                  });
+              }
+
+              setThreads((prev) =>
+                prev.map((t) =>
+                  t.id === id
+                    ? {
+                        ...t,
+                        status: decision === 'deny' ? 'IDLE' : isTauriRuntime() ? 'RUNNING' : 'DONE',
+                        permissionMode: decision === 'enable_yolo' ? 'yolo' : t.permissionMode,
+                        pendingApproval: undefined,
+                        messages: isTauriRuntime()
+                          ? t.messages
+                          : [
+                              ...t.messages,
+                              {
+                                id: `ap-${Date.now()}`,
+                                role: 'assistant',
+                                timestamp: formatNowTime(),
+                                text:
+                                  decision === 'deny'
+                                    ? 'Command denied by Terminal Guard.'
+                                    : `Command approved (${decision}) and executed cleanly.`,
+                              },
+                            ],
+                      }
+                    : t,
+                ),
+              );
+              showToast(decision === 'deny' ? 'Command denied' : 'Command approved');
+            }}
+            skills={skills}
+            theme={theme}
+            onRevertToCheckpoint={async (threadId, checkpointId) => {
+              if (isTauriRuntime()) {
+                try {
+                  await tauriApi.revertToCheckpoint(threadId, checkpointId);
+                  const refreshed = await tauriApi.listSessions();
+                  if (refreshed?.length) {
+                    setThreads(refreshed);
+                  }
+                  await refreshDiffs('all');
+                  showToast('Reverted workspace & chat to checkpoint');
+                } catch (err) {
+                  showToast(`Revert failed: ${String(err)}`);
+                }
+                return;
+              }
+              setThreads((prev) =>
+                prev.map((t) => {
+                  if (t.id !== threadId) return t;
+                  const idx = t.messages.findIndex((m) => m.checkpoint?.id === checkpointId);
+                  if (idx < 0) return t;
+                  return { ...t, messages: t.messages.slice(0, idx + 1) };
+                }),
+              );
+              showToast('Reverted workspace & chat to checkpoint');
+            }}
+            onViewCheckpointDiff={(checkpointId) => {
+              setRightOpen(true);
+              setInspectorTab('changes');
+              setTurnScopeFilter(checkpointId);
+              void refreshDiffs(checkpointId);
+            }}
+            onForkAtMessage={(threadId, msgIndex) => {
+              const src = threads.find((t) => t.id === threadId);
+              if (!src) return;
+              const slicedMessages = src.messages.slice(0, msgIndex + 1);
+              const forkTitle = `${src.title} (Fork)`;
+              const forkBranch = `${src.branch}-fork`;
+              if (isTauriRuntime()) {
+                void tauriApi
+                  .forkSession({
+                    sourceId: src.id,
+                    title: forkTitle,
+                    branch: forkBranch,
+                    upToIndex: msgIndex,
+                  })
+                  .then((created) => {
+                    const forked: Thread = created
+                      ? created
+                      : {
+                          ...src,
+                          id: `fork-${Date.now()}`,
+                          title: forkTitle,
+                          branch: forkBranch,
+                          status: 'IDLE',
+                          messages: slicedMessages,
+                        };
+                    setThreads((prev) => [forked, ...prev]);
+                    setSelectedThreadId(forked.id);
+                    showToast('Forked thread into new session');
+                  })
+                  .catch((err) => {
+                    showToast(`Failed to fork thread: ${String(err)}`);
+                  });
+                return;
+              }
+              const forkId = `fork-${Date.now()}`;
+              const forked: Thread = {
+                ...src,
+                id: forkId,
+                title: forkTitle,
+                branch: forkBranch,
+                status: 'IDLE',
+                messages: slicedMessages,
+              };
+              setThreads((prev) => [forked, ...prev]);
+              setSelectedThreadId(forkId);
+              showToast('Forked thread into new worktree');
+            }}
+            attachedChips={attachedChips}
+            onAddChips={(chips) => setAttachedChips((prev) => [...prev, ...chips])}
+            onPickAttachments={handlePickAttachments}
+            onRemoveChip={(id) => setAttachedChips((prev) => prev.filter((c) => c.id !== id))}
+            queuedPrompts={queues[activeThread.id] || []}
+            onSendQueuedNow={(qid) => {
+              const item = (queues[activeThread.id] || []).find((q) => q.id === qid);
+              if (!item) return;
+              setQueues((prev) => ({
+                ...prev,
+                [activeThread.id]: (prev[activeThread.id] || []).filter((q) => q.id !== qid),
+              }));
+              dispatchTurn(activeThread.id, item.prompt);
+            }}
+            onRemoveQueued={(qid) =>
+              setQueues((prev) => ({
+                ...prev,
+                [activeThread.id]: (prev[activeThread.id] || []).filter((q) => q.id !== qid),
+              }))
+            }
+            onOpenCommandPalette={() => setCmdOpen(true)}
+            harnessModels={harnessModels}
+            disabledHarnesses={disabledHarnesses}
+            onToast={showToast}
+          />
+          </ErrorBoundary>
+
+          {rightOpen && !rightExpanded && (
+            <div
+              className={`pane-resizer ${isResizing === 'right' ? 'is-dragging' : ''}`}
+              tabIndex={0}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                setIsResizing('right');
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'ArrowLeft') {
+                  e.preventDefault();
+                  setRightWidth((w) => Math.min(680, w + 16));
+                } else if (e.key === 'ArrowRight') {
+                  e.preventDefault();
+                  setRightWidth((w) => Math.max(360, w - 16));
+                }
+              }}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize right inspector"
+              aria-valuenow={rightWidth}
+              aria-valuemin={360}
+              aria-valuemax={680}
+            />
+          )}
+
+          <ErrorBoundary paneName="Inspector">
+            <RightInspector
+              open={rightOpen}
+            width={rightWidth}
+            expanded={rightExpanded}
+            onToggleExpand={() => setRightExpanded((v) => !v)}
+            onClose={() => setRightOpen(false)}
+            activeTab={inspectorTab}
+            onSelectTab={setInspectorTab}
+            thread={activeThread}
+            threads={threads}
+            onSelectThread={(id) => {
+              setSelectedThreadId(id);
+              setPrimarySection('chat');
+            }}
+            projectCwd={activeProject?.cwd}
+            wslDistro={activeProject?.wslDistro}
+            theme={theme}
+            diffs={diffs}
+            onRefreshDiffs={refreshDiffs}
+            onToggleStageHunk={async (filePath, hunkId, hunkHeader, nextStaged) => {
+              if (isTauriRuntime()) {
+                try {
+                  await tauriApi.stageHunk(effectiveCwd, filePath, hunkHeader, nextStaged);
+                  await refreshDiffs(turnScopeFilter);
+                  return;
+                } catch (err) {
+                  showToast(`Stage hunk failed: ${String(err)}`);
+                  return;
+                }
+              }
+              setDiffs((prev) =>
+                prev.map((df) =>
+                  df.path === filePath
+                    ? {
+                        ...df,
+                        hunks: df.hunks.map((h) =>
+                          h.id === hunkId ? { ...h, staged: nextStaged } : h,
+                        ),
+                      }
+                    : df,
+                ),
+              );
+            }}
+            onDiscardHunk={async (filePath, hunkId, hunkHeader) => {
+              if (isTauriRuntime()) {
+                try {
+                  await tauriApi.discardHunk(effectiveCwd, filePath, hunkHeader);
+                  await refreshDiffs(turnScopeFilter);
+                  showToast(`Discarded hunk in ${filePath}`);
+                  return;
+                } catch (err) {
+                  showToast(`Discard hunk failed: ${String(err)}`);
+                  return;
+                }
+              }
+              setDiffs((prev) =>
+                prev.map((df) =>
+                  df.path === filePath
+                    ? {
+                        ...df,
+                        hunks: df.hunks.map((h) =>
+                          h.id === hunkId ? { ...h, discarded: true } : h,
+                        ),
+                      }
+                    : df,
+                ),
+              );
+              showToast(`Discarded hunk in ${filePath}`);
+            }}
+            onBranchChanged={(nextBranch) => {
+              setThreads((prev) =>
+                prev.map((t) =>
+                  t.id === activeThread.id ? { ...t, branch: nextBranch } : t,
+                ),
+              );
+            }}
+            onOpenCreatePr={() => setPrOpen(true)}
+            turnScopeFilter={turnScopeFilter}
+            onChangeTurnScope={setTurnScopeFilter}
+            files={files}
+            onSaveFile={async (path, content) => {
+              if (isTauriRuntime()) {
+                await tauriApi.writeWorkspaceFile(effectiveCwd, path, content);
+              } else {
+                setFiles((prev) =>
+                  prev.map((f) => (f.path === path ? { ...f, lines: content.split('\n') } : f)),
+                );
+              }
+              showToast(`Saved ${path}`);
+            }}
+            traces={traces}
+            onAttachChip={(chip) => {
+              setAttachedChips((prev) => [...prev, chip]);
+              showToast(`Attached ${chip.label} to composer`);
+            }}
+            onToast={showToast}
+          />
+          </ErrorBoundary>
+        </>
+      ) : (
+        <ErrorBoundary paneName="Dashboard">
+          <DashboardView
+            subtab={dashSubtab}
+          theme={theme}
+          onSetTheme={handleSetTheme}
+          leftSidebarOpen={leftOpen}
+          onToggleLeftSidebar={() => setLeftOpen((v) => !v)}
+          onReturnToChat={() => setPrimarySection('chat')}
+          threads={threads}
+          onSelectThread={(id) => {
+            setSelectedThreadId(id);
+            setPrimarySection('chat');
+          }}
+          telemetry={telemetry}
+          onRefreshTelemetry={() => void refreshTelemetry()}
+          onToggleAutostart={async (enabled) => {
+            if (isTauriRuntime()) {
+              try {
+                const next = await tauriApi.setAutostart(enabled);
+                setTelemetry((prev) =>
+                  prev ? { ...prev, autostartEnabled: next ?? enabled } : prev,
+                );
+                showToast(`OS auto-start ${enabled ? 'enabled' : 'disabled'}`);
+              } catch (err) {
+                showToast(`Failed to update auto-start: ${String(err)}`);
+              }
+              return;
+            }
+            setTelemetry((prev) =>
+              prev ? { ...prev, autostartEnabled: enabled } : prev,
+            );
+            showToast(`OS auto-start ${enabled ? 'enabled' : 'disabled'}`);
+          }}
+          quotas={quotas}
+          onRefreshQuotas={() => void refreshQuotas()}
+          mcpServers={mcpServers}
+          onRefreshMcp={() => void refreshMcp()}
+          onAddMcp={async (name, transport, endpoint) => {
+            if (isTauriRuntime()) {
+              try {
+                const created = await tauriApi.addMcpServer(name, transport, endpoint);
+                if (created) setMcpServers((prev) => [...prev, created]);
+                showToast(`Added MCP server ${name}`);
+              } catch (err) {
+                showToast(`Add MCP failed: ${String(err)}`);
+              }
+              return;
+            }
+            setMcpServers((prev) => [
+              ...prev,
+              {
+                id: `mcp-${Date.now()}`,
+                name,
+                transport,
+                endpoint,
+                enabled: true,
+                status: 'idle',
+              },
+            ]);
+            showToast(`Added MCP server ${name}`);
+          }}
+          onTestMcp={async (id) => {
+            if (isTauriRuntime()) {
+              try {
+                const updated = await tauriApi.pingMcpServer(id);
+                if (updated) {
+                  setMcpServers((prev) => prev.map((m) => (m.id === id ? updated : m)));
+                  showToast(
+                    updated.status === 'connected'
+                      ? `MCP OK (${updated.latencyMs ?? 0}ms)`
+                      : `MCP ping: ${updated.status}`,
+                  );
+                }
+              } catch (err) {
+                showToast(`MCP ping failed: ${String(err)}`);
+              }
+              return;
+            }
+            setMcpServers((prev) =>
+              prev.map((m) =>
+                m.id === id ? { ...m, status: 'connected', latencyMs: 19 } : m,
+              ),
+            );
+            showToast('MCP connection OK (19ms)');
+          }}
+          onToggleMcp={async (id, enabled) => {
+            if (isTauriRuntime()) {
+              try {
+                const updated = await tauriApi.toggleMcpServer(id, enabled);
+                setMcpServers((prev) =>
+                  prev.map((m) => (m.id === id ? updated ?? { ...m, enabled } : m)),
+                );
+              } catch (err) {
+                showToast(`Toggle MCP failed: ${String(err)}`);
+              }
+              return;
+            }
+            setMcpServers((prev) =>
+              prev.map((m) => (m.id === id ? { ...m, enabled } : m)),
+            );
+          }}
+          onDeleteMcp={async (id) => {
+            if (isTauriRuntime()) {
+              try {
+                await tauriApi.deleteMcpServer(id);
+                setMcpServers((prev) => prev.filter((m) => m.id !== id));
+                showToast('Deleted MCP server');
+              } catch (err) {
+                showToast(`Delete MCP failed: ${String(err)}`);
+              }
+              return;
+            }
+            setMcpServers((prev) => prev.filter((m) => m.id !== id));
+            showToast('Deleted MCP server');
+          }}
+          onImportAgyMcp={async () => {
+            if (isTauriRuntime()) {
+              try {
+                const imported = await tauriApi.importAgyMcpServers();
+                if (imported) setMcpServers(imported);
+                showToast(`Synced ${imported?.length ?? 0} MCP servers from AGY`);
+              } catch (err) {
+                showToast(`AGY import failed: ${String(err)}`);
+              }
+              return;
+            }
+            showToast('AGY MCP import requires Tauri desktop runtime');
+          }}
+          skills={skills}
+          onRefreshSkills={() => void refreshSkills()}
+          automations={automations}
+          onRefreshAutomations={() => void refreshAutomations()}
+          onCreateAutomation={async (name, kind, schedule, prompt) => {
+            if (isTauriRuntime()) {
+              try {
+                const created = await tauriApi.createAutomation(
+                  name,
+                  kind,
+                  schedule,
+                  prompt,
+                );
+                if (created) setAutomations((prev) => [created, ...prev]);
+                showToast(`Created automation ${name}`);
+              } catch (err) {
+                showToast(`Create automation failed: ${String(err)}`);
+              }
+              return;
+            }
+            setAutomations((prev) => [
+              {
+                id: `auto-${Date.now()}`,
+                name,
+                kind,
+                schedule,
+                prompt,
+                enabled: true,
+                lastRunStatus: 'OK',
+                history: [],
+              },
+              ...prev,
+            ]);
+            showToast(`Created automation ${name}`);
+          }}
+          onToggleAutomation={async (id, enabled) => {
+            if (isTauriRuntime()) {
+              try {
+                const updated = await tauriApi.toggleAutomation(id, enabled);
+                setAutomations((prev) =>
+                  prev.map((a) => (a.id === id ? updated ?? { ...a, enabled } : a)),
+                );
+              } catch (err) {
+                showToast(`Toggle automation failed: ${String(err)}`);
+              }
+              return;
+            }
+            setAutomations((prev) =>
+              prev.map((a) => (a.id === id ? { ...a, enabled } : a)),
+            );
+          }}
+          onDeleteAutomation={async (id) => {
+            if (isTauriRuntime()) {
+              try {
+                await tauriApi.deleteAutomation(id);
+                setAutomations((prev) => prev.filter((a) => a.id !== id));
+                showToast('Deleted automation');
+              } catch (err) {
+                showToast(`Delete automation failed: ${String(err)}`);
+              }
+              return;
+            }
+            setAutomations((prev) => prev.filter((a) => a.id !== id));
+            showToast('Deleted automation');
+          }}
+          onRunAutomation={async (id) => {
+            if (isTauriRuntime()) {
+              try {
+                const updated = await tauriApi.runAutomationNow(id);
+                if (updated) {
+                  setAutomations((prev) =>
+                    prev.map((a) => (a.id === id ? updated : a)),
+                  );
+                }
+                showToast('Automation executed');
+              } catch (err) {
+                showToast(`Automation run failed: ${String(err)}`);
+              }
+              return;
+            }
+            setAutomations((prev) =>
+              prev.map((a) =>
+                a.id === id
+                  ? {
+                      ...a,
+                      history: [
+                        {
+                          ts: 'Just now',
+                          status: 'OK',
+                          durationMs: 1120,
+                          summary: 'Manual trigger completed.',
+                        },
+                        ...a.history,
+                      ],
+                    }
+                  : a,
+              ),
+            );
+            showToast('Automation executed');
+          }}
+          discordStatus={discordStatus}
+          onStartDiscordBot={async (token) => {
+            if (isTauriRuntime()) {
+              try {
+                const next = await tauriApi.startDiscordBot(token);
+                if (next) setDiscordStatus(next);
+                showToast('Discord bot started');
+              } catch (err) {
+                showToast(`Discord start failed: ${String(err)}`);
+              }
+              return;
+            }
+            setDiscordStatus({
+              running: true,
+              botTag: 'Sakana#0001',
+              hasToken: true,
+              connectedGuilds: 1,
+            });
+            showToast('Discord bot started (preview)');
+          }}
+          onStopDiscordBot={async () => {
+            if (isTauriRuntime()) {
+              try {
+                const next = await tauriApi.stopDiscordBot();
+                if (next) setDiscordStatus(next);
+                showToast('Discord bot stopped');
+              } catch (err) {
+                showToast(`Discord stop failed: ${String(err)}`);
+              }
+              return;
+            }
+            setDiscordStatus({
+              running: false,
+              hasToken: false,
+              connectedGuilds: 0,
+            });
+            showToast('Discord bot stopped');
+          }}
+          discordUsers={discordUsers}
+          onUpsertDiscordUser={async (userId, label, role) => {
+            if (isTauriRuntime()) {
+              try {
+                const saved = await tauriApi.upsertDiscordRule(userId, label, role);
+                if (saved) {
+                  setDiscordUsers((prev) => {
+                    const idx = prev.findIndex((u) => u.id === saved.id || u.userId === saved.userId);
+                    if (idx >= 0) {
+                      return prev.map((u, i) => (i === idx ? saved : u));
+                    }
+                    return [...prev, saved];
+                  });
+                }
+                showToast(`Saved Discord rule for ${label}`);
+              } catch (err) {
+                showToast(`Save Discord rule failed: ${String(err)}`);
+              }
+              return;
+            }
+            setDiscordUsers((prev) => {
+              const idx = prev.findIndex((u) => u.userId === userId);
+              if (idx >= 0) {
+                return prev.map((u, i) => (i === idx ? { ...u, label, role } : u));
+              }
+              return [...prev, { id: `du-${Date.now()}`, userId, label, role }];
+            });
+            showToast(`Saved Discord rule for ${label}`);
+          }}
+          onDeleteDiscordUser={async (id) => {
+            if (isTauriRuntime()) {
+              try {
+                await tauriApi.deleteDiscordRule(id);
+                setDiscordUsers((prev) => prev.filter((u) => u.id !== id));
+                showToast('Removed Discord rule');
+              } catch (err) {
+                showToast(`Delete Discord rule failed: ${String(err)}`);
+              }
+              return;
+            }
+            setDiscordUsers((prev) => prev.filter((u) => u.id !== id));
+            showToast('Removed Discord rule');
+          }}
+          remoteHosts={remoteHosts}
+          activeHostId={activeHostId}
+          onSwitchHost={(hid) => void handleSwitchHost(hid)}
+          onRefreshRemoteHosts={refreshRemoteHosts}
+          remoteStatus={remoteStatus}
+          onStartRemoteServer={async (port, lanEnabled) => {
+            if (isTauriRuntime()) {
+              try {
+                const next = await tauriApi.startRemoteServer(port, lanEnabled);
+                if (next) setRemoteStatus(next);
+                showToast(`Remote server listening on :${next?.port ?? port ?? 4317}`);
+              } catch (err) {
+                showToast(`Remote start failed: ${String(err)}`);
+              }
+              return;
+            }
+            const p = port ?? 4317;
+            const bindAddr = lanEnabled ? '0.0.0.0' : '127.0.0.1';
+            setRemoteStatus({
+              running: true,
+              port: p,
+              bindAddr,
+              magicLink: `http://${bindAddr}:${p}/?token=skn_preview_token`,
+              token: 'skn_preview_token',
+              qrSvg: '',
+            });
+            showToast(`Remote server started on :${p} (preview)`);
+          }}
+          onStopRemoteServer={async () => {
+            if (isTauriRuntime()) {
+              try {
+                const next = await tauriApi.stopRemoteServer();
+                if (next) setRemoteStatus(next);
+                showToast('Remote server stopped');
+              } catch (err) {
+                showToast(`Remote stop failed: ${String(err)}`);
+              }
+              return;
+            }
+            setRemoteStatus(null);
+            showToast('Remote server stopped');
+          }}
+          secrets={secrets}
+          onSetSecret={async (key, value) => {
+            if (isTauriRuntime()) {
+              try {
+                const next = await tauriApi.setEnvSecret(key, value);
+                if (next) setSecrets(next);
+                showToast(`Saved secret ${key}`);
+              } catch (err) {
+                showToast(`Save secret failed: ${String(err)}`);
+              }
+              return;
+            }
+            setSecrets((prev) => {
+              const exists = prev.some((s) => s.key === key);
+              if (exists) {
+                return prev.map((s) => (s.key === key ? { ...s, value } : s));
+              }
+              return [...prev, { key, value, hint: '••••' }];
+            });
+            showToast(`Saved secret ${key}`);
+          }}
+          onDeleteSecret={async (key) => {
+            if (isTauriRuntime()) {
+              try {
+                await tauriApi.deleteEnvSecret(key);
+                setSecrets((prev) => prev.filter((s) => s.key !== key));
+                showToast(`Deleted secret ${key}`);
+              } catch (err) {
+                showToast(`Delete secret failed: ${String(err)}`);
+              }
+              return;
+            }
+            setSecrets((prev) => prev.filter((s) => s.key !== key));
+            showToast(`Deleted secret ${key}`);
+          }}
+          onToast={showToast}
+          disabledHarnesses={disabledHarnesses}
+          onToggleHarness={handleToggleHarness}
+          onRefreshModels={() => refreshHarnessModels(true)}
+          refreshingModels={refreshingModels}
+        />
+        </ErrorBoundary>
+      )}
+
+      {/* Modals */}
+      <CommandPalette
+        open={cmdOpen}
+        onClose={() => setCmdOpen(false)}
+        threads={threads}
+        projects={projects}
+        onSelectThread={(id) => {
+          setSelectedThreadId(id);
+          setPrimarySection('chat');
+        }}
+        onSelectProject={(projectId) => {
+          const match = threads.find((t) => t.projectId === projectId);
+          if (match) {
+            setSelectedThreadId(match.id);
+            setPrimarySection('chat');
+          } else {
+            setNewWtOpen(true);
+          }
+        }}
+        onSelectInspectorTab={(tab) => {
+          setPrimarySection('chat');
+          setRightOpen(true);
+          setInspectorTab(tab);
+        }}
+        onSelectDashSubtab={(tab) => {
+          setDashSubtab(tab);
+          setPrimarySection('dashboard');
+        }}
+        onSetTheme={handleSetTheme}
+        onToggleSplit={() => setSplitView((v) => !v)}
+        onOpenNewWorktree={() => setNewWtOpen(true)}
+        onOpenCreatePr={() => setPrOpen(true)}
+      />
+
+      <CreatePrModal
+        open={prOpen}
+        onClose={() => setPrOpen(false)}
+        thread={activeThread}
+        onSubmit={async ({ title, body, baseBranch }) => {
+          if (isTauriRuntime()) {
+            const url = await tauriApi.createPr(effectiveCwd, title, body, baseBranch);
+            showToast(url ? `PR created: ${url}` : `Opened PR: ${title}`);
+          } else {
+            showToast(`Opened PR: ${title}`);
+          }
+        }}
+      />
+
+      <NewWorktreeModal
+        open={newWtOpen}
+        onClose={() => setNewWtOpen(false)}
+        projects={projects}
+        harnessModels={harnessModels}
+        onCreate={handleCreateWorktree}
+      />
+
+      {/* Toast */}
+      {toast && (
+        <div
+          className="sakana-popover pop-enter fixed bottom-5 right-5 z-[80] max-w-[520px] break-words px-3.5 py-2 rounded-[10px] text-[12px] font-medium"
+          style={{ color: 'var(--text-main)' }}
+        >
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}

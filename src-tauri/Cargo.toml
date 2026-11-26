@@ -1,0 +1,53 @@
+[package]
+name = "sakana"
+version = "2.0.0"
+description = "Sakana Desktop — Cross-Platform Agentic AI Control Surface"
+authors = ["Sakana"]
+edition = "2021"
+default-run = "sakana"
+
+[lib]
+name = "sakana_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "sakana"
+path = "src/main.rs"
+
+[[bin]]
+name = "sakana-daemon"
+path = "src/bin/sakana-daemon.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+thiserror = "2"
+dirs = "6"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+regex = "1"
+portable-pty = "0.8"
+sysinfo = "0.33"
+axum = { version = "0.8", features = ["ws"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+qrcode = "0.14"
+tokio-cron-scheduler = "0.13"
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+poise = "0.6"

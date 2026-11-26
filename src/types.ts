@@ -1,0 +1,433 @@
+export type ThemeId = 'paper' | 'noir' | 'slate' | 'sand';
+
+export type HarnessId = 'agy-cli' | 'claude-code' | 'kiro-cli' | 'sakana';
+
+export type ThreadStatus = 'RUNNING' | 'AWAITING_APPROVAL' | 'DONE' | 'IDLE';
+
+export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+
+export type PermissionMode = 'supervised' | 'auto-edit' | 'yolo';
+
+export type PrimarySection = 'chat' | 'dashboard';
+
+export type InspectorTab = 'changes' | 'files' | 'preview' | 'terminal' | 'traces';
+
+export type DashboardSubtab =
+  | 'overview'
+  | 'harnesses'
+  | 'mcp'
+  | 'automations'
+  | 'discord'
+  | 'remote';
+
+export interface Project {
+  id: string;
+  name: string;
+  cwd: string;
+  repoUrl?: string;
+  discordChannel?: string;
+  runtime?: 'native' | 'wsl';
+  wslDistro?: string;
+}
+
+export interface RemoteHost {
+  id: string;
+  name: string;
+  url: string;
+  token: string;
+  os: string;
+  hostname: string;
+  status: string;
+  lastSeenAt: string;
+}
+
+export interface HostInfo {
+  hostId: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  version: string;
+  port: number;
+}
+
+export interface DirEntryItem {
+  name: string;
+  path: string;
+  isDir: boolean;
+  isGitRepo: boolean;
+}
+
+export interface DirListing {
+  path: string;
+  parent?: string | null;
+  entries: DirEntryItem[];
+  os: string;
+  wslDistro?: string | null;
+}
+
+export interface WslDistro {
+  name: string;
+  state: string;
+  version: number;
+  isDefault: boolean;
+}
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  target: string;
+  status: 'ok' | 'running' | 'error';
+  durationMs: number;
+}
+
+export interface TurnCheckpoint {
+  id: string;
+  turnNumber: number;
+  commitHash: string;
+  label: string;
+  filesChanged: number;
+  additions: number;
+  deletions: number;
+}
+
+export interface InlineWidgetData {
+  title: string;
+  subtitle: string;
+  sourceCode: string;
+  metrics: { label: string; value: string; delta: string; ok: boolean }[];
+  bars: { label: string; pct: number; ms: number }[];
+}
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  author?: string;
+  timestamp: string;
+  text: string;
+  thinking?: string;
+  thinkingDuration?: string;
+  tools?: ToolCall[];
+  subagent?: {
+    harness: HarnessId;
+    command: string;
+    summary: string;
+    durationMs: number;
+  };
+  widget?: InlineWidgetData;
+  checkpoint?: TurnCheckpoint;
+}
+
+export interface PendingApproval {
+  id: string;
+  command: string;
+  cwd: string;
+  reason: string;
+  risk: 'medium' | 'high';
+  requestedBy: HarnessId;
+}
+
+export interface Thread {
+  id: string;
+  projectId: string;
+  title: string;
+  status: ThreadStatus;
+  harness: HarnessId;
+  model: string;
+  effort: ReasoningEffort;
+  account: string;
+  permissionMode: PermissionMode;
+  worktreePath: string;
+  branch: string;
+  sharedDeps: string[];
+  additions: number;
+  deletions: number;
+  timeAgo: string;
+  isDiscord?: boolean;
+  discordChannel?: string;
+  unreadDone?: boolean;
+  messages: ChatMessage[];
+  pendingApproval?: PendingApproval;
+}
+
+export interface DiffLine {
+  type: 'ctx' | 'add' | 'del';
+  oldLine?: number;
+  newLine?: number;
+  content: string;
+}
+
+export interface DiffHunk {
+  id: string;
+  header: string;
+  staged: boolean;
+  discarded?: boolean;
+  lines: DiffLine[];
+}
+
+export interface DiffFile {
+  path: string;
+  status: 'modified' | 'added' | 'deleted';
+  turnId?: string;
+  additions: number;
+  deletions: number;
+  hunks: DiffHunk[];
+}
+
+export interface WorkspaceFile {
+  path: string;
+  language: string;
+  lines: string[];
+}
+
+export interface TraceSpan {
+  id: string;
+  actor: string;
+  harness: HarnessId;
+  action: string;
+  durationMs: number;
+  tokens: string;
+  status: 'ok' | 'running';
+  children?: TraceSpan[];
+}
+
+export interface AttachmentItem {
+  path: string;
+  name: string;
+  sizeBytes: number;
+  kind: 'image' | 'pdf' | 'file';
+  previewDataUrl?: string;
+}
+
+export interface AttachedContextChip {
+  id: string;
+  kind?: 'lines' | 'diff-comment' | 'design-element' | 'context' | 'image' | 'pdf' | 'file';
+  label: string;
+  payload: string;
+  path?: string;
+  sizeBytes?: number;
+  previewDataUrl?: string;
+}
+
+export interface QueuedPrompt {
+  id: string;
+  prompt: string;
+}
+
+export interface QuotaAccount {
+  id: string;
+  harness: HarnessId;
+  label: string;
+  email: string;
+  fiveHourPct: number;
+  fiveHourReset: string;
+  weeklyPct: number;
+  weeklyReset: string;
+  isDefault?: boolean;
+}
+
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: 'stdio' | 'sse';
+  endpoint: string;
+  enabled: boolean;
+  status: 'connected' | 'idle' | 'error';
+  latencyMs?: number;
+}
+
+export interface SkillItem {
+  slug: string;
+  scope: 'global' | 'project';
+  description: string;
+}
+
+export interface AutomationItem {
+  id: string;
+  name: string;
+  kind: 'cron' | 'webhook';
+  schedule: string;
+  prompt: string;
+  enabled: boolean;
+  lastRunStatus: 'OK' | 'ERR';
+  history: { ts: string; status: 'OK' | 'ERR'; durationMs: number; summary: string }[];
+}
+
+export interface DiscordUserRule {
+  id: string;
+  userId: string;
+  label: string;
+  role: 'owner' | 'friend' | 'guest' | 'blocked';
+}
+
+export interface EnvSecret {
+  key: string;
+  value: string;
+  hint: string;
+}
+
+export interface DiscordStatus {
+  running: boolean;
+  botTag?: string;
+  hasToken: boolean;
+  connectedGuilds: number;
+  lastError?: string;
+}
+
+export interface RemoteStatus {
+  running: boolean;
+  port: number;
+  bindAddr: string;
+  token: string;
+  magicLink: string;
+  qrSvg: string;
+  lastError?: string;
+}
+
+export interface SystemTelemetry {
+  osName: string;
+  osVersion: string;
+  hostName: string;
+  cpuBrand: string;
+  cpuCores: number;
+  cpuUsagePct: number;
+  memoryUsedBytes: number;
+  memoryTotalBytes: number;
+  diskUsedBytes: number;
+  diskTotalBytes: number;
+  uptimeSecs: number;
+  autostartEnabled: boolean;
+}
+
+export type GuardMode = 'yolo' | 'guarded' | 'strict' | 'readonly';
+
+export interface GuardConfig {
+  mode: GuardMode;
+  catastrophicGuardrail: boolean;
+  allowlistPrefixes: string[];
+}
+
+export interface TurnTokenEvent {
+  sessionId: string;
+  messageId: string;
+  token: string;
+}
+
+export interface TurnThinkingEvent {
+  sessionId: string;
+  messageId: string;
+  thinking: string;
+  durationMs?: number;
+}
+
+export interface TurnToolEvent {
+  sessionId: string;
+  messageId: string;
+  tool: ToolCall;
+}
+
+export interface TurnSubagentEvent {
+  sessionId: string;
+  messageId: string;
+  subagent: NonNullable<ChatMessage['subagent']>;
+}
+
+export interface TurnDoneEvent {
+  sessionId: string;
+  messageId: string;
+  message?: ChatMessage;
+  status?: ThreadStatus;
+}
+
+export interface TurnErrorEvent {
+  sessionId: string;
+  messageId: string;
+  error: string;
+}
+
+export interface GuardApprovalEvent {
+  sessionId: string;
+  approval: PendingApproval;
+}
+
+export interface PtyDataEvent {
+  sessionId: string;
+  data: string;
+}
+
+export interface PtyExitEvent {
+  sessionId: string;
+  code: number;
+}
+
+export interface HarnessModelOption {
+  id: string;
+  label: string;
+  family: string;
+  efforts: string[];
+}
+
+export interface HarnessAuthAccount {
+  id: string;
+  harness: HarnessId;
+  label: string;
+  email: string;
+  profileDir: string;
+  authType: string;
+  isDefault: boolean;
+  authenticated: boolean;
+  status: string;
+  cliInstalled: boolean;
+  cliBin: string;
+  lastLoginOutput: string;
+}
+
+export interface HarnessLoginResponse {
+  started: boolean;
+  accountId: string;
+  harness: HarnessId;
+  authType: string;
+  mode: string;
+  authenticated: boolean;
+  needsCode: boolean;
+  authUrl: string;
+  deviceCode: string;
+  email: string;
+  message: string;
+}
+
+export interface UpdateCheckResult {
+  available: boolean;
+  currentVersion: string;
+  latestVersion?: string;
+  body?: string;
+  error?: string;
+}
+
+export interface DiscordPromptEvent {
+  sessionId: string;
+  channel: string;
+  author: string;
+  prompt: string;
+}
+
+export interface GuardResolvedEvent {
+  approvalId: string;
+  sessionId: string;
+  approved: boolean;
+  command: string;
+}
+
+export interface BootstrapState {
+  theme: ThemeId;
+  projects: Project[];
+  sessions: Thread[];
+  accounts?: QuotaAccount[];
+  quotas?: QuotaAccount[];
+  mcpServers?: McpServer[];
+  skills?: SkillItem[];
+  automations?: AutomationItem[];
+  discordRules?: DiscordUserRule[];
+  discordUsers?: DiscordUserRule[];
+  envSecrets?: EnvSecret[];
+  secrets?: EnvSecret[];
+}

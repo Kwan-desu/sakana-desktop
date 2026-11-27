@@ -29,6 +29,7 @@ import type {
   AppCustomization,
   AutomationItem,
   DashboardSubtab,
+  DiscordSettings,
   DiscordStatus,
   DiscordUserRule,
   EnvSecret,
@@ -214,9 +215,25 @@ export function DashboardView({
     }
   };
 
+  const [discordSettings, setDiscordSettings] = useState<DiscordSettings>({
+    defaultHarness: 'auto',
+    defaultModel: '',
+    defaultEffort: 'medium',
+    reactWithEmojis: true,
+  });
+  const [savingDcSettings, setSavingDcSettings] = useState(false);
+
   useEffect(() => {
     if (subtab === 'remote') {
       void refreshGitHubStatus();
+    }
+    if (subtab === 'discord' && isTauriRuntime()) {
+      void tauriApi
+        .getDiscordSettings()
+        .then((cfg) => {
+          if (cfg) setDiscordSettings(cfg);
+        })
+        .catch(() => {});
     }
   }, [subtab]);
   const [openAutoHistory, setOpenAutoHistory] = useState<Record<string, boolean>>({});
@@ -2450,6 +2467,118 @@ export function DashboardView({
               </div>
 
               <div className="sakana-card rounded-[12px] p-5 space-y-3 h-fit">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-[14px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
+                    Bot Harness &amp; Reactions
+                  </h3>
+                  <span className="font-mono-tech text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                    Default Config
+                  </span>
+                </div>
+                <p className="text-[11.5px] m-0" style={{ color: 'var(--text-muted)' }}>
+                  Choose which connected CLI harness Discord DMs &amp; channels use so replies never fall back to missing API keys.
+                </p>
+                <div className="space-y-2">
+                  <div>
+                    <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--text-muted)' }}>
+                      Default Harness
+                    </label>
+                    <select
+                      value={discordSettings.defaultHarness}
+                      onChange={(e) =>
+                        setDiscordSettings((prev) => ({
+                          ...prev,
+                          defaultHarness: e.target.value,
+                          defaultModel: '',
+                        }))
+                      }
+                      className="w-full rounded-[6px] border px-2.5 py-1.5 font-mono-tech text-[11.5px]"
+                      style={{ backgroundColor: 'var(--bg-app)', borderColor: 'var(--border-line)', color: 'var(--text-main)' }}
+                    >
+                      <option value="auto">Auto (Detect connected CLI)</option>
+                      <option value="agy-cli">agy-cli (Antigravity)</option>
+                      <option value="claude-code">claude-code (Claude Code)</option>
+                      <option value="kiro-cli">kiro-cli (Kiro)</option>
+                      <option value="sakana">sakana (OpenRouter/OpenAI API key)</option>
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--text-muted)' }}>
+                        Model (optional)
+                      </label>
+                      <input
+                        value={discordSettings.defaultModel}
+                        onChange={(e) =>
+                          setDiscordSettings((prev) => ({ ...prev, defaultModel: e.target.value }))
+                        }
+                        list="discord-harness-models"
+                        placeholder="harness default"
+                        className="w-full rounded-[6px] border px-2 py-1.5 font-mono-tech text-[11px]"
+                        style={{ backgroundColor: 'var(--bg-app)', borderColor: 'var(--border-line)', color: 'var(--text-main)' }}
+                      />
+                      <datalist id="discord-harness-models">
+                        {(harnessModels[discordSettings.defaultHarness] ?? []).map((m) => (
+                          <option key={m.id} value={m.id} />
+                        ))}
+                      </datalist>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--text-muted)' }}>
+                        Effort
+                      </label>
+                      <select
+                        value={discordSettings.defaultEffort}
+                        onChange={(e) =>
+                          setDiscordSettings((prev) => ({ ...prev, defaultEffort: e.target.value }))
+                        }
+                        className="w-full rounded-[6px] border px-2 py-1.5 font-mono-tech text-[11px]"
+                        style={{ backgroundColor: 'var(--bg-app)', borderColor: 'var(--border-line)', color: 'var(--text-main)' }}
+                      >
+                        <option value="">Default</option>
+                        <option value="low">low</option>
+                        <option value="medium">medium</option>
+                        <option value="high">high</option>
+                        <option value="xhigh">xhigh</option>
+                      </select>
+                    </div>
+                  </div>
+                  <label className="flex items-center justify-between gap-2 pt-1 cursor-pointer text-[12px]" style={{ color: 'var(--text-body)' }}>
+                    <span>React with 👀 (read) → ✅ (done)</span>
+                    <input
+                      type="checkbox"
+                      checked={discordSettings.reactWithEmojis}
+                      onChange={(e) =>
+                        setDiscordSettings((prev) => ({ ...prev, reactWithEmojis: e.target.checked }))
+                      }
+                      className="cursor-pointer"
+                    />
+                  </label>
+                </div>
+                <button
+                  type="button"
+                  disabled={savingDcSettings}
+                  onClick={async () => {
+                    setSavingDcSettings(true);
+                    try {
+                      if (isTauriRuntime()) {
+                        const saved = await tauriApi.updateDiscordSettings(discordSettings);
+                        if (saved) setDiscordSettings(saved);
+                      }
+                      onToast('Saved Discord bot harness & reaction settings');
+                    } catch (err) {
+                      onToast(`Failed to save Discord settings: ${String(err)}`);
+                    } finally {
+                      setSavingDcSettings(false);
+                    }
+                  }}
+                  className="btn-solid w-full py-1.5 text-[12px] font-medium cursor-pointer disabled:opacity-50"
+                >
+                  {savingDcSettings ? 'Saving…' : 'Save Bot Settings'}
+                </button>
+              </div>
+
+              <div className="sakana-card rounded-[12px] p-5 space-y-3 h-fit">
                 <h3 className="text-[14px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
                   Quick Invite Bot
                 </h3>
@@ -2487,8 +2616,11 @@ export function DashboardView({
                   Commands &amp; Private DMs
                 </h3>
                 <div className="space-y-1.5 text-[11.5px] font-mono-tech" style={{ color: 'var(--text-body)' }}>
-                  <div><strong>Direct Message</strong> — Private chat for Owner, Friend &amp; Guest</div>
+                  <div><strong>Direct Message</strong> — Private chat (👀 read → ✅ done)</div>
                   <div><strong>!project &lt;name&gt;</strong> — Switch active DM project</div>
+                  <div><strong>!auto list|run|toggle|delete</strong> — Manage automations</div>
+                  <div><strong>!auto create name | cron | prompt</strong> — Schedule task to this chat</div>
+                  <div><strong>/automation</strong> — Slash command for automations</div>
                   <div><strong>/projects</strong> — List projects &amp; channel links</div>
                   <div><strong>/bind &lt;project&gt;</strong> — Link current channel or DM</div>
                   <div><strong>/ask &lt;prompt&gt;</strong> — Send prompt to bound project/DM</div>

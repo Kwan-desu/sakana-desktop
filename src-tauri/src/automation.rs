@@ -242,6 +242,8 @@ async fn send_discord_bot_channel(
         db_lock
             .get_setting("discord_bot_token")
             .map_err(|e| e.to_string())?
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| crate::platform::get_env_or_dotenv("DISCORD_BOT_TOKEN"))
             .unwrap_or_default()
     };
     if token.trim().is_empty() {

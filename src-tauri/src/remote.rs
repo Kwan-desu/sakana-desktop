@@ -1244,6 +1244,17 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             let ok = crate::discord::delete_discord_rule_inner(&ctx.db, id).await?;
             Ok(json!(ok))
         }
+        "get_discord_settings" => {
+            let cfg = crate::discord::get_discord_settings_inner(&ctx.db).await?;
+            serde_json::to_value(cfg).map_err(|e| e.to_string())
+        }
+        "update_discord_settings" => {
+            let raw = args.get("settings").cloned().unwrap_or(args);
+            let cfg: crate::models::DiscordSettings =
+                serde_json::from_value(raw).map_err(|e| e.to_string())?;
+            let saved = crate::discord::update_discord_settings_inner(&ctx.db, cfg).await?;
+            serde_json::to_value(saved).map_err(|e| e.to_string())
+        }
         other => Err(format!("Unsupported remote RPC command: '{}'", other)),
     }
 }

@@ -273,6 +273,13 @@ export interface DiscordStatus {
   lastError?: string;
 }
 
+export interface DiscordSettings {
+  defaultHarness: string;
+  defaultModel: string;
+  defaultEffort: string;
+  reactWithEmojis: boolean;
+}
+
 export interface RemoteStatus {
   running: boolean;
   port: number;

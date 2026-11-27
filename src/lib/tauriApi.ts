@@ -14,6 +14,7 @@ import type {
   DiffFile,
   DirListing,
   DiscordPromptEvent,
+  DiscordSettings,
   DiscordStatus,
   DiscordUserRule,
   EnvSecret,
@@ -526,6 +527,12 @@ export const tauriApi = {
 
   deleteDiscordRule: (id: string) =>
     tauriInvoke<void>('delete_discord_rule', { id }),
+
+  getDiscordSettings: () =>
+    tauriInvoke<DiscordSettings>('get_discord_settings'),
+
+  updateDiscordSettings: (settings: DiscordSettings) =>
+    tauriInvoke<DiscordSettings>('update_discord_settings', { settings }),
 
   // Phase 4: Remote Access
   getRemoteStatus: () => tauriInvoke<RemoteStatus>('get_remote_status'),

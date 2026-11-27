@@ -2795,7 +2795,7 @@ pub async fn run_one_shot_prompt_with_opts(
     prompt: &str,
     read_only: bool,
 ) -> Result<String, String> {
-    let (session, effective_cwd, proj_wsl, account) = {
+    let (session, effective_cwd, proj_wsl, effective_harness, effective_model, effective_effort, account) = {
         let db_lock = db.lock().await;
         let session = db_lock
             .get_session(session_id)
@@ -2826,13 +2826,39 @@ pub async fn run_one_shot_prompt_with_opts(
         } else {
             proj_cwd
         };
+
+        // Resolve harness/model/effort: Discord sessions historically defaulted to "sakana",
+        // which skipped installed CLI harnesses. Respect DiscordSettings and auto-detect
+        // connected CLI harnesses unless explicitly forced to "sakana" (API-key mode).
+        let dc_cfg = crate::discord::load_discord_settings(&db_lock);
+        let raw_harness = session.harness.trim().to_string();
+        let effective_harness = if raw_harness.is_empty() || raw_harness == "auto" || (raw_harness == "sakana" && session.is_discord.unwrap_or(false) && dc_cfg.default_harness != "sakana") {
+            crate::discord::resolve_effective_discord_harness(&dc_cfg)
+        } else {
+            raw_harness
+        };
+        let effective_model = if !session.model.trim().is_empty() {
+            session.model.trim().to_string()
+        } else if session.is_discord.unwrap_or(false) && !dc_cfg.default_model.trim().is_empty() {
+            dc_cfg.default_model.trim().to_string()
+        } else {
+            String::new()
+        };
+        let effective_effort = if !session.effort.trim().is_empty() {
+            session.effort.trim().to_string()
+        } else if session.is_discord.unwrap_or(false) && !dc_cfg.default_effort.trim().is_empty() {
+            dc_cfg.default_effort.trim().to_string()
+        } else {
+            String::new()
+        };
+
         let account = db_lock
             .get_harness_account(&session.account)
             .ok()
             .flatten()
-            .filter(|a| a.harness == session.harness)
-            .or_else(|| db_lock.get_default_harness_account(&session.harness).ok().flatten());
-        (session, effective_cwd, proj_wsl, account)
+            .filter(|a| a.harness == effective_harness)
+            .or_else(|| db_lock.get_default_harness_account(&effective_harness).ok().flatten());
+        (session, effective_cwd, proj_wsl, effective_harness, effective_model, effective_effort, account)
     };
 
     let permission_mode = if read_only {
@@ -2841,14 +2867,14 @@ pub async fn run_one_shot_prompt_with_opts(
         session.permission_mode.as_str()
     };
 
-    let reply_text = if let Some(ref distro) = proj_wsl.filter(|_| session.harness != "sakana") {
+    let reply_text = if let Some(ref distro) = proj_wsl.filter(|_| effective_harness != "sakana") {
         let escaped_prompt = crate::platform::shell_escape_single(prompt);
-        let mut cli_cmd = match session.harness.as_str() {
+        let mut cli_cmd = match effective_harness.as_str() {
             "claude-code" => {
                 let mut parts = vec!["claude".to_string(), "-p".to_string(), escaped_prompt];
-                if !session.model.trim().is_empty() {
+                if !effective_model.is_empty() {
                     parts.push("--model".to_string());
-                    parts.push(crate::platform::shell_escape_single(session.model.trim()));
+                    parts.push(crate::platform::shell_escape_single(&effective_model));
                 }
                 for flag in build_permission_args("claude-code", permission_mode) {
                     parts.push(flag.to_string());
@@ -2857,7 +2883,7 @@ pub async fn run_one_shot_prompt_with_opts(
             }
             "agy-cli" => {
                 let (resolved_model, resolved_effort) =
-                    resolve_agy_model_and_effort_with_db(&db, &session.model, &session.effort)
+                    resolve_agy_model_and_effort_with_db(&db, &effective_model, &effective_effort)
                         .await;
                 let mut parts = vec![
                     "$(command -v agy-cli || command -v agy || echo agy)".to_string(),
@@ -2880,13 +2906,13 @@ pub async fn run_one_shot_prompt_with_opts(
             "kiro-cli" => format!("kiro-cli chat --no-interactive {}", escaped_prompt),
             _ => format!("claude -p {}", escaped_prompt),
         };
-        let env_exports = build_wsl_env_exports(&session.harness, account.as_ref());
+        let env_exports = build_wsl_env_exports(&effective_harness, account.as_ref());
         if !env_exports.is_empty() {
             cli_cmd = format!("{}; {}", env_exports.join("; "), cli_cmd);
         }
         let posix_cwd = wsl_posix_cwd(&effective_cwd);
         let mut cmd = crate::platform::wsl_tokio_shell(distro, &posix_cwd, &cli_cmd);
-        crate::auth::apply_account_env(&mut cmd, &session.harness, account.as_ref());
+        crate::auth::apply_account_env(&mut cmd, &effective_harness, account.as_ref());
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2907,12 +2933,13 @@ pub async fn run_one_shot_prompt_with_opts(
             Ok(Err(e)) => format!("Failed to spawn WSL harness: {}", e),
             Err(_) => "WSL harness request timed out after 90s.".to_string(),
         }
-    } else if let Some((active_harness, bin)) = (session.harness != "sakana")
+    } else if let Some((active_harness, bin)) = (effective_harness != "sakana")
         .then(|| {
-            resolve_harness_binary(&session.harness)
-                .map(|b| (session.harness.as_str(), b))
-                .or_else(|| resolve_harness_binary("claude-code").map(|b| ("claude-code", b)))
+            resolve_harness_binary(&effective_harness)
+                .map(|b| (effective_harness.as_str(), b))
                 .or_else(|| resolve_harness_binary("agy-cli").map(|b| ("agy-cli", b)))
+                .or_else(|| resolve_harness_binary("claude-code").map(|b| ("claude-code", b)))
+                .or_else(|| resolve_harness_binary("kiro-cli").map(|b| ("kiro-cli", b)))
         })
         .flatten()
     {
@@ -2926,7 +2953,7 @@ pub async fn run_one_shot_prompt_with_opts(
             cmd.args(["chat", "--no-interactive", prompt]);
         } else if active_harness == "agy-cli" {
             let (resolved_model, resolved_effort) =
-                resolve_agy_model_and_effort_with_db(&db, &session.model, &session.effort).await;
+                resolve_agy_model_and_effort_with_db(&db, &effective_model, &effective_effort).await;
             cmd.args(["-p", prompt]);
             if let Some(m) = resolved_model {
                 cmd.args(["--model", &m]);
@@ -2937,8 +2964,8 @@ pub async fn run_one_shot_prompt_with_opts(
             cmd.args(build_permission_args(active_harness, permission_mode));
         } else {
             cmd.args(["-p", prompt]);
-            if !session.model.trim().is_empty() {
-                cmd.args(["--model", session.model.trim()]);
+            if !effective_model.is_empty() {
+                cmd.args(["--model", &effective_model]);
             }
             cmd.args(build_permission_args(active_harness, permission_mode));
         }

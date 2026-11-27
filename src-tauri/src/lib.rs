@@ -575,6 +575,8 @@ pub fn run() {
             discord::stop_discord_bot,
             discord::upsert_discord_rule,
             discord::delete_discord_rule,
+            discord::get_discord_settings,
+            discord::update_discord_settings,
             remote::get_remote_status,
             remote::start_remote_server,
             remote::stop_remote_server,

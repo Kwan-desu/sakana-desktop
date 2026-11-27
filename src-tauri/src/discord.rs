@@ -1,17 +1,201 @@
 use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
-use serenity::all::{FullEvent, GatewayIntents};
+use serenity::all::{FullEvent, GatewayIntents, ReactionType};
 use serenity::gateway::ShardManager;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::models::{ChatMessage, CreateSessionInput, DiscordStatus, DiscordUserRule, Project};
+use crate::models::{
+    AutomationItem, ChatMessage, CreateSessionInput, DiscordSettings, DiscordStatus,
+    DiscordUserRule, Project,
+};
 use crate::DbState;
 
 const DISCORD_TOKEN_KEY: &str = "discord_bot_token";
+const DISCORD_SETTINGS_KEY: &str = "discord_bot_settings";
+
+pub fn load_discord_settings(db: &Database) -> DiscordSettings {
+    db.get_setting(DISCORD_SETTINGS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<DiscordSettings>(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_discord_settings(db: &Database, settings: &DiscordSettings) -> Result<(), String> {
+    let raw = serde_json::to_string(settings).map_err(|e| e.to_string())?;
+    db.set_setting(DISCORD_SETTINGS_KEY, &raw)
+        .map_err(|e| e.to_string())
+}
+
+pub fn resolve_effective_discord_harness(settings: &DiscordSettings) -> String {
+    let chosen = settings.default_harness.trim();
+    if !chosen.is_empty() && chosen != "auto" {
+        return chosen.to_string();
+    }
+    for candidate in ["agy-cli", "claude-code", "kiro-cli"] {
+        if crate::harness::resolve_harness_binary(candidate).is_some() {
+            return candidate.to_string();
+        }
+    }
+    "agy-cli".to_string()
+}
+
+fn find_automation_by_query<'a>(
+    items: &'a [AutomationItem],
+    query: &str,
+) -> Option<&'a AutomationItem> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    items
+        .iter()
+        .find(|a| a.id.eq_ignore_ascii_case(&q) || a.name.eq_ignore_ascii_case(&q))
+        .or_else(|| items.iter().find(|a| a.name.to_lowercase().contains(&q)))
+}
+
+fn format_automations_list(items: &[AutomationItem]) -> String {
+    if items.is_empty() {
+        return "No automations configured yet. Use `!auto create <name> | <cron> | <prompt>` or `/automation` to add one.".to_string();
+    }
+    let lines = items
+        .iter()
+        .map(|a| {
+            let state = if a.enabled { "ON" } else { "OFF" };
+            format!(
+                "• **{}** (`{}` · `{}` · {} · last: {})",
+                a.name, a.kind, a.schedule, state, a.last_run_status
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("**Sakana Automations:**\n{}", lines.join("\n"))
+}
+
+async fn handle_automation_command(
+    app: &AppHandle,
+    db: &Arc<Mutex<Database>>,
+    role: &str,
+    channel_id: u64,
+    action: &str,
+    arg_text: &str,
+) -> Result<String, String> {
+    let act = action.trim().to_lowercase();
+    if act.is_empty() || act == "list" {
+        let items = {
+            let db_lock = db.lock().await;
+            db_lock.list_automations().unwrap_or_default()
+        };
+        return Ok(format_automations_list(&items));
+    }
+
+    if role != "owner" && role != "friend" {
+        return Err("Only Owner or Friend can run or modify automations from Discord.".to_string());
+    }
+
+    match act.as_str() {
+        "run" => {
+            let target_id = {
+                let db_lock = db.lock().await;
+                let items = db_lock.list_automations().unwrap_or_default();
+                find_automation_by_query(&items, arg_text)
+                    .map(|a| a.id.clone())
+                    .ok_or_else(|| format!("Automation `{}` not found. Use `!auto list` to see available automations.", arg_text.trim()))?
+            };
+            let updated = crate::automation::execute_automation(db, Some(app), &target_id).await?;
+            let summary = updated
+                .history
+                .first()
+                .map(|h| h.summary.as_str())
+                .unwrap_or("Completed");
+            Ok(format!(
+                "Ran **{}** → `{}`\n{}",
+                updated.name,
+                updated.last_run_status,
+                truncate_discord_reply(summary)
+            ))
+        }
+        "toggle" => {
+            let (target_id, next_enabled) = {
+                let db_lock = db.lock().await;
+                let items = db_lock.list_automations().unwrap_or_default();
+                let found = find_automation_by_query(&items, arg_text)
+                    .ok_or_else(|| format!("Automation `{}` not found.", arg_text.trim()))?;
+                (found.id.clone(), !found.enabled)
+            };
+            let updated = {
+                let db_lock = db.lock().await;
+                db_lock
+                    .toggle_automation(&target_id, next_enabled)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Automation not found".to_string())?
+            };
+            let auto_state = app.state::<crate::automation::AutomationState>();
+            let _ = crate::automation::sync_scheduler(&auto_state, Arc::clone(db), app.clone()).await;
+            Ok(format!(
+                "Automation **{}** is now **{}**.",
+                updated.name,
+                if updated.enabled { "ENABLED" } else { "DISABLED" }
+            ))
+        }
+        "delete" | "rm" | "remove" => {
+            let (target_id, target_name) = {
+                let db_lock = db.lock().await;
+                let items = db_lock.list_automations().unwrap_or_default();
+                let found = find_automation_by_query(&items, arg_text)
+                    .ok_or_else(|| format!("Automation `{}` not found.", arg_text.trim()))?;
+                (found.id.clone(), found.name.clone())
+            };
+            {
+                let db_lock = db.lock().await;
+                db_lock
+                    .delete_automation(&target_id)
+                    .map_err(|e| e.to_string())?;
+            };
+            let auto_state = app.state::<crate::automation::AutomationState>();
+            let _ = crate::automation::sync_scheduler(&auto_state, Arc::clone(db), app.clone()).await;
+            Ok(format!("Deleted automation **{}**.", target_name))
+        }
+        "create" | "add" => {
+            // Format: <name> | <schedule> | <prompt>
+            let parts: Vec<&str> = arg_text.splitn(3, '|').map(|s| s.trim()).collect();
+            if parts.len() < 3 || parts[0].is_empty() || parts[1].is_empty() || parts[2].is_empty() {
+                return Err("Usage: `!auto create <name> | <cron schedule> | <prompt>`\nExample: `!auto create Daily Standup | 0 9 * * * | Summarize git commits from the last 24h`".to_string());
+            }
+            let name = parts[0];
+            let schedule = parts[1];
+            let raw_prompt = parts[2];
+            let kind = if schedule.starts_with('/') { "webhook" } else { "cron" };
+            // Route AI output back to this Discord channel automatically unless a prefix is already specified.
+            let prompt = if raw_prompt.starts_with("discord:")
+                || raw_prompt.starts_with("discord-ai:")
+                || raw_prompt.starts_with("shell:")
+                || raw_prompt.starts_with("cmd:")
+                || raw_prompt.starts_with("notify:")
+            {
+                raw_prompt.to_string()
+            } else {
+                format!("discord-ai:channel:{}|{}", channel_id, raw_prompt)
+            };
+            let created = {
+                let db_lock = db.lock().await;
+                db_lock
+                    .create_automation(name, kind, schedule, &prompt)
+                    .map_err(|e| e.to_string())?
+            };
+            let auto_state = app.state::<crate::automation::AutomationState>();
+            let _ = crate::automation::sync_scheduler(&auto_state, Arc::clone(db), app.clone()).await;
+            Ok(format!(
+                "Created {} automation **{}** (`{}`) — results will post back to this Discord chat.",
+                created.kind, created.name, created.schedule
+            ))
+        }
+        _ => Err("Unknown automation action. Try: `list`, `run <name>`, `toggle <name>`, `delete <name>`, or `create <name> | <cron> | <prompt>`.".to_string()),
+    }
+}
 
 #[derive(Clone)]
 pub struct DiscordState {
@@ -92,6 +276,18 @@ async fn dispatch_discord_prompt(
 ) -> Result<(String, String), String> {
     let (session_id, target_label) = {
         let db_lock = db.lock().await;
+        let dc_cfg = load_discord_settings(&db_lock);
+        let default_harness = resolve_effective_discord_harness(&dc_cfg);
+        let default_model = if dc_cfg.default_model.trim().is_empty() {
+            None
+        } else {
+            Some(dc_cfg.default_model.trim().to_string())
+        };
+        let default_effort = if dc_cfg.default_effort.trim().is_empty() {
+            None
+        } else {
+            Some(dc_cfg.default_effort.trim().to_string())
+        };
         let projects = db_lock.list_projects().unwrap_or_default();
         let all_sessions = db_lock.list_sessions(None).unwrap_or_default();
 
@@ -127,9 +323,9 @@ async fn dispatch_discord_prompt(
                     .create_session(CreateSessionInput {
                         project_id: target_proj.id.clone(),
                         title: format!("DM · {} ({})", author_name, role),
-                        harness: Some("sakana".to_string()),
-                        model: None,
-                        effort: None,
+                        harness: Some(default_harness.clone()),
+                        model: default_model.clone(),
+                        effort: default_effort.clone(),
                         account: None,
                         permission_mode: Some("yolo".to_string()),
                         worktree_path: Some(target_proj.cwd.clone()),
@@ -189,9 +385,9 @@ async fn dispatch_discord_prompt(
                         .create_session(CreateSessionInput {
                             project_id: target_project.id.clone(),
                             title: format!("Discord {}", channel_label),
-                            harness: Some("sakana".to_string()),
-                            model: None,
-                            effort: None,
+                            harness: Some(default_harness.clone()),
+                            model: default_model.clone(),
+                            effort: default_effort.clone(),
                             account: None,
                             permission_mode: Some("yolo".to_string()),
                             worktree_path: Some(target_project.cwd.clone()),
@@ -415,6 +611,36 @@ async fn ask(
     Ok(())
 }
 
+#[poise::command(slash_command, description_localized("en-US", "List, run, create, toggle, or delete Sakana automations"))]
+async fn automation(
+    ctx: BotContext<'_>,
+    #[description = "Action: list, run, create, toggle, or delete"] action: String,
+    #[description = "Automation name/id, or for create: name | cron | prompt"] args: Option<String>,
+) -> Result<(), BotError> {
+    let role = resolve_user_role(&ctx.data().db, ctx.author().id.get()).await;
+    if role == "blocked" {
+        ctx.say("Access denied (blocked by Sakana RBAC).").await?;
+        return Ok(());
+    }
+
+    ctx.defer().await?;
+    let arg_text = args.unwrap_or_default();
+    match handle_automation_command(
+        &ctx.data().app,
+        &ctx.data().db,
+        &role,
+        ctx.channel_id().get(),
+        &action,
+        &arg_text,
+    )
+    .await
+    {
+        Ok(msg) => { ctx.say(msg).await?; }
+        Err(err) => { ctx.say(err).await?; }
+    }
+    Ok(())
+}
+
 async fn handle_event(
     ctx: &serenity::Context,
     event: &FullEvent,
@@ -449,8 +675,16 @@ async fn handle_event(
                     return Ok(());
                 }
 
+                let react_enabled = {
+                    let db_lock = data.db.lock().await;
+                    load_discord_settings(&db_lock).react_with_emojis
+                };
+
                 // Quick DM command: !project <name> to switch active project
                 if let Some(rest) = content.strip_prefix("!project") {
+                    if react_enabled {
+                        let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
+                    }
                     let query = rest.trim();
                     let reply = {
                         let db_lock = data.db.lock().await;
@@ -470,9 +704,55 @@ async fn handle_event(
                         }
                     };
                     let _ = new_message.reply(&ctx.http, reply).await;
+                    if react_enabled {
+                        let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
+                    }
                     return Ok(());
                 }
 
+                // Quick DM command: !auto / !automation <list|run|toggle|delete|create> ...
+                if let Some(rest) = content
+                    .strip_prefix("!automation")
+                    .or_else(|| content.strip_prefix("!auto"))
+                {
+                    if react_enabled {
+                        let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
+                    }
+                    let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                    let trimmed = rest.trim();
+                    let (action, arg_text) = match trimmed.split_once(char::is_whitespace) {
+                        Some((a, b)) => (a.trim(), b.trim()),
+                        None => (trimmed, ""),
+                    };
+                    match handle_automation_command(
+                        &data.app,
+                        &data.db,
+                        &role,
+                        new_message.channel_id.get(),
+                        action,
+                        arg_text,
+                    )
+                    .await
+                    {
+                        Ok(reply) => {
+                            let _ = new_message.reply(&ctx.http, reply).await;
+                            if react_enabled {
+                                let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = new_message.reply(&ctx.http, err).await;
+                            if react_enabled {
+                                let _ = new_message.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+
+                if react_enabled {
+                    let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
+                }
                 let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
                 let channel_label = format!("#dm-{}", user_id);
                 match dispatch_discord_prompt(
@@ -491,9 +771,15 @@ async fn handle_event(
                         let _ = new_message
                             .reply(&ctx.http, format!("**{}**:\n{}", target_label, reply))
                             .await;
+                        if react_enabled {
+                            let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
+                        }
                     }
                     Err(err) => {
                         let _ = new_message.reply(&ctx.http, err).await;
+                        if react_enabled {
+                            let _ = new_message.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
+                        }
                     }
                 }
             } else {
@@ -530,6 +816,54 @@ async fn handle_event(
                     return Ok(());
                 }
 
+                let react_enabled = {
+                    let db_lock = data.db.lock().await;
+                    load_discord_settings(&db_lock).react_with_emojis
+                };
+
+                // Support !auto / !automation directly inside bound guild channels
+                if let Some(rest) = content
+                    .strip_prefix("!automation")
+                    .or_else(|| content.strip_prefix("!auto"))
+                {
+                    if react_enabled {
+                        let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
+                    }
+                    let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                    let trimmed = rest.trim();
+                    let (action, arg_text) = match trimmed.split_once(char::is_whitespace) {
+                        Some((a, b)) => (a.trim(), b.trim()),
+                        None => (trimmed, ""),
+                    };
+                    match handle_automation_command(
+                        &data.app,
+                        &data.db,
+                        &role,
+                        new_message.channel_id.get(),
+                        action,
+                        arg_text,
+                    )
+                    .await
+                    {
+                        Ok(reply) => {
+                            let _ = new_message.reply(&ctx.http, reply).await;
+                            if react_enabled {
+                                let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = new_message.reply(&ctx.http, err).await;
+                            if react_enabled {
+                                let _ = new_message.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+
+                if react_enabled {
+                    let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
+                }
                 let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
                 match dispatch_discord_prompt(
                     &data.app,
@@ -545,9 +879,15 @@ async fn handle_event(
                 {
                     Ok((_, reply)) => {
                         let _ = new_message.reply(&ctx.http, reply).await;
+                        if react_enabled {
+                            let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
+                        }
                     }
                     Err(err) => {
                         let _ = new_message.reply(&ctx.http, err).await;
+                        if react_enabled {
+                            let _ = new_message.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
+                        }
                     }
                 }
             }
@@ -640,7 +980,7 @@ pub async fn start_discord_bot_inner(
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![status(), projects(), bind(), ask()],
+            commands: vec![status(), projects(), bind(), ask(), automation()],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(handle_event(ctx, event, framework, data))
             },
@@ -758,4 +1098,45 @@ pub async fn delete_discord_rule(
     id: String,
 ) -> Result<bool, String> {
     delete_discord_rule_inner(&db_state.0, id).await
+}
+
+pub async fn get_discord_settings_inner(
+    db: &Arc<Mutex<Database>>,
+) -> Result<DiscordSettings, String> {
+    let db_lock = db.lock().await;
+    Ok(load_discord_settings(&db_lock))
+}
+
+#[tauri::command]
+pub async fn get_discord_settings(
+    db_state: State<'_, DbState>,
+) -> Result<DiscordSettings, String> {
+    get_discord_settings_inner(&db_state.0).await
+}
+
+pub async fn update_discord_settings_inner(
+    db: &Arc<Mutex<Database>>,
+    settings: DiscordSettings,
+) -> Result<DiscordSettings, String> {
+    let normalized = DiscordSettings {
+        default_harness: if settings.default_harness.trim().is_empty() {
+            "auto".to_string()
+        } else {
+            settings.default_harness.trim().to_string()
+        },
+        default_model: settings.default_model.trim().to_string(),
+        default_effort: settings.default_effort.trim().to_string(),
+        react_with_emojis: settings.react_with_emojis,
+    };
+    let db_lock = db.lock().await;
+    save_discord_settings(&db_lock, &normalized)?;
+    Ok(normalized)
+}
+
+#[tauri::command]
+pub async fn update_discord_settings(
+    db_state: State<'_, DbState>,
+    settings: DiscordSettings,
+) -> Result<DiscordSettings, String> {
+    update_discord_settings_inner(&db_state.0, settings).await
 }

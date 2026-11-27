@@ -406,6 +406,26 @@ pub struct DiscordStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DiscordSettings {
+    pub default_harness: String,
+    pub default_model: String,
+    pub default_effort: String,
+    pub react_with_emojis: bool,
+}
+
+impl Default for DiscordSettings {
+    fn default() -> Self {
+        Self {
+            default_harness: "auto".to_string(),
+            default_model: String::new(),
+            default_effort: "medium".to_string(),
+            react_with_emojis: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteStatus {
     pub running: bool,
     pub port: u16,

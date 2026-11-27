@@ -85,6 +85,9 @@ interface ChatPaneProps {
   onOpenHarnessAccounts?: () => void;
   disabledHarnesses?: HarnessId[];
   onToast: (msg: string) => void;
+  onOpenFile?: (path: string) => void;
+  splitBridgeEnabled?: boolean;
+  onToggleSplitBridge?: () => void;
   skills?: SkillItem[];
   theme?: ThemeId;
 }
@@ -213,7 +216,22 @@ function handleExternalLinkClick(e: React.MouseEvent, url: string) {
   }
 }
 
-function renderInline(line: string): ReactNode[] {
+const FILE_EXT_RE =
+  /\.(md|markdown|txt|ts|tsx|js|jsx|mjs|cjs|json|rs|py|go|java|kt|c|cc|cpp|h|hpp|cs|rb|php|css|scss|less|html|htm|xml|svg|yaml|yml|toml|ini|conf|sql|sh|bash|zsh|bat|cmd|ps1|env|csv|log|pdf|png|jpg|jpeg|gif|webp|docx|xlsx|pptx|lock|gitignore|dockerfile)(?::\d+(?::\d+)?)?$/i;
+
+function isLikelyFilePath(raw: string): boolean {
+  const s = raw.trim();
+  if (!s || s.length > 220 || /\s/.test(s) || /^https?:\/\//i.test(s) || s.startsWith('--')) {
+    return false;
+  }
+  if (FILE_EXT_RE.test(s)) return true;
+  if (/^(README|LICENSE|Makefile|Dockerfile|Cargo\.toml|package\.json)(?::\d+)?$/i.test(s)) {
+    return true;
+  }
+  return false;
+}
+
+function renderInline(line: string, onOpenFile?: (path: string) => void): ReactNode[] {
   const inlineRe = /(`[^`]+`|\[[^\]]+\]\([^)]+\)|\*\*[^*\n]+\*\*|~~[^~\n]+~~|\*[^*\n]+\*|(?<!\w)_[^_\n]+_(?!\w))/g;
   const out: ReactNode[] = [];
   let lastIndex = 0;
@@ -226,31 +244,63 @@ function renderInline(line: string): ReactNode[] {
     }
     const tok = match[0];
     if (tok.startsWith('`') && tok.endsWith('`')) {
-      out.push(
-        <code
-          key={key++}
-          className="font-mono-tech text-[12px] px-1.5 py-0.5 rounded-[5px]"
-          style={{ backgroundColor: 'var(--bg-elevated)', color: 'var(--text-main)' }}
-        >
-          {tok.slice(1, -1)}
-        </code>,
-      );
+      const inner = tok.slice(1, -1);
+      if (onOpenFile && isLikelyFilePath(inner)) {
+        out.push(
+          <button
+            key={key++}
+            type="button"
+            onClick={() => onOpenFile(inner)}
+            className="font-mono-tech text-[12px] px-1.5 py-0.5 rounded-[5px] inline cursor-pointer hover:underline transition-opacity hover:opacity-90"
+            style={{ backgroundColor: 'var(--accent-blue-bg)', color: 'var(--accent-blue)' }}
+            title={`Open ${inner} in Sakana sidebar`}
+          >
+            {inner}
+          </button>,
+        );
+      } else {
+        out.push(
+          <code
+            key={key++}
+            className="font-mono-tech text-[12px] px-1.5 py-0.5 rounded-[5px]"
+            style={{ backgroundColor: 'var(--bg-elevated)', color: 'var(--text-main)' }}
+          >
+            {inner}
+          </code>,
+        );
+      }
     } else if (tok.startsWith('[')) {
       const linkMatch = tok.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       if (linkMatch) {
         const [, label, url] = linkMatch;
-        out.push(
-          <a
-            key={key++}
-            href={url}
-            onClick={(e) => handleExternalLinkClick(e, url)}
-            className="underline decoration-1 underline-offset-2 hover:opacity-80 cursor-pointer"
-            style={{ color: 'var(--accent-blue)' }}
-            title={url}
-          >
-            {label}
-          </a>,
-        );
+        const isLocalFile = !/^https?:\/\//i.test(url) && !url.startsWith('mailto:') && !url.startsWith('#');
+        if (onOpenFile && isLocalFile) {
+          out.push(
+            <button
+              key={key++}
+              type="button"
+              onClick={() => onOpenFile(url)}
+              className="underline decoration-1 underline-offset-2 hover:opacity-80 cursor-pointer inline"
+              style={{ color: 'var(--accent-blue)' }}
+              title={`Open ${url} in Sakana sidebar`}
+            >
+              {label}
+            </button>,
+          );
+        } else {
+          out.push(
+            <a
+              key={key++}
+              href={url}
+              onClick={(e) => handleExternalLinkClick(e, url)}
+              className="underline decoration-1 underline-offset-2 hover:opacity-80 cursor-pointer"
+              style={{ color: 'var(--accent-blue)' }}
+              title={url}
+            >
+              {label}
+            </a>,
+          );
+        }
       } else {
         out.push(tok);
       }
@@ -328,6 +378,7 @@ function parseListBlock(
   lines: string[],
   startIndex: number,
   keyPrefix: string,
+  onOpenFile?: (path: string) => void,
 ): { node: ReactNode; nextIndex: number } {
   const first = matchListLine(lines[startIndex]);
   if (!first) return { node: null, nextIndex: startIndex + 1 };
@@ -353,12 +404,12 @@ function parseListBlock(
       while (i < lines.length) {
         const next = matchListLine(lines[i]);
         if (!next || next.indent <= baseIndent) break;
-        const sub = parseListBlock(lines, i, `${keyPrefix}-sub-${i}`);
+        const sub = parseListBlock(lines, i, `${keyPrefix}-sub-${i}`, onOpenFile);
         item.children.push(sub.node);
         i = sub.nextIndex;
       }
     } else {
-      const sub = parseListBlock(lines, i, `${keyPrefix}-sub-${i}`);
+      const sub = parseListBlock(lines, i, `${keyPrefix}-sub-${i}`, onOpenFile);
       if (items.length > 0) {
         items[items.length - 1].children.push(sub.node);
       }
@@ -387,11 +438,11 @@ function parseListBlock(
                   style={{ accentColor: 'var(--accent-blue)' }}
                 />
                 <span className={item.parsed.taskChecked ? 'line-through opacity-75' : undefined}>
-                  {renderInline(item.parsed.content)}
+                  {renderInline(item.parsed.content, onOpenFile)}
                 </span>
               </div>
             ) : (
-              renderInline(item.parsed.content)
+              renderInline(item.parsed.content, onOpenFile)
             )}
             {item.children}
           </li>
@@ -403,7 +454,11 @@ function parseListBlock(
   return { node, nextIndex: i };
 }
 
-function renderMarkdownBlocks(blockText: string, keyPrefix: string): ReactNode[] {
+function renderMarkdownBlocks(
+  blockText: string,
+  keyPrefix: string,
+  onOpenFile?: (path: string) => void,
+): ReactNode[] {
   const lines = blockText.split('\n');
   const nodes: ReactNode[] = [];
   let i = 0;
@@ -419,7 +474,7 @@ function renderMarkdownBlocks(blockText: string, keyPrefix: string): ReactNode[]
     const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
     if (headingMatch) {
       const level = headingMatch[1].length;
-      const content = renderInline(headingMatch[2]);
+      const content = renderInline(headingMatch[2], onOpenFile);
       const cls =
         level === 1
           ? 'text-[17px] font-semibold mt-2 mb-1'
@@ -470,7 +525,7 @@ function renderMarkdownBlocks(blockText: string, keyPrefix: string): ReactNode[]
                       textAlign: aligns[hIdx] || 'left',
                     }}
                   >
-                    {renderInline(h)}
+                    {renderInline(h, onOpenFile)}
                   </th>
                 ))}
               </tr>
@@ -487,7 +542,7 @@ function renderMarkdownBlocks(blockText: string, keyPrefix: string): ReactNode[]
                         textAlign: aligns[cIdx] || 'left',
                       }}
                     >
-                      {renderInline(r[cIdx] ?? '')}
+                      {renderInline(r[cIdx] ?? '', onOpenFile)}
                     </td>
                   ))}
                 </tr>
@@ -527,7 +582,7 @@ function renderMarkdownBlocks(blockText: string, keyPrefix: string): ReactNode[]
         >
           {quoteLines.map((ql, qIdx) => (
             <p key={qIdx} className="m-0">
-              {renderInline(ql)}
+              {renderInline(ql, onOpenFile)}
             </p>
           ))}
         </blockquote>,
@@ -537,7 +592,7 @@ function renderMarkdownBlocks(blockText: string, keyPrefix: string): ReactNode[]
 
     // Lists (unordered, ordered, task, and nested)
     if (matchListLine(line)) {
-      const list = parseListBlock(lines, i, `${keyPrefix}-list-${i}`);
+      const list = parseListBlock(lines, i, `${keyPrefix}-list-${i}`, onOpenFile);
       nodes.push(list.node);
       i = list.nextIndex;
       continue;
@@ -563,7 +618,7 @@ function renderMarkdownBlocks(blockText: string, keyPrefix: string): ReactNode[]
           {paraLines.map((pl, pIdx) => (
             <Fragment key={pIdx}>
               {pIdx > 0 && <br />}
-              {renderInline(pl)}
+              {renderInline(pl, onOpenFile)}
             </Fragment>
           ))}
         </p>,
@@ -574,12 +629,14 @@ function renderMarkdownBlocks(blockText: string, keyPrefix: string): ReactNode[]
   return nodes;
 }
 
-const SimpleMarkdown = memo(function SimpleMarkdown({
+export const SimpleMarkdown = memo(function SimpleMarkdown({
   text,
   stripSakanaUi = false,
+  onOpenFile,
 }: {
   text: string;
   stripSakanaUi?: boolean;
+  onOpenFile?: (path: string) => void;
 }) {
   const sourceText = stripSakanaUi
     ? text.replace(/```sakana-ui\b[\s\S]*?(?:```|$)/g, '').replace(/\n{3,}/g, '\n\n').trim()
@@ -598,6 +655,52 @@ const SimpleMarkdown = memo(function SimpleMarkdown({
           const lines = inner.split('\n');
           const lang = lines[0]?.trim() || 'code';
           const code = lines.slice(1).join('\n');
+          if (lang === 'sakana-action') {
+            return (
+              <div
+                key={idx}
+                className="rounded-[8px] border px-3 py-1.5 inline-flex items-center gap-2 font-mono-tech text-[11px]"
+                style={{
+                  borderColor: 'var(--accent-blue)',
+                  backgroundColor: 'var(--accent-blue-bg)',
+                  color: 'var(--accent-blue)',
+                }}
+              >
+                <span>✦ Sakana Action Applied</span>
+              </div>
+            );
+          }
+          if (lang === 'sakana-peer') {
+            let peerText = code.trim();
+            try {
+              const parsed = JSON.parse(code.trim());
+              if (parsed && typeof parsed.message === 'string') {
+                peerText = parsed.message;
+              }
+            } catch {
+              // fall back to raw text
+            }
+            return (
+              <div
+                key={idx}
+                className="rounded-[9px] border px-3 py-2 space-y-1"
+                style={{
+                  borderColor: 'var(--accent-blue)',
+                  backgroundColor: 'var(--accent-blue-bg)',
+                }}
+              >
+                <div
+                  className="font-mono-tech text-[10.5px] font-medium flex items-center gap-1.5"
+                  style={{ color: 'var(--accent-blue)' }}
+                >
+                  <span>⇄ Sent to Split-Mode Peer Session</span>
+                </div>
+                <div className="text-[12.5px] leading-relaxed whitespace-pre-wrap" style={{ color: 'var(--text-main)' }}>
+                  {peerText}
+                </div>
+              </div>
+            );
+          }
           return (
             <div
               key={idx}
@@ -621,7 +724,7 @@ const SimpleMarkdown = memo(function SimpleMarkdown({
           );
         }
 
-        return renderMarkdownBlocks(part, `b-${idx}`);
+        return renderMarkdownBlocks(part, `b-${idx}`, onOpenFile);
       })}
     </div>
   );
@@ -881,6 +984,7 @@ interface MessageRowProps {
   onViewCheckpointDiff: (checkpointId: string) => void;
   onRevertToCheckpoint: (threadId: string, checkpointId: string) => void;
   onToast: (msg: string) => void;
+  onOpenFile?: (path: string) => void;
 }
 
 const MessageRow = memo(function MessageRow({
@@ -896,6 +1000,7 @@ const MessageRow = memo(function MessageRow({
   onViewCheckpointDiff,
   onRevertToCheckpoint,
   onToast,
+  onOpenFile,
 }: MessageRowProps) {
   if (m.role === 'user') {
     return (
@@ -916,7 +1021,7 @@ const MessageRow = memo(function MessageRow({
           className="max-w-[80%] rounded-[14px] px-4 py-2.5 text-[13.5px]"
           style={{ backgroundColor: 'var(--bg-elevated)', color: 'var(--text-main)' }}
         >
-          <SimpleMarkdown text={m.text} stripSakanaUi={Boolean(m.widget)} />
+          <SimpleMarkdown text={m.text} stripSakanaUi={Boolean(m.widget)} onOpenFile={onOpenFile} />
         </div>
         <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
           <CopyButton
@@ -1007,9 +1112,21 @@ const MessageRow = memo(function MessageRow({
                     )}
                     <span style={{ color: 'var(--text-main)' }}>{tool.name}</span>
                     {tool.target && (
-                      <span className="truncate" style={{ color: 'var(--text-muted)' }}>
-                        {tool.target}
-                      </span>
+                      onOpenFile && isLikelyFilePath(tool.target) ? (
+                        <button
+                          type="button"
+                          onClick={() => onOpenFile(tool.target)}
+                          className="truncate hover:underline cursor-pointer"
+                          style={{ color: 'var(--accent-blue)' }}
+                          title={`Open ${tool.target} in Sakana sidebar`}
+                        >
+                          {tool.target}
+                        </button>
+                      ) : (
+                        <span className="truncate" style={{ color: 'var(--text-muted)' }}>
+                          {tool.target}
+                        </span>
+                      )
                     )}
                   </span>
                   {tool.durationMs > 0 && (
@@ -1073,7 +1190,7 @@ const MessageRow = memo(function MessageRow({
         </div>
       )}
 
-      <SimpleMarkdown text={m.text} stripSakanaUi={Boolean(m.widget)} />
+      <SimpleMarkdown text={m.text} stripSakanaUi={Boolean(m.widget)} onOpenFile={onOpenFile} />
 
       {/* Inline sakana-ui Widget */}
       {m.widget && <SakanaUiCard msg={m} theme={theme} />}
@@ -1250,6 +1367,9 @@ export function ChatPane({
   onOpenHarnessAccounts,
   disabledHarnesses = [],
   onToast,
+  onOpenFile,
+  splitBridgeEnabled = true,
+  onToggleSplitBridge,
   skills = [],
   theme = 'paper',
 }: ChatPaneProps) {
@@ -1714,6 +1834,7 @@ export function ChatPane({
                   onViewCheckpointDiff={onViewCheckpointDiff}
                   onRevertToCheckpoint={onRevertToCheckpoint}
                   onToast={onToast}
+                  onOpenFile={onOpenFile}
                 />
               ))}
 
@@ -1898,6 +2019,34 @@ export function ChatPane({
                 </span>
               )}
               <div className="flex items-center gap-1 shrink-0">
+                {secondaryThread && onToggleSplitBridge && (
+                  <button
+                    type="button"
+                    onClick={onToggleSplitBridge}
+                    className="px-2 py-1 rounded-[6px] border font-mono-tech text-[10.5px] inline-flex items-center gap-1 cursor-pointer transition-colors"
+                    style={
+                      splitBridgeEnabled
+                        ? {
+                            borderColor: 'var(--accent-blue)',
+                            backgroundColor: 'var(--accent-blue-bg)',
+                            color: 'var(--accent-blue)',
+                          }
+                        : {
+                            borderColor: 'var(--border-line)',
+                            backgroundColor: 'var(--bg-card)',
+                            color: 'var(--text-muted)',
+                          }
+                    }
+                    title={
+                      splitBridgeEnabled
+                        ? `Native Split Bridge ON: ${HARNESS_META[thread.harness].name} ⇄ ${HARNESS_META[secondaryThread.harness].name} can talk to each other automatically`
+                        : 'Enable native agent-to-agent communication between split sessions'
+                    }
+                  >
+                    <span>⇄</span>
+                    <span>{splitBridgeEnabled ? 'Bridge ON' : 'Bridge OFF'}</span>
+                  </button>
+                )}
                 {onQuickNewThread && (
                   <button
                     type="button"
@@ -1951,6 +2100,7 @@ export function ChatPane({
                       onViewCheckpointDiff={onViewCheckpointDiff}
                       onRevertToCheckpoint={onRevertToCheckpoint}
                       onToast={onToast}
+                      onOpenFile={onOpenFile}
                     />
                   ))}
                   {secondaryThread.pendingApproval && (

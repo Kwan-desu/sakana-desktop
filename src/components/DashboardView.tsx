@@ -26,6 +26,7 @@ import {
   X,
 } from '@phosphor-icons/react';
 import type {
+  AppCustomization,
   AutomationItem,
   DashboardSubtab,
   DiscordStatus,
@@ -39,10 +40,13 @@ import type {
   HarnessLoginResponse,
   HarnessModelOption,
   McpServer,
+  Project,
   QuotaAccount,
   RemoteHost,
   RemoteStatus,
   SkillItem,
+  SyncConfig,
+  SyncStatus,
   SystemTelemetry,
   ThemeId,
   Thread,
@@ -112,6 +116,15 @@ interface DashboardViewProps {
   onRefreshModels: () => Promise<void> | void;
   refreshingModels?: boolean;
   onOpenGitHubClone?: () => void;
+  projects?: Project[];
+  onSetProjectDiscordChannel?: (projectId: string, channel?: string) => Promise<void> | void;
+  customization?: AppCustomization | null;
+  onUpdateCustomization?: (next: AppCustomization) => Promise<void> | void;
+  onResetCustomization?: () => Promise<void> | void;
+  syncConfig?: SyncConfig | null;
+  syncStatus?: SyncStatus | null;
+  onUpdateSyncConfig?: (next: SyncConfig) => Promise<void> | void;
+  onSyncNow?: () => Promise<void> | void;
 }
 
 function formatUptime(seconds: number): string {
@@ -176,6 +189,15 @@ export function DashboardView({
   onRefreshModels,
   refreshingModels = false,
   onOpenGitHubClone,
+  projects = [],
+  onSetProjectDiscordChannel,
+  customization,
+  onUpdateCustomization,
+  onResetCustomization,
+  syncConfig,
+  syncStatus,
+  onUpdateSyncConfig,
+  onSyncNow,
 }: DashboardViewProps) {
   const [ghStatus, setGhStatus] = useState<GitHubAuthStatus | null>(null);
   const [ghTokenInput, setGhTokenInput] = useState('');
@@ -199,6 +221,7 @@ export function DashboardView({
   }, [subtab]);
   const [openAutoHistory, setOpenAutoHistory] = useState<Record<string, boolean>>({});
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, string>>({});
+  const [projChannelDrafts, setProjChannelDrafts] = useState<Record<string, string>>({});
   const [hostName, setHostName] = useState('');
   const [hostUrl, setHostUrl] = useState('');
   const [hostToken, setHostToken] = useState('');
@@ -2344,6 +2367,67 @@ export function DashboardView({
                   ))
                 )}
               </div>
+
+              {onSetProjectDiscordChannel && projects.length > 0 && (
+                <div className="sakana-card rounded-[12px] p-5 space-y-3 mt-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <h3 className="text-[14px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
+                      Project Channel Bindings
+                    </h3>
+                    <span className="font-mono-tech text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
+                      Route #channel → project
+                    </span>
+                  </div>
+                  <p className="text-[11.5px] m-0" style={{ color: 'var(--text-muted)' }}>
+                    Bind a workspace project to a Discord channel name (e.g. <code>#sakana</code>). Messages in that channel automatically route to the matching project.
+                  </p>
+                  <div className="space-y-2">
+                    {projects.map((p) => {
+                      const draft = projChannelDrafts[p.id] ?? p.discordChannel ?? '';
+                      const dirty = draft.trim() !== (p.discordChannel ?? '');
+                      return (
+                        <div
+                          key={p.id}
+                          className="flex items-center justify-between gap-2 p-2.5 rounded-[8px] border"
+                          style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[12.5px] font-medium truncate" style={{ color: 'var(--text-main)' }}>
+                              {p.name}
+                            </div>
+                            <div className="font-mono-tech text-[10px] truncate" style={{ color: 'var(--text-muted)' }}>
+                              {p.cwd}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <input
+                              value={draft}
+                              onChange={(e) =>
+                                setProjChannelDrafts((prev) => ({ ...prev, [p.id]: e.target.value }))
+                              }
+                              placeholder="#channel-name"
+                              className="w-36 rounded-[6px] border px-2 py-1 font-mono-tech text-[11px]"
+                              style={{
+                                backgroundColor: 'var(--bg-card)',
+                                borderColor: 'var(--border-line)',
+                                color: 'var(--text-main)',
+                              }}
+                            />
+                            <button
+                              type="button"
+                              disabled={!dirty}
+                              onClick={() => void onSetProjectDiscordChannel(p.id, draft)}
+                              className="btn-solid px-2.5 py-1 text-[11px] font-medium cursor-pointer disabled:opacity-40"
+                            >
+                              Save
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="lg:col-span-4 space-y-4">
@@ -2515,6 +2599,123 @@ export function DashboardView({
                   );
                 })}
               </div>
+
+              {customization && onUpdateCustomization && (
+                <div
+                  className="pt-3 mt-1 border-t space-y-3"
+                  style={{ borderColor: 'var(--border-line)' }}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-[12.5px] font-medium" style={{ color: 'var(--text-main)' }}>
+                        AI Self-Modify &amp; Custom Theme
+                      </div>
+                      <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                        Allow agents in chat to apply themes, CSS overrides, UI scale, and automations via <code>sakana-action</code>.
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="inline-flex items-center gap-1.5 text-[11.5px] cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={customization.enabled}
+                          onChange={(e) =>
+                            void onUpdateCustomization({
+                              ...customization,
+                              enabled: e.target.checked,
+                            })
+                          }
+                        />
+                        <span style={{ color: 'var(--text-main)' }}>
+                          {customization.enabled ? 'Enabled' : 'Disabled'}
+                        </span>
+                      </label>
+                      {onResetCustomization && (
+                        <button
+                          type="button"
+                          onClick={() => void onResetCustomization()}
+                          className="btn-ghost px-2.5 py-1 text-[11px] cursor-pointer"
+                        >
+                          Reset Customizations
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {(customization.customThemeName ||
+                    Object.keys(customization.cssVars || {}).length > 0 ||
+                    customization.customCss ||
+                    customization.uiScale) && (
+                    <div
+                      className="rounded-[8px] border px-3 py-2 flex flex-wrap items-center gap-3 font-mono-tech text-[11px]"
+                      style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)', color: 'var(--text-muted)' }}
+                    >
+                      {customization.customThemeName && (
+                        <span style={{ color: 'var(--text-main)' }}>
+                          Custom Theme: {customization.customThemeName}
+                        </span>
+                      )}
+                      <span>
+                        CSS Vars: {Object.keys(customization.cssVars || {}).length}
+                      </span>
+                      {customization.uiScale && (
+                        <span>Scale: {Math.round(customization.uiScale * 100)}%</span>
+                      )}
+                      {customization.customCss && (
+                        <span>Custom CSS: {customization.customCss.length} chars</span>
+                      )}
+                    </div>
+                  )}
+
+                  {customization.savedPresets && customization.savedPresets.length > 0 && (
+                    <div className="space-y-1.5">
+                      <div className="font-mono-tech text-[10.5px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                        Saved AI Theme Presets
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {customization.savedPresets.map((preset) => (
+                          <div
+                            key={preset.id}
+                            className="inline-flex items-center gap-1 rounded-[7px] border px-2 py-1 text-[11.5px]"
+                            style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                          >
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void onUpdateCustomization({
+                                  ...customization,
+                                  theme: preset.baseTheme,
+                                  customThemeName: preset.name,
+                                  cssVars: { ...preset.cssVars },
+                                  customCss: preset.customCss,
+                                })
+                              }
+                              className="cursor-pointer hover:underline"
+                              style={{ color: 'var(--text-main)' }}
+                            >
+                              {preset.name}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void onUpdateCustomization({
+                                  ...customization,
+                                  savedPresets: customization.savedPresets.filter((p) => p.id !== preset.id),
+                                })
+                              }
+                              className="p-0.5 rounded hover:bg-[var(--bg-hover)] cursor-pointer"
+                              style={{ color: 'var(--text-muted)' }}
+                              title="Delete preset"
+                            >
+                              <X size={10} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* GitHub Integration */}
@@ -3032,6 +3233,176 @@ export function DashboardView({
                   </button>
                 </div>
               </div>
+
+              {onUpdateSyncConfig && (
+                <div className="sakana-card rounded-[12px] p-5 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <h2 className="text-[14.5px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
+                      Cross-Device Sync (Sessions &amp; Files)
+                    </h2>
+                    <span
+                      className="font-mono-tech text-[10px] px-2 py-0.5 rounded-[5px]"
+                      style={
+                        syncStatus?.syncing
+                          ? { backgroundColor: 'var(--accent-blue-bg)', color: 'var(--accent-blue)' }
+                          : syncStatus?.running
+                            ? { backgroundColor: 'var(--accent-green-bg)', color: 'var(--accent-green)' }
+                            : { backgroundColor: 'var(--bg-elevated)', color: 'var(--text-muted)' }
+                      }
+                    >
+                      {syncStatus?.syncing ? 'Syncing…' : syncStatus?.running ? 'Auto-Sync ON' : 'Idle'}
+                    </span>
+                  </div>
+                  <p className="text-[11.5px] m-0 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                    Automatically mirror chat history and workspace files with another PC running Sakana. Add the second PC in <strong>Remote Sakana Hosts</strong> above, then select it below.
+                  </p>
+
+                  {(() => {
+                    const cfg: SyncConfig = syncConfig ?? {
+                      enabled: false,
+                      peerHostId: remoteHosts[0]?.id ?? null,
+                      syncSessions: true,
+                      syncFiles: true,
+                      intervalSecs: 15,
+                      conflictPolicy: 'newest-wins',
+                    };
+                    return (
+                      <div className="space-y-2.5">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <label className="space-y-1 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                            <span>Peer PC Host</span>
+                            <select
+                              value={cfg.peerHostId ?? ''}
+                              onChange={(e) =>
+                                void onUpdateSyncConfig({
+                                  ...cfg,
+                                  peerHostId: e.target.value || null,
+                                })
+                              }
+                              className="w-full rounded-[6px] border px-2 py-1.5 font-mono-tech text-[11px]"
+                              style={{
+                                backgroundColor: 'var(--bg-app)',
+                                borderColor: 'var(--border-line)',
+                                color: 'var(--text-main)',
+                              }}
+                            >
+                              <option value="">— Select a Remote Host —</option>
+                              {remoteHosts.map((h) => (
+                                <option key={h.id} value={h.id}>
+                                  {h.name} ({h.url})
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="space-y-1 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                            <span>Sync Interval &amp; Conflict Policy</span>
+                            <div className="flex items-center gap-1.5">
+                              <select
+                                value={cfg.intervalSecs}
+                                onChange={(e) =>
+                                  void onUpdateSyncConfig({
+                                    ...cfg,
+                                    intervalSecs: Number(e.target.value) || 15,
+                                  })
+                                }
+                                className="w-20 rounded-[6px] border px-2 py-1.5 font-mono-tech text-[11px]"
+                                style={{
+                                  backgroundColor: 'var(--bg-app)',
+                                  borderColor: 'var(--border-line)',
+                                  color: 'var(--text-main)',
+                                }}
+                              >
+                                <option value={10}>10s</option>
+                                <option value={15}>15s</option>
+                                <option value={30}>30s</option>
+                                <option value={60}>60s</option>
+                              </select>
+                              <select
+                                value={cfg.conflictPolicy}
+                                onChange={(e) =>
+                                  void onUpdateSyncConfig({
+                                    ...cfg,
+                                    conflictPolicy: e.target.value as SyncConfig['conflictPolicy'],
+                                  })
+                                }
+                                className="flex-1 rounded-[6px] border px-2 py-1.5 font-mono-tech text-[11px]"
+                                style={{
+                                  backgroundColor: 'var(--bg-app)',
+                                  borderColor: 'var(--border-line)',
+                                  color: 'var(--text-main)',
+                                }}
+                              >
+                                <option value="newest-wins">Newest wins</option>
+                                <option value="local-wins">This PC wins</option>
+                                <option value="remote-wins">Peer PC wins</option>
+                              </select>
+                            </div>
+                          </label>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-3 text-[11.5px]">
+                          <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={cfg.enabled}
+                              disabled={!cfg.peerHostId}
+                              onChange={(e) =>
+                                void onUpdateSyncConfig({ ...cfg, enabled: e.target.checked })
+                              }
+                            />
+                            <span style={{ color: 'var(--text-main)' }}>Auto-Sync</span>
+                          </label>
+                          <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={cfg.syncSessions}
+                              onChange={(e) =>
+                                void onUpdateSyncConfig({ ...cfg, syncSessions: e.target.checked })
+                              }
+                            />
+                            <span style={{ color: 'var(--text-body)' }}>Chat Sessions &amp; History</span>
+                          </label>
+                          <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={cfg.syncFiles}
+                              onChange={(e) =>
+                                void onUpdateSyncConfig({ ...cfg, syncFiles: e.target.checked })
+                              }
+                            />
+                            <span style={{ color: 'var(--text-body)' }}>Workspace Files</span>
+                          </label>
+                        </div>
+
+                        <div className="flex items-center justify-between gap-2 pt-1">
+                          <div className="font-mono-tech text-[10.5px] truncate" style={{ color: 'var(--text-muted)' }}>
+                            {syncStatus?.lastError ? (
+                              <span style={{ color: 'var(--accent-red)' }}>{syncStatus.lastError}</span>
+                            ) : syncStatus?.lastSyncAt ? (
+                              <span>
+                                Last sync: {new Date(syncStatus.lastSyncAt).toLocaleTimeString()} · {syncStatus.sessionsSynced} sessions · ↑{syncStatus.filesPushed} ↓{syncStatus.filesPulled} files
+                              </span>
+                            ) : (
+                              <span>Not synced yet</span>
+                            )}
+                          </div>
+                          {onSyncNow && (
+                            <button
+                              type="button"
+                              disabled={!cfg.peerHostId || Boolean(syncStatus?.syncing)}
+                              onClick={() => void onSyncNow()}
+                              className="btn-solid px-3 py-1.5 text-[11.5px] font-medium inline-flex items-center gap-1.5 shrink-0 cursor-pointer disabled:opacity-40"
+                            >
+                              <ArrowClockwise size={12} />
+                              <span>{syncStatus?.syncing ? 'Syncing…' : 'Sync Now'}</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
 
               <div className="sakana-card rounded-[12px] p-5 flex items-center justify-between">
                 <div>

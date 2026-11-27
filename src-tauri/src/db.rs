@@ -580,6 +580,28 @@ impl Database {
         Ok(changed > 0)
     }
 
+    pub fn set_project_discord_channel(
+        &self,
+        id: &str,
+        discord_channel: Option<&str>,
+    ) -> Result<bool> {
+        let normalized = discord_channel
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s.starts_with('#') {
+                    s.to_string()
+                } else {
+                    format!("#{}", s)
+                }
+            });
+        let changed = self.conn.execute(
+            "UPDATE projects SET discord_channel = ?2 WHERE id = ?1",
+            params![id, normalized],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn rename_project(&self, id: &str, name: &str) -> Result<bool> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -610,6 +632,112 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    /// Upsert a project received via Cross-Device Sync.
+    /// Matches by id or case-insensitive name so an existing local project's `cwd` is preserved.
+    pub fn upsert_synced_project(&self, project: &Project) -> Result<String> {
+        if let Some(existing) = self.get_project(&project.id)? {
+            return Ok(existing.id);
+        }
+        let by_name: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM projects WHERE LOWER(name) = LOWER(?1) LIMIT 1",
+                params![project.name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_id) = by_name {
+            return Ok(existing_id);
+        }
+        let now = Utc::now().to_rfc3339();
+        let runtime = project.runtime.clone().unwrap_or_else(|| "local".to_string());
+        self.conn.execute(
+            "INSERT INTO projects (id, name, cwd, repo_url, discord_channel, runtime, wsl_distro, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                project.id,
+                project.name,
+                project.cwd,
+                project.repo_url,
+                project.discord_channel,
+                runtime,
+                project.wsl_distro,
+                now
+            ],
+        )?;
+        Ok(project.id.clone())
+    }
+
+    /// Idempotently merge a synced session and its chat history into SQLite.
+    /// Returns the number of newly inserted messages.
+    pub fn upsert_synced_session(&self, session: &Session, mapped_project_id: &str) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        let shared_deps_json = serde_json::to_string(&session.shared_deps)?;
+        let is_discord_int: i64 = if session.is_discord.unwrap_or(false) { 1 } else { 0 };
+        let unread_done_int: i64 = if session.unread_done.unwrap_or(false) { 1 } else { 0 };
+
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                params![session.id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if !exists {
+            self.conn.execute(
+                "INSERT INTO sessions (
+                    id, project_id, title, status, harness, model, effort, account,
+                    permission_mode, worktree_path, branch, shared_deps_json,
+                    additions, deletions, time_ago, is_discord, discord_channel,
+                    unread_done, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                params![
+                    session.id,
+                    mapped_project_id,
+                    session.title,
+                    if session.status == "RUNNING" { "IDLE" } else { &session.status },
+                    session.harness,
+                    session.model,
+                    session.effort,
+                    session.account,
+                    session.permission_mode,
+                    ".",
+                    session.branch,
+                    shared_deps_json,
+                    session.additions,
+                    session.deletions,
+                    session.time_ago,
+                    is_discord_int,
+                    session.discord_channel,
+                    unread_done_int,
+                    now,
+                    now
+                ],
+            )?;
+        }
+
+        let mut inserted_msgs = 0usize;
+        for msg in &session.messages {
+            let msg_exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM messages WHERE id = ?1",
+                    params![msg.id],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !msg_exists {
+                self.append_message(&session.id, msg)?;
+                inserted_msgs += 1;
+            }
+        }
+        Ok(inserted_msgs)
     }
 
     pub fn delete_project(&self, id: &str) -> Result<bool> {

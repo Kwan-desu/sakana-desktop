@@ -928,6 +928,7 @@ pub async fn send_office_message_inner(
                         extra_system_context: Some(master_ctx),
                         completion_tx: Some(comp_tx),
                         author_override: Some(master_staff.name.clone()),
+                        peer_session_id: None,
                     },
                 )
                 .await;
@@ -1141,6 +1142,7 @@ pub async fn send_office_message_inner(
                                 extra_system_context: Some(staff_ctx),
                                 completion_tx: Some(comp_tx),
                                 author_override: Some(staff.name.clone()),
+                                peer_session_id: None,
                             },
                         )
                         .await;
@@ -1255,6 +1257,7 @@ pub async fn send_office_message_inner(
                 extra_system_context: Some(staff_ctx),
                 completion_tx: Some(comp_tx),
                 author_override: Some(target.name.clone()),
+                peer_session_id: None,
             },
         )
         .await?;

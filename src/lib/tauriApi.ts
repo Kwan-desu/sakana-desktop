@@ -1,7 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
+  AppCustomization,
   AttachedContextChip,
+  PeerMessageEvent,
+  SyncConfig,
+  SyncStatus,
   AttachmentItem,
   AutomationItem,
   BootstrapState,
@@ -192,6 +196,19 @@ export const tauriApi = {
   renameProject: (id: string, name: string) =>
     tauriInvoke<boolean>('rename_project', { id, name }),
 
+  setProjectDiscordChannel: (id: string, discordChannel?: string | null) =>
+    tauriInvoke<boolean>('set_project_discord_channel', {
+      id,
+      discordChannel: discordChannel ?? null,
+    }),
+
+  openFileExternal: (cwd: string, relPath: string, wslDistro?: string) =>
+    tauriInvoke<void>('open_file_external', {
+      cwd,
+      relPath,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
+
   reorderProjects: (orderedIds: string[]) =>
     tauriInvoke<void>('reorder_projects', { orderedIds }),
 
@@ -228,7 +245,14 @@ export const tauriApi = {
     sessionId: string,
     prompt: string,
     attachments: AttachedContextChip[] = [],
-  ) => tauriInvoke<string>('send_turn', { sessionId, prompt, attachments }),
+    peerSessionId?: string | null,
+  ) =>
+    tauriInvoke<string>('send_turn', {
+      sessionId,
+      prompt,
+      attachments,
+      ...(peerSessionId ? { peerSessionId } : {}),
+    }),
 
   cancelTurn: (sessionId: string) =>
     tauriInvoke<void>('cancel_turn', { sessionId }),
@@ -789,6 +813,58 @@ export const tauriApi = {
   ) =>
     tauriListen<{ officeId: string; edges: OfficeDelegationEdge[] }>(
       'office:delegation',
+      handler,
+    ),
+
+  // Sakana Self-Modify (AI App Control & Custom Themes)
+  getAppCustomization: async (): Promise<AppCustomization | null> =>
+    tauriInvoke<AppCustomization>('get_app_customization'),
+
+  updateAppCustomization: async (
+    customization: AppCustomization,
+  ): Promise<AppCustomization | null> =>
+    tauriInvoke<AppCustomization>('update_app_customization', { customization }),
+
+  resetAppCustomization: async (): Promise<AppCustomization | null> =>
+    tauriInvoke<AppCustomization>('reset_app_customization'),
+
+  onCustomizationUpdated: (handler: (payload: AppCustomization) => void) =>
+    tauriListen<AppCustomization>('sakana:customization-updated', handler),
+
+  onAutomationsUpdated: (handler: (payload: AutomationItem[]) => void) =>
+    tauriListen<AutomationItem[]>('sakana:automations-updated', handler),
+
+  onActionsApplied: (handler: (payload: string[]) => void) =>
+    tauriListen<string[]>('sakana:actions-applied', handler),
+
+  onNotify: (handler: (payload: { title: string; body: string }) => void) =>
+    tauriListen<{ title: string; body: string }>('sakana:notify', handler),
+
+  // Split-Mode Native Peer Bridge
+  onPeerMessage: (handler: (payload: PeerMessageEvent) => void) =>
+    tauriListen<PeerMessageEvent>('sakana:peer-message', handler),
+
+  // Cross-Device Sync (Chat Sessions & Workspace Files)
+  getSyncConfig: async (): Promise<SyncConfig | null> =>
+    tauriInvoke<SyncConfig>('get_sync_config'),
+
+  updateSyncConfig: async (config: SyncConfig): Promise<SyncConfig | null> =>
+    tauriInvoke<SyncConfig>('update_sync_config', { config }),
+
+  getSyncStatus: async (): Promise<SyncStatus | null> =>
+    tauriInvoke<SyncStatus>('get_sync_status'),
+
+  syncNow: async (): Promise<SyncStatus | null> =>
+    tauriInvoke<SyncStatus>('sync_now'),
+
+  onSyncStatus: (handler: (payload: SyncStatus) => void) =>
+    tauriListen<SyncStatus>('sakana:sync-status', handler),
+
+  onSyncUpdated: (
+    handler: (payload: { newMessages: number; filesPulled: number; filesPushed: number }) => void,
+  ) =>
+    tauriListen<{ newMessages: number; filesPulled: number; filesPushed: number }>(
+      'sakana:sync-updated',
       handler,
     ),
 };

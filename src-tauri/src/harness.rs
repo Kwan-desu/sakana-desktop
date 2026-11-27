@@ -1457,6 +1457,7 @@ pub struct TurnRunOptions {
     pub extra_system_context: Option<String>,
     pub completion_tx: Option<tokio::sync::oneshot::Sender<Result<ChatMessage, String>>>,
     pub author_override: Option<String>,
+    pub peer_session_id: Option<String>,
 }
 
 pub async fn send_turn_inner(
@@ -1549,6 +1550,7 @@ pub async fn send_turn_with_options(
         extra_system_context,
         mut completion_tx,
         author_override,
+        peer_session_id,
     } = opts;
 
     tokio::spawn(async move {
@@ -1602,7 +1604,7 @@ pub async fn send_turn_with_options(
             (session.harness.clone(), format!("{}{}", prompt, attach_text))
         };
 
-        let (active_account, recent_history, enabled_mcp_servers) = {
+        let (active_account, recent_history, enabled_mcp_servers, self_control_ctx, split_peer_ctx) = {
             let db = db_arc.lock().await;
             let account = db
                 .get_harness_account(&session.account)
@@ -1617,8 +1619,28 @@ pub async fn send_turn_with_options(
                 .into_iter()
                 .filter(|s| s.enabled)
                 .collect();
-            (account, history, mcp_servers)
+            let sc_ctx = crate::self_control::build_self_control_prompt(&db);
+            let peer_ctx = peer_session_id
+                .as_deref()
+                .map(|pid| crate::self_control::build_split_peer_prompt(&db, pid))
+                .unwrap_or_default();
+            (account, history, mcp_servers, sc_ctx, peer_ctx)
         };
+
+        if !self_control_ctx.trim().is_empty() {
+            if sakana_ctx.trim().is_empty() {
+                sakana_ctx = self_control_ctx;
+            } else {
+                sakana_ctx = format!("{}\n\n{}", sakana_ctx, self_control_ctx);
+            }
+        }
+        if !split_peer_ctx.trim().is_empty() {
+            if sakana_ctx.trim().is_empty() {
+                sakana_ctx = split_peer_ctx;
+            } else {
+                sakana_ctx = format!("{}\n\n{}", sakana_ctx, split_peer_ctx);
+            }
+        }
 
         let full_prompt_with_ctx =
             build_cli_prompt_with_history(&sakana_ctx, &recent_history, &effective_prompt);
@@ -1743,6 +1765,29 @@ pub async fn send_turn_with_options(
                 let cost_usd = acc.cost_usd;
                 let author = author_override.unwrap_or_else(|| active_harness.clone());
                 let msg = acc.into_message(msg_id_clone.clone(), author);
+                let _ = crate::self_control::extract_and_execute_actions(
+                    &db_arc,
+                    app_handle.as_ref(),
+                    &msg.text,
+                )
+                .await;
+                if let Some(ref to_sid) = peer_session_id {
+                    let peer_msgs = crate::self_control::extract_peer_messages(&msg.text);
+                    for pm in peer_msgs {
+                        crate::platform::emit_app_and_remote(
+                            app_handle.as_ref(),
+                            "sakana:peer-message",
+                            crate::self_control::PeerMessageEvent {
+                                from_session_id: sid.clone(),
+                                to_session_id: to_sid.clone(),
+                                from_harness: active_harness.clone(),
+                                from_title: session.title.clone(),
+                                message: pm.message,
+                                expect_reply: pm.expect_reply,
+                            },
+                        );
+                    }
+                }
                 if input_tokens == 0 && output_tokens == 0 {
                     input_tokens = (full_prompt_with_ctx.len() / 4) as i64;
                     output_tokens = (msg.text.len() / 4) as i64;
@@ -1837,14 +1882,19 @@ pub async fn send_turn(
     session_id: String,
     prompt: String,
     attachments: Option<Vec<Value>>,
+    peer_session_id: Option<String>,
 ) -> Result<String, String> {
-    send_turn_inner(
+    send_turn_with_options(
         Some(app),
         db_state.0.clone(),
         harness_state.active_turns.clone(),
         session_id,
         prompt,
         attachments,
+        TurnRunOptions {
+            peer_session_id,
+            ..Default::default()
+        },
     )
     .await
 }

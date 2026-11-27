@@ -11,6 +11,8 @@ pub mod office;
 pub mod platform;
 pub mod pty;
 pub mod remote;
+pub mod self_control;
+pub mod sync;
 pub mod telemetry;
 pub mod tray;
 
@@ -75,6 +77,73 @@ async fn reorder_sessions(
 ) -> Result<(), String> {
     let db = state.0.lock().await;
     db.reorder_sessions(&ordered_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_project_discord_channel(
+    state: State<'_, DbState>,
+    id: String,
+    discord_channel: Option<String>,
+) -> Result<bool, String> {
+    let db = state.0.lock().await;
+    db.set_project_discord_channel(&id, discord_channel.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_file_external(
+    cwd: String,
+    rel_path: String,
+    wsl_distro: Option<String>,
+) -> Result<(), String> {
+    let trimmed = rel_path.trim();
+    if trimmed.is_empty() {
+        return Err("File path is empty".to_string());
+    }
+    let encoded_cwd = crate::platform::encode_wsl_path(wsl_distro.as_deref(), &cwd);
+    let full_path = if let Some((distro, linux_cwd)) = crate::platform::parse_wsl_path(&encoded_cwd) {
+        let linux_target = if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("{}/{}", linux_cwd.trim_end_matches('/'), trimmed.trim_start_matches("./"))
+        };
+        crate::platform::wsl_to_unc_path(&distro, &linux_target)
+    } else {
+        let p = std::path::PathBuf::from(trimmed);
+        if p.is_absolute() {
+            p
+        } else {
+            std::path::PathBuf::from(&cwd).join(trimmed.trim_start_matches("./"))
+        }
+    };
+    if !full_path.exists() {
+        return Err(format!("File not found: {}", full_path.display()));
+    }
+    let target = full_path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &target])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|e| format!("Failed to open file externally: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("Failed to open file externally: {e}"))?;
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("Failed to open file externally: {e}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -368,6 +437,7 @@ pub fn run() {
         .manage(discord::DiscordState::default())
         .manage(remote::RemoteState::default())
         .manage(office::OfficeState::default())
+        .manage(sync::SyncState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -411,7 +481,9 @@ pub fn run() {
             let db_for_sched = Arc::clone(&db_arc);
             tauri::async_runtime::spawn(async move {
                 let auto_state = app_handle.state::<automation::AutomationState>();
-                let _ = automation::sync_scheduler(&auto_state, db_for_sched, app_handle.clone()).await;
+                let _ = automation::sync_scheduler(&auto_state, Arc::clone(&db_for_sched), app_handle.clone()).await;
+                let sync_state = app_handle.state::<sync::SyncState>();
+                sync::restart_auto_sync_loop(&sync_state, db_for_sched, app_handle.clone()).await;
             });
             Ok(())
         })
@@ -420,6 +492,8 @@ pub fn run() {
             list_projects,
             create_project,
             rename_project,
+            set_project_discord_channel,
+            open_file_external,
             reorder_projects,
             reorder_sessions,
             delete_project,
@@ -506,6 +580,10 @@ pub fn run() {
             remote::remote_rpc,
             remote::connect_remote_events,
             remote::disconnect_remote_events,
+            sync::get_sync_config,
+            sync::update_sync_config,
+            sync::get_sync_status,
+            sync::sync_now,
             platform::list_wsl_distros,
             platform::list_directories,
             telemetry::get_system_telemetry,
@@ -531,6 +609,9 @@ pub fn run() {
             office::send_office_message,
             office::report_staff_to_master,
             office::stop_office_run,
+            self_control::get_app_customization,
+            self_control::update_app_customization,
+            self_control::reset_app_customization,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Sakana");

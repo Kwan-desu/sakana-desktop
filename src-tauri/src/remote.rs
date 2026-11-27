@@ -346,6 +346,16 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             db.reorder_sessions(&ordered_ids).map_err(|e| e.to_string())?;
             Ok(json!(true))
         }
+        "set_project_discord_channel" => {
+            let id = get_str(&args, "id")?;
+            let channel = get_opt_str(&args, "discordChannel")
+                .or_else(|| get_opt_str(&args, "discord_channel"));
+            let db = ctx.db.lock().await;
+            let ok = db
+                .set_project_discord_channel(&id, channel.as_deref())
+                .map_err(|e| e.to_string())?;
+            Ok(json!(ok))
+        }
         "delete_project" => {
             let id = get_str(&args, "id")?;
             let db = ctx.db.lock().await;
@@ -425,16 +435,84 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
                 .get("attachments")
                 .and_then(|v| v.as_array())
                 .cloned();
-            let msg_id = crate::harness::send_turn_inner(
+            let peer_session_id = get_opt_str(&args, "peerSessionId")
+                .or_else(|| get_opt_str(&args, "peer_session_id"));
+            let msg_id = crate::harness::send_turn_with_options(
                 ctx.app.clone(),
                 Arc::clone(&ctx.db),
                 Arc::clone(&ctx.harness_active),
                 session_id,
                 prompt,
                 attachments,
+                crate::harness::TurnRunOptions {
+                    peer_session_id,
+                    ..Default::default()
+                },
             )
             .await?;
             Ok(json!(msg_id))
+        }
+        "sync_get_sessions" => {
+            let db = ctx.db.lock().await;
+            let payload = crate::sync::export_sessions_payload(&db)?;
+            serde_json::to_value(payload).map_err(|e| e.to_string())
+        }
+        "sync_push_sessions" => {
+            let payload: crate::sync::SyncSessionsPayload =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            let (touched, added) = {
+                let db = ctx.db.lock().await;
+                crate::sync::merge_sessions_payload(&db, &payload)?
+            };
+            if added > 0 {
+                crate::platform::emit_app_and_remote(
+                    ctx.app.as_ref(),
+                    "sakana:sync-updated",
+                    &json!({ "newMessages": added, "filesPulled": 0, "filesPushed": 0 }),
+                );
+            }
+            Ok(json!({ "sessionsTouched": touched, "newMessages": added }))
+        }
+        "sync_list_file_manifest" => {
+            let cwd = get_str(&args, "cwd")?;
+            let wsl_distro =
+                get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
+            let entries = tokio::task::spawn_blocking(move || {
+                crate::sync::list_project_file_manifest(&cwd, wsl_distro.as_deref())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            serde_json::to_value(entries).map_err(|e| e.to_string())
+        }
+        "sync_read_file_b64" => {
+            let cwd = get_str(&args, "cwd")?;
+            let rel_path = get_str(&args, "relPath").or_else(|_| get_str(&args, "rel_path"))?;
+            let wsl_distro =
+                get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
+            tokio::task::spawn_blocking(move || {
+                crate::sync::read_project_file_b64(&cwd, &rel_path, wsl_distro.as_deref())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
+        "sync_write_file_b64" => {
+            let cwd = get_str(&args, "cwd")?;
+            let rel_path = get_str(&args, "relPath").or_else(|_| get_str(&args, "rel_path"))?;
+            let content_b64 =
+                get_str(&args, "contentB64").or_else(|_| get_str(&args, "content_b64"))?;
+            let wsl_distro =
+                get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
+            let ok = tokio::task::spawn_blocking(move || {
+                crate::sync::write_project_file_b64(
+                    &cwd,
+                    &rel_path,
+                    &content_b64,
+                    wsl_distro.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            Ok(json!(ok))
         }
         "cancel_turn" => {
             let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
@@ -736,8 +814,46 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
         }
         "run_automation_now" => {
             let id = get_str(&args, "id")?;
-            let item = execute_remote_automation(&ctx.db, ctx.app.as_ref(), &id).await?;
+            let item = crate::automation::execute_automation(&ctx.db, ctx.app.as_ref(), &id).await?;
             serde_json::to_value(item).map_err(|e| e.to_string())
+        }
+        "get_app_customization" => {
+            let db = ctx.db.lock().await;
+            let cfg = crate::self_control::load_customization(&db);
+            serde_json::to_value(cfg).map_err(|e| e.to_string())
+        }
+        "update_app_customization" => {
+            let raw = args.get("customization").cloned().unwrap_or(args);
+            let cfg: crate::self_control::AppCustomization =
+                serde_json::from_value(raw).map_err(|e| e.to_string())?;
+            {
+                let db = ctx.db.lock().await;
+                crate::self_control::save_customization(&db, &cfg)?;
+            }
+            crate::platform::emit_app_and_remote(
+                ctx.app.as_ref(),
+                "sakana:customization-updated",
+                &cfg,
+            );
+            serde_json::to_value(cfg).map_err(|e| e.to_string())
+        }
+        "reset_app_customization" => {
+            let next = {
+                let db = ctx.db.lock().await;
+                let mut cfg = crate::self_control::load_customization(&db);
+                cfg.custom_theme_name = None;
+                cfg.css_vars.clear();
+                cfg.custom_css.clear();
+                cfg.ui_scale = None;
+                crate::self_control::save_customization(&db, &cfg)?;
+                cfg
+            };
+            crate::platform::emit_app_and_remote(
+                ctx.app.as_ref(),
+                "sakana:customization-updated",
+                &next,
+            );
+            serde_json::to_value(next).map_err(|e| e.to_string())
         }
         "list_quota_accounts" => {
             let db = ctx.db.lock().await;

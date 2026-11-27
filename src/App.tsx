@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
+  AppCustomization,
   AttachedContextChip,
   AutomationItem,
   ChatMessage,
@@ -24,6 +25,8 @@ import type {
   RemoteHost,
   RemoteStatus,
   SkillItem,
+  SyncConfig,
+  SyncStatus,
   SystemTelemetry,
   ThemeId,
   Thread,
@@ -145,6 +148,8 @@ export default function App() {
   const [isResizing, setIsResizing] = useState<'left' | 'right' | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('changes');
   const [splitView, setSplitView] = useState(false);
+  const [splitBridgeEnabled, setSplitBridgeEnabled] = useState(true);
+  const peerBridgeHopRef = useRef<number>(0);
 
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
@@ -172,6 +177,9 @@ export default function App() {
   const [diffs, setDiffs] = useState<DiffFile[]>([]);
   const [turnScopeFilter, setTurnScopeFilter] = useState('all');
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [requestedFile, setRequestedFile] = useState<{ path: string; seq: number } | null>(null);
+  const [customization, setCustomization] = useState<AppCustomization | null>(null);
+  const appliedCustomVarsRef = useRef<string[]>([]);
   const [traces] = useState<TraceSpan[]>([]);
 
   const [attachedChips, setAttachedChips] = useState<AttachedContextChip[]>([]);
@@ -189,6 +197,8 @@ export default function App() {
   const [remoteStatus, setRemoteStatus] = useState<RemoteStatus | null>(null);
   const [remoteHosts, setRemoteHosts] = useState<RemoteHost[]>([]);
   const [activeHostId, setActiveHostId] = useState<string>('local');
+  const [syncConfig, setSyncConfig] = useState<SyncConfig | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
 
   // Office state
   const [offices, setOffices] = useState<Office[]>([]);
@@ -501,6 +511,81 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  const applyCustomizationToDom = useCallback((cfg: AppCustomization | null) => {
+    if (typeof document === 'undefined') return;
+    const root = document.documentElement;
+    // Clear previously injected CSS variables
+    for (const key of appliedCustomVarsRef.current) {
+      root.style.removeProperty(key);
+    }
+    appliedCustomVarsRef.current = [];
+
+    if (cfg?.theme) {
+      setTheme(cfg.theme);
+    }
+    if (cfg?.cssVars) {
+      const nextKeys: string[] = [];
+      for (const [k, v] of Object.entries(cfg.cssVars)) {
+        if (k.startsWith('--') && typeof v === 'string' && v.trim()) {
+          root.style.setProperty(k, v.trim());
+          nextKeys.push(k);
+        }
+      }
+      appliedCustomVarsRef.current = nextKeys;
+    }
+
+    let styleEl = document.getElementById('sakana-custom-css') as HTMLStyleElement | null;
+    const css = cfg?.customCss?.trim() || '';
+    if (css) {
+      if (!styleEl) {
+        styleEl = document.createElement('style');
+        styleEl.id = 'sakana-custom-css';
+        document.head.appendChild(styleEl);
+      }
+      styleEl.textContent = css;
+    } else if (styleEl) {
+      styleEl.remove();
+    }
+
+    if (cfg?.uiScale && Number.isFinite(cfg.uiScale) && cfg.uiScale >= 0.75 && cfg.uiScale <= 1.4) {
+      root.style.fontSize = `${Math.round(cfg.uiScale * 100)}%`;
+    } else {
+      root.style.removeProperty('font-size');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    void tauriApi
+      .getAppCustomization()
+      .then((cfg) => {
+        if (cfg) {
+          setCustomization(cfg);
+          applyCustomizationToDom(cfg);
+        }
+      })
+      .catch(() => {});
+    void tauriApi
+      .getSyncConfig()
+      .then((cfg) => {
+        if (cfg) setSyncConfig(cfg);
+      })
+      .catch(() => {});
+    void tauriApi
+      .getSyncStatus()
+      .then((st) => {
+        if (st) setSyncStatus(st);
+      })
+      .catch(() => {});
+  }, [applyCustomizationToDom]);
+
+  const handleOpenFileInSidebar = useCallback((path: string) => {
+    setPrimarySection('chat');
+    setRightOpen(true);
+    setInspectorTab('files');
+    setRequestedFile((prev) => ({ path, seq: (prev?.seq ?? 0) + 1 }));
+  }, []);
+
   const handleSetTheme = (nextTheme: ThemeId) => {
     setTheme(nextTheme);
     showToast(`Theme: ${nextTheme}`);
@@ -702,6 +787,19 @@ export default function App() {
   attachedChipsRef.current = attachedChips;
   const dispatchTurnRef = useRef<(threadId: string, promptText: string) => void>(() => {});
 
+  const splitStateRef = useRef<{ splitView: boolean; splitBridgeEnabled: boolean; primaryId: string; secondaryId?: string }>({
+    splitView: false,
+    splitBridgeEnabled: true,
+    primaryId: '',
+    secondaryId: undefined,
+  });
+  splitStateRef.current = {
+    splitView,
+    splitBridgeEnabled,
+    primaryId: activeThread.id,
+    secondaryId: secondaryThread?.id,
+  };
+
   const dispatchTurn = useCallback((threadId: string, promptText: string) => {
     const chips = attachedChipsRef.current;
     const attachmentBlock =
@@ -742,8 +840,17 @@ export default function App() {
     );
 
     if (isTauriRuntime()) {
+      const sp = splitStateRef.current;
+      const peerSessionId =
+        sp.splitView && sp.splitBridgeEnabled && sp.secondaryId && sp.primaryId !== sp.secondaryId
+          ? threadId === sp.primaryId
+            ? sp.secondaryId
+            : threadId === sp.secondaryId
+              ? sp.primaryId
+              : undefined
+          : undefined;
       void tauriApi
-        .sendTurn(threadId, fullPrompt, chips)
+        .sendTurn(threadId, fullPrompt, chips, peerSessionId)
         .then((messageId) => {
           if (!messageId) return;
           setThreads((prev) =>
@@ -1104,6 +1211,59 @@ export default function App() {
             ...edges,
           ]);
         }),
+        tauriApi.onCustomizationUpdated((cfg) => {
+          setCustomization(cfg);
+          applyCustomizationToDom(cfg);
+        }),
+        tauriApi.onAutomationsUpdated((items) => {
+          setAutomations(items);
+        }),
+        tauriApi.onActionsApplied((actions) => {
+          if (actions && actions.length > 0) {
+            showToast(`Sakana updated: ${actions.join(', ')}`);
+          }
+        }),
+        tauriApi.onNotify(({ title, body }) => {
+          showToast(body ? `${title}: ${body}` : title);
+        }),
+        tauriApi.onPeerMessage((payload) => {
+          const sp = splitStateRef.current;
+          if (!sp.splitView || !sp.splitBridgeEnabled) return;
+          if (peerBridgeHopRef.current >= 6) {
+            showToast('Split Bridge paused after 6 consecutive agent turns');
+            return;
+          }
+          peerBridgeHopRef.current += 1;
+          const relayPrompt = `[Split-Mode message from ${payload.fromTitle} (${payload.fromHarness})]\n\n${payload.message}${
+            payload.expectReply
+              ? '\n\n(The peer session is waiting for your response — emit a ```sakana-peer block if you want to reply back to them.)'
+              : ''
+          }`;
+          showToast(`Split Bridge: ${payload.fromHarness} → peer session`);
+          setTimeout(() => {
+            dispatchTurnRef.current(payload.toSessionId, relayPrompt);
+          }, 250);
+        }),
+        tauriApi.onSyncStatus((st) => {
+          setSyncStatus(st);
+        }),
+        tauriApi.onSyncUpdated(({ newMessages, filesPulled }) => {
+          if (newMessages > 0) {
+            void tauriApi
+              .getBootstrapState()
+              .then((state) => {
+                if (!state) return;
+                if (state.projects) setProjects(state.projects);
+                if (state.sessions) setThreads(state.sessions);
+              })
+              .catch(() => {});
+          }
+          if (newMessages > 0 || filesPulled > 0) {
+            showToast(
+              `Cross-Device Sync: +${newMessages} msg${newMessages === 1 ? '' : 's'}, ↓${filesPulled} file${filesPulled === 1 ? '' : 's'}`,
+            );
+          }
+        }),
       ]);
 
       if (disposed) {
@@ -1148,6 +1308,8 @@ export default function App() {
   };
 
   const handleSendPrompt = (threadId: string, promptText: string) => {
+    // Reset Split-Mode Peer Bridge hop counter on every human-initiated message
+    peerBridgeHopRef.current = 0;
     const target = threads.find((t) => t.id === threadId);
     if (target?.status === 'RUNNING') {
       setQueues((prev) => ({
@@ -1766,6 +1928,16 @@ export default function App() {
             }}
             disabledHarnesses={disabledHarnesses}
             onToast={showToast}
+            onOpenFile={handleOpenFileInSidebar}
+            splitBridgeEnabled={splitBridgeEnabled}
+            onToggleSplitBridge={() => {
+              setSplitBridgeEnabled((v) => {
+                const next = !v;
+                peerBridgeHopRef.current = 0;
+                showToast(next ? 'Split-Mode Agent Bridge enabled' : 'Split-Mode Agent Bridge paused');
+                return next;
+              });
+            }}
           />
           </ErrorBoundary>
 
@@ -1892,6 +2064,7 @@ export default function App() {
               showToast(`Attached ${chip.label} to composer`);
             }}
             onToast={showToast}
+            requestedFile={requestedFile}
           />
           </ErrorBoundary>
         </>
@@ -2314,6 +2487,99 @@ export default function App() {
           onRefreshModels={() => refreshHarnessModels(true)}
           refreshingModels={refreshingModels}
           onOpenGitHubClone={() => setGhCloneOpen(true)}
+          projects={projects}
+          onSetProjectDiscordChannel={async (projectId, channel) => {
+            const normalized = channel?.trim()
+              ? channel.trim().startsWith('#')
+                ? channel.trim()
+                : `#${channel.trim()}`
+              : undefined;
+            if (isTauriRuntime()) {
+              try {
+                await tauriApi.setProjectDiscordChannel(projectId, normalized ?? null);
+                setProjects((prev) =>
+                  prev.map((p) => (p.id === projectId ? { ...p, discordChannel: normalized } : p)),
+                );
+                showToast(
+                  normalized
+                    ? `Bound project to Discord ${normalized}`
+                    : 'Cleared project Discord channel',
+                );
+              } catch (err) {
+                showToast(`Failed to update Discord channel: ${String(err)}`);
+              }
+              return;
+            }
+            setProjects((prev) =>
+              prev.map((p) => (p.id === projectId ? { ...p, discordChannel: normalized } : p)),
+            );
+            showToast(
+              normalized
+                ? `Bound project to Discord ${normalized}`
+                : 'Cleared project Discord channel',
+            );
+          }}
+          customization={customization}
+          onUpdateCustomization={async (next) => {
+            setCustomization(next);
+            applyCustomizationToDom(next);
+            if (isTauriRuntime()) {
+              try {
+                const saved = await tauriApi.updateAppCustomization(next);
+                if (saved) {
+                  setCustomization(saved);
+                  applyCustomizationToDom(saved);
+                }
+              } catch (err) {
+                showToast(`Failed to save customization: ${String(err)}`);
+              }
+            }
+          }}
+          onResetCustomization={async () => {
+            if (isTauriRuntime()) {
+              try {
+                const reset = await tauriApi.resetAppCustomization();
+                if (reset) {
+                  setCustomization(reset);
+                  applyCustomizationToDom(reset);
+                }
+                showToast('Reset Sakana appearance to defaults');
+              } catch (err) {
+                showToast(`Failed to reset customization: ${String(err)}`);
+              }
+              return;
+            }
+            setCustomization(null);
+            applyCustomizationToDom(null);
+            showToast('Reset Sakana appearance to defaults');
+          }}
+          syncConfig={syncConfig}
+          syncStatus={syncStatus}
+          onUpdateSyncConfig={async (next) => {
+            setSyncConfig(next);
+            if (isTauriRuntime()) {
+              try {
+                const saved = await tauriApi.updateSyncConfig(next);
+                if (saved) setSyncConfig(saved);
+                showToast(next.enabled ? 'Cross-Device Auto-Sync enabled' : 'Cross-Device Sync settings saved');
+              } catch (err) {
+                showToast(`Sync config failed: ${String(err)}`);
+              }
+            }
+          }}
+          onSyncNow={async () => {
+            if (!isTauriRuntime()) {
+              showToast('Cross-Device Sync requires desktop runtime');
+              return;
+            }
+            try {
+              const st = await tauriApi.syncNow();
+              if (st) setSyncStatus(st);
+              showToast('Cross-Device Sync complete');
+            } catch (err) {
+              showToast(`Sync failed: ${String(err)}`);
+            }
+          }}
         />
         </ErrorBoundary>
       )}

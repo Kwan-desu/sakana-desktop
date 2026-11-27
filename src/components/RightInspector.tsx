@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowClockwise,
   ArrowDown,
+  ArrowSquareOut,
   ArrowsOutSimple,
   ArrowUp,
+  Eye,
   CaretDown,
   CaretRight,
   Check,
@@ -38,6 +40,7 @@ import { isTauriRuntime, tauriApi } from '../lib/tauriApi';
 import { HarnessIcon } from './HarnessBadge';
 import { CodeMirrorEditor } from './CodeMirrorEditor';
 import { XtermTerminal } from './XtermTerminal';
+import { SimpleMarkdown } from './ChatPane';
 
 interface RightInspectorProps {
   open: boolean;
@@ -75,6 +78,7 @@ interface RightInspectorProps {
   onToast: (msg: string) => void;
   threads?: Thread[];
   onSelectThread?: (id: string) => void;
+  requestedFile?: { path: string; seq: number } | null;
 }
 
 interface FileTreeNode {
@@ -244,6 +248,7 @@ export function RightInspector({
   onToast,
   threads = [],
   onSelectThread,
+  requestedFile,
 }: RightInspectorProps) {
   const effectiveCwd =
     thread.worktreePath && thread.worktreePath !== '.'
@@ -334,6 +339,7 @@ export function RightInspector({
   const [loadedFile, setLoadedFile] = useState<WorkspaceFile | null>(null);
   const [loadingFile, setLoadingFile] = useState(false);
   const [editingFile, setEditingFile] = useState(false);
+  const [previewMarkdown, setPreviewMarkdown] = useState(true);
   const [editDraft, setEditDraft] = useState('');
   const [savingFile, setSavingFile] = useState(false);
   const [lineSelection, setLineSelection] = useState<{ start: number; end: number } | null>(null);
@@ -406,6 +412,37 @@ export function RightInspector({
       void loadWorkspaceFiles();
     }
   }, [open, activeTab, showLauncher, loadWorkspaceFiles]);
+
+  // Open file requested from chat links or tool calls
+  useEffect(() => {
+    if (!requestedFile?.path) return;
+    const raw = requestedFile.path.trim().replace(/^\.[\/]/, '').replace(/\\/g, '/');
+    const withoutLine = raw.replace(/:\d+(?::\d+)?$/, '');
+    const normalizedCwd = effectiveCwd.replace(/\\/g, '/').replace(/\/+$/, '');
+    const rel =
+      normalizedCwd && withoutLine.toLowerCase().startsWith(normalizedCwd.toLowerCase() + '/')
+        ? withoutLine.slice(normalizedCwd.length + 1)
+        : withoutLine;
+    setSelectedFilePath(rel);
+    setEditingFile(false);
+    setLineSelection(null);
+    if (/\.(md|markdown)$/i.test(rel)) {
+      setPreviewMarkdown(true);
+    }
+    const parts = rel.split('/');
+    if (parts.length > 1) {
+      setExpandedDirs((prev) => {
+        const next = { ...prev };
+        let acc = '';
+        for (let i = 0; i < parts.length - 1; i++) {
+          acc = acc ? `${acc}/${parts[i]}` : parts[i];
+          next[acc] = true;
+        }
+        return next;
+      });
+    }
+    void loadWorkspaceFiles();
+  }, [requestedFile, effectiveCwd, loadWorkspaceFiles]);
 
   // Load file contents when selectedFilePath changes
   useEffect(() => {
@@ -1384,6 +1421,37 @@ export function RightInspector({
                   </button>
                 )}
 
+                {activeFile && /\.(md|markdown)$/i.test(activeFile.path) && !editingFile && (
+                  <button
+                    type="button"
+                    onClick={() => setPreviewMarkdown((v) => !v)}
+                    className={previewMarkdown ? 'btn-solid px-2 py-1 text-[11px] inline-flex items-center gap-1 cursor-pointer' : 'btn-ghost px-2 py-1 text-[11px] inline-flex items-center gap-1 cursor-pointer'}
+                    title={previewMarkdown ? 'Switch to raw source view' : 'Preview rendered Markdown'}
+                  >
+                    <Eye size={12} />
+                    <span>{previewMarkdown ? 'Preview' : 'Source'}</span>
+                  </button>
+                )}
+
+                {activeFile && !editingFile && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await tauriApi.openFileExternal(effectiveCwd, activeFile.path, wslDistro);
+                        onToast(`Opened ${activeFile.path} externally`);
+                      } catch (err) {
+                        onToast(`Open external failed: ${String(err)}`);
+                      }
+                    }}
+                    className="btn-ghost px-2 py-1 text-[11px] inline-flex items-center gap-1 cursor-pointer"
+                    title="Open in external default application"
+                  >
+                    <ArrowSquareOut size={12} />
+                    <span>Open</span>
+                  </button>
+                )}
+
                 {activeFile && (editingFile ? (
                   <>
                     <button
@@ -1507,6 +1575,16 @@ export function RightInspector({
                   onChange={setEditDraft}
                   onSave={() => void handleSaveActiveFile()}
                 />
+              </div>
+            ) : /\.(md|markdown)$/i.test(activeFile.path) && previewMarkdown ? (
+              <div className="flex-1 overflow-y-auto p-4">
+                {loadingFile ? (
+                  <div className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                    Loading {selectedFilePath}...
+                  </div>
+                ) : (
+                  <SimpleMarkdown text={activeFile.lines.join('\n')} />
+                )}
               </div>
             ) : (
               <div className="flex-1 overflow-y-auto p-3 font-mono-tech text-[11.5px] leading-[1.65]">

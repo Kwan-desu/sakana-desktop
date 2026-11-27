@@ -354,6 +354,53 @@ export interface PtyDataEvent {
   data: string;
 }
 
+export interface CustomThemePreset {
+  id: string;
+  name: string;
+  baseTheme: ThemeId;
+  cssVars: Record<string, string>;
+  customCss: string;
+}
+
+export interface AppCustomization {
+  enabled: boolean;
+  theme: ThemeId;
+  customThemeName?: string | null;
+  cssVars: Record<string, string>;
+  customCss: string;
+  uiScale?: number | null;
+  savedPresets: CustomThemePreset[];
+}
+
+export interface SyncConfig {
+  enabled: boolean;
+  peerHostId?: string | null;
+  syncSessions: boolean;
+  syncFiles: boolean;
+  intervalSecs: number;
+  conflictPolicy: 'newest-wins' | 'local-wins' | 'remote-wins';
+}
+
+export interface SyncStatus {
+  running: boolean;
+  syncing: boolean;
+  peerName?: string | null;
+  lastSyncAt?: string | null;
+  lastError?: string | null;
+  sessionsSynced: number;
+  filesPulled: number;
+  filesPushed: number;
+}
+
+export interface PeerMessageEvent {
+  fromSessionId: string;
+  toSessionId: string;
+  fromHarness: string;
+  fromTitle: string;
+  message: string;
+  expectReply: boolean;
+}
+
 export interface PtyExitEvent {
   sessionId: string;
   code: number;

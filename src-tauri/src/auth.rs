@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::harness::resolve_harness_binary;
-use crate::models::{HarnessAccountRow, HarnessAuthAccount, HarnessLoginResponse};
+use crate::models::{HarnessAccountRow, HarnessAuthAccount, HarnessLoginResponse, McpServer};
 use crate::platform::{app_data_dir, get_env_or_dotenv, tokio_command};
 use crate::DbState;
 
@@ -322,6 +322,189 @@ pub fn resolve_account_email(acc: &HarnessAccountRow) -> String {
         "claude-code" => extract_email_from_claude_json(acc).unwrap_or_default(),
         "agy-cli" => extract_email_from_agy_files(acc).unwrap_or_default(),
         _ => String::new(),
+    }
+}
+
+fn link_dir_if_exists(src: &Path, dst: &Path) {
+    if !src.exists() || dst.exists() || dst.symlink_metadata().is_ok() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(src, dst);
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(src, dst).is_err() {
+            let _ = copy_dir_recursive(src, dst);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            let _ = std::fs::copy(entry.path(), target);
+        }
+    }
+    Ok(())
+}
+
+fn read_mcp_servers_from_file(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return serde_json::Map::new();
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return serde_json::Map::new();
+    };
+    val.get("mcpServers")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Sync global user MCP configurations + Sakana DB MCP servers + skills directories
+/// into an isolated harness profile so tools & skills remain available when HOME is overridden.
+pub fn sync_profile_mcp_and_skills(
+    harness: &str,
+    acc: Option<&HarnessAccountRow>,
+    enabled_mcp_servers: &[McpServer],
+) {
+    let real_home = home_dir_or_fallback();
+
+    match harness {
+        "agy-cli" => {
+            let prof = match acc {
+                Some(account) => agy_profile_dir(account),
+                None => ensure_profile_dir("agy-cli", "default"),
+            };
+            let prof_gemini = prof.join(".gemini");
+
+            // 1. Link global skills directories from real HOME into isolated profile
+            for rel in [
+                ".gemini/config/skills",
+                ".gemini/antigravity/skills",
+                ".gemini/antigravity-cli/skills",
+                ".sakana/skills",
+                ".agents/skills",
+                ".claude/skills",
+            ] {
+                link_dir_if_exists(&real_home.join(rel), &prof.join(rel));
+            }
+
+            // 2. Merge MCP servers from real HOME Antigravity configs + Sakana DB enabled servers
+            let mut merged = serde_json::Map::new();
+            for src in [
+                real_home.join(".gemini").join("settings.json"),
+                real_home.join(".gemini").join("antigravity").join("mcp_config.json"),
+                real_home.join(".gemini").join("antigravity-cli").join("mcp_config.json"),
+                real_home.join(".gemini").join("config").join("mcp_config.json"),
+            ] {
+                for (k, v) in read_mcp_servers_from_file(&src) {
+                    merged.insert(k, v);
+                }
+            }
+
+            for s in enabled_mcp_servers {
+                if !s.enabled {
+                    continue;
+                }
+                let endpoint = s.endpoint.trim();
+                if endpoint.is_empty() {
+                    continue;
+                }
+                let is_http = s.transport.eq_ignore_ascii_case("http")
+                    || s.transport.eq_ignore_ascii_case("sse")
+                    || endpoint.starts_with("http://")
+                    || endpoint.starts_with("https://");
+                let entry = if is_http {
+                    let kind = if s.transport.eq_ignore_ascii_case("http") {
+                        "http"
+                    } else {
+                        "sse"
+                    };
+                    serde_json::json!({ "type": kind, "url": endpoint, "serverUrl": endpoint })
+                } else {
+                    let mut parts = endpoint.split_whitespace();
+                    let Some(command) = parts.next() else {
+                        continue;
+                    };
+                    let args: Vec<&str> = parts.collect();
+                    serde_json::json!({ "command": command, "args": args })
+                };
+                merged.insert(s.name.clone(), entry);
+            }
+
+            if !merged.is_empty() {
+                let mcp_payload = serde_json::json!({ "mcpServers": merged });
+                if let Ok(pretty) = serde_json::to_string_pretty(&mcp_payload) {
+                    for dst in [
+                        prof_gemini.join("config").join("mcp_config.json"),
+                        prof_gemini.join(AGY_ACP_APP_DATA_DIR).join("mcp_config.json"),
+                        prof_gemini.join("antigravity").join("mcp_config.json"),
+                    ] {
+                        if let Some(parent) = dst.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&dst, format!("{pretty}\n"));
+                    }
+                }
+
+                // Also merge mcpServers into settings.json files while preserving auth and other keys
+                for settings_path in [
+                    prof_gemini.join(AGY_ACP_APP_DATA_DIR).join("settings.json"),
+                    prof_gemini.join("settings.json"),
+                ] {
+                    if let Some(parent) = settings_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    if let Some(obj) = root.as_object_mut() {
+                        obj.insert(
+                            "mcpServers".to_string(),
+                            serde_json::Value::Object(merged.clone()),
+                        );
+                    }
+                    if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+                        let _ = std::fs::write(&settings_path, format!("{pretty}\n"));
+                    }
+                }
+            }
+        }
+        "kiro-cli" => {
+            if let Some(account) = acc {
+                if account.id != "kiro_default" && !account.profile_dir.trim().is_empty() {
+                    let prof = PathBuf::from(&account.profile_dir);
+                    for rel in [".kiro/skills", ".kiro/settings", ".sakana/skills", ".agents/skills"] {
+                        link_dir_if_exists(&real_home.join(rel), &prof.join(rel));
+                    }
+                }
+            }
+        }
+        "claude-code" => {
+            if let Some(account) = acc {
+                if account.id != "claude_default" && !account.profile_dir.trim().is_empty() {
+                    let cdir = PathBuf::from(&account.profile_dir);
+                    for rel in ["skills", "commands", "agents"] {
+                        link_dir_if_exists(&real_home.join(".claude").join(rel), &cdir.join(rel));
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 

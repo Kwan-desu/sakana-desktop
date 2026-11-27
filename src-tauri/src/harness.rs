@@ -813,6 +813,7 @@ async fn run_cli_harness(
     acc: &mut TurnAccumulator,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
+    crate::auth::sync_profile_mcp_and_skills(harness, account, enabled_mcp_servers);
     let bin_str = bin.to_string_lossy().to_string();
     let mut cmd = crate::platform::tokio_command(&bin_str);
     crate::auth::apply_account_env(&mut cmd, harness, account);
@@ -977,7 +978,7 @@ fn build_wsl_env_exports(
         let escaped_id = crate::platform::shell_escape_single(agy_id);
         env_exports.push("export AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1".to_string());
         env_exports.push(format!(
-            "_SAKANA_ORIG_HOME=\"$HOME\"; export PATH=\"$_SAKANA_ORIG_HOME/.local/bin:$_SAKANA_ORIG_HOME/.antigravity/bin:$PATH\"; _SAKANA_AGY_PROF=\"$_SAKANA_ORIG_HOME/.sakana/profiles/agy/\"{}; mkdir -p \"$_SAKANA_AGY_PROF/.gemini/antigravity-cli\"; export HOME=\"$_SAKANA_AGY_PROF\"; export SAKANA_AGY_GEMINI_DIR=\"$_SAKANA_AGY_PROF/.gemini\"",
+            "_SAKANA_ORIG_HOME=\"$HOME\"; export PATH=\"$_SAKANA_ORIG_HOME/.local/bin:$_SAKANA_ORIG_HOME/.antigravity/bin:$PATH\"; _SAKANA_AGY_PROF=\"$_SAKANA_ORIG_HOME/.sakana/profiles/agy/\"{}; mkdir -p \"$_SAKANA_AGY_PROF/.gemini/antigravity-cli\" \"$_SAKANA_AGY_PROF/.gemini/config\" \"$_SAKANA_AGY_PROF/.gemini/antigravity\"; for _mc in \"$_SAKANA_ORIG_HOME/.gemini/config/mcp_config.json\" \"$_SAKANA_ORIG_HOME/.gemini/antigravity/mcp_config.json\"; do if [ -f \"$_mc\" ]; then ln -sf \"$_mc\" \"$_SAKANA_AGY_PROF/.gemini/config/mcp_config.json\"; ln -sf \"$_mc\" \"$_SAKANA_AGY_PROF/.gemini/antigravity-cli/mcp_config.json\"; ln -sf \"$_mc\" \"$_SAKANA_AGY_PROF/.gemini/antigravity/mcp_config.json\"; break; fi; done; for _sk in .gemini/config/skills .gemini/antigravity/skills .sakana/skills .agents/skills .claude/skills; do if [ -d \"$_SAKANA_ORIG_HOME/$_sk\" ] && [ ! -e \"$_SAKANA_AGY_PROF/$_sk\" ]; then mkdir -p \"$(dirname \"$_SAKANA_AGY_PROF/$_sk\")\"; ln -s \"$_SAKANA_ORIG_HOME/$_sk\" \"$_SAKANA_AGY_PROF/$_sk\"; fi; done; export HOME=\"$_SAKANA_AGY_PROF\"; export SAKANA_AGY_GEMINI_DIR=\"$_SAKANA_AGY_PROF/.gemini\"",
             escaped_id
         ));
     } else if let Some(acc) = account.filter(|a| !a.is_default && !a.id.trim().is_empty()) {

@@ -363,6 +363,24 @@ async fn send_discord_reply(
     let _ = target_msg.channel_id.send_message(&ctx.http, builder).await;
 }
 
+async fn finish_reaction(
+    ctx: &serenity::Context,
+    msg: &serenity::Message,
+    react_enabled: bool,
+    ok: bool,
+) {
+    if !react_enabled {
+        return;
+    }
+    let _ = msg
+        .delete_reaction(&ctx.http, None, ReactionType::Unicode("👀".to_string()))
+        .await;
+    let emoji = if ok { "✅" } else { "❌" };
+    let _ = msg
+        .react(&ctx.http, ReactionType::Unicode(emoji.to_string()))
+        .await;
+}
+
 /// Route a prompt from either a private DM or a bound guild channel/thread into a Sakana session,
 /// persist the user message, emit `discord-prompt`, and execute the turn.
 async fn dispatch_discord_prompt(
@@ -815,9 +833,7 @@ async fn handle_event(
                         }
                     };
                     let _ = new_message.reply(&ctx.http, reply).await;
-                    if react_enabled {
-                        let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
-                    }
+                    finish_reaction(ctx, new_message, react_enabled, true).await;
                     return Ok(());
                 }
 
@@ -847,15 +863,11 @@ async fn handle_event(
                     {
                         Ok(reply) => {
                             let _ = new_message.reply(&ctx.http, reply).await;
-                            if react_enabled {
-                                let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
-                            }
+                            finish_reaction(ctx, new_message, react_enabled, true).await;
                         }
                         Err(err) => {
                             let _ = new_message.reply(&ctx.http, err).await;
-                            if react_enabled {
-                                let _ = new_message.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
-                            }
+                            finish_reaction(ctx, new_message, react_enabled, false).await;
                         }
                     }
                     return Ok(());
@@ -897,15 +909,11 @@ async fn handle_event(
                 {
                     Ok((_, reply)) => {
                         send_discord_reply(ctx, new_message, &reply).await;
-                        if react_enabled {
-                            let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
-                        }
+                        finish_reaction(ctx, new_message, react_enabled, true).await;
                     }
                     Err(err) => {
                         let _ = new_message.reply(&ctx.http, err).await;
-                        if react_enabled {
-                            let _ = new_message.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
-                        }
+                        finish_reaction(ctx, new_message, react_enabled, false).await;
                     }
                 }
             } else {
@@ -973,15 +981,11 @@ async fn handle_event(
                     {
                         Ok(reply) => {
                             let _ = new_message.reply(&ctx.http, reply).await;
-                            if react_enabled {
-                                let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
-                            }
+                            finish_reaction(ctx, new_message, react_enabled, true).await;
                         }
                         Err(err) => {
                             let _ = new_message.reply(&ctx.http, err).await;
-                            if react_enabled {
-                                let _ = new_message.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
-                            }
+                            finish_reaction(ctx, new_message, react_enabled, false).await;
                         }
                     }
                     return Ok(());
@@ -1022,15 +1026,11 @@ async fn handle_event(
                 {
                     Ok((_, reply)) => {
                         send_discord_reply(ctx, new_message, &reply).await;
-                        if react_enabled {
-                            let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
-                        }
+                        finish_reaction(ctx, new_message, react_enabled, true).await;
                     }
                     Err(err) => {
                         let _ = new_message.reply(&ctx.http, err).await;
-                        if react_enabled {
-                            let _ = new_message.react(&ctx.http, ReactionType::Unicode("❌".to_string())).await;
-                        }
+                        finish_reaction(ctx, new_message, react_enabled, false).await;
                     }
                 }
             }

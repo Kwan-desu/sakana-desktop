@@ -129,16 +129,256 @@ pub async fn get_system_telemetry(app: AppHandle) -> Result<SystemTelemetry, Str
     })
 }
 
-#[tauri::command]
-pub async fn list_quota_accounts(state: State<'_, DbState>) -> Result<Vec<QuotaAccount>, String> {
-    let db = state.0.lock().await;
-    db.list_accounts().map_err(|e| e.to_string())
+fn read_claude_recent_tokens_7d() -> i64 {
+    let Some(home) = dirs::home_dir() else {
+        return 0;
+    };
+    let stats_path = home.join(".claude").join("stats-cache.json");
+    let Ok(content) = std::fs::read_to_string(stats_path) else {
+        return 0;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return 0;
+    };
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(7))
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut total: i64 = 0;
+    if let Some(days) = val.get("dailyModelTokens").and_then(|v| v.as_array()) {
+        for day in days {
+            let date = day.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            if date >= cutoff.as_str() {
+                if let Some(map) = day.get("tokensByModel").and_then(|v| v.as_object()) {
+                    for v in map.values() {
+                        total += v.as_i64().unwrap_or(0);
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
+async fn fetch_agy_live_quota(acc: &crate::models::HarnessAccountRow) -> Option<(f64, String)> {
+    let (access_token, _) = crate::auth::read_agy_file_token(acc)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+        .ok()?;
+    let lca_resp = client
+        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", "antigravity/1.5.18 windows/amd64")
+        .json(&serde_json::json!({ "metadata": { "ideType": "ANTIGRAVITY" } }))
+        .send()
+        .await
+        .ok()?;
+    if !lca_resp.status().is_success() {
+        return None;
+    }
+    let lca_val: serde_json::Value = lca_resp.json().await.ok()?;
+    let project = lca_val
+        .get("cloudaicompanionProject")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let body = match project {
+        Some(p) => serde_json::json!({ "project": p }),
+        None => serde_json::json!({}),
+    };
+    let models_resp = client
+        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", "antigravity/1.5.18 windows/amd64")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    if !models_resp.status().is_success() {
+        return None;
+    }
+    let val: serde_json::Value = models_resp.json().await.ok()?;
+    let models_obj = val.get("models").and_then(|v| v.as_object())?;
+
+    let mut active_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(sorts) = val.get("agentModelSorts").and_then(|v| v.as_array()) {
+        for sort in sorts {
+            if let Some(groups) = sort.get("groups").and_then(|v| v.as_array()) {
+                for g in groups {
+                    if let Some(ids) = g.get("modelIds").and_then(|v| v.as_array()) {
+                        for id_val in ids {
+                            if let Some(s) = id_val.as_str() {
+                                if !s.is_empty() && !s.starts_with("tab_") {
+                                    active_ids.insert(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tiered) = val.get("tieredModelIds") {
+        if let Some(arr) = tiered.as_array() {
+            for id_val in arr {
+                if let Some(s) = id_val.as_str() {
+                    if !s.is_empty() && !s.starts_with("tab_") {
+                        active_ids.insert(s.to_string());
+                    }
+                }
+            }
+        } else if let Some(obj) = tiered.as_object() {
+            for arr_val in obj.values() {
+                if let Some(arr) = arr_val.as_array() {
+                    for id_val in arr {
+                        if let Some(s) = id_val.as_str() {
+                            if !s.is_empty() && !s.starts_with("tab_") {
+                                active_ids.insert(s.to_string());
+                            }
+                        }
+                    }
+                } else if let Some(s) = arr_val.as_str() {
+                    if !s.is_empty() && !s.starts_with("tab_") {
+                        active_ids.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut min_rem: Option<f64> = None;
+    let mut next_reset: Option<String> = None;
+    let now = chrono::Utc::now();
+
+    for id in &active_ids {
+        let Some(meta) = models_obj.get(id) else {
+            continue;
+        };
+        if let Some(qi) = meta.get("quotaInfo") {
+            let reset_str = qi
+                .get("resetTime")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let rem_opt = qi
+                .get("remainingFraction")
+                .and_then(|v| v.as_f64())
+                .or_else(|| if reset_str.is_some() { Some(0.0) } else { None });
+            if let Some(rem) = rem_opt {
+                if min_rem.map(|m| rem < m).unwrap_or(true) {
+                    min_rem = Some(rem);
+                    if let Some(ts) = reset_str {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                            let mins = (dt.with_timezone(&chrono::Utc) - now).num_minutes().max(0);
+                            let h = mins / 60;
+                            let m = mins % 60;
+                            next_reset = Some(if h > 0 { format!("{h}h {m}m") } else { format!("{m}m") });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let rem = min_rem?;
+    let used_pct = (((1.0 - rem) * 100.0).clamp(0.0, 100.0) * 10.0).round() / 10.0;
+    Some((used_pct, next_reset.unwrap_or_else(|| "5h".to_string())))
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn upsert_quota_account(
-    state: State<'_, DbState>,
+pub async fn list_quota_accounts(state: State<'_, DbState>) -> Result<Vec<QuotaAccount>, String> {
+    let (mut accounts, harness_rows, db_windows) = {
+        let db = state.0.lock().await;
+        let mut accounts = db.list_accounts().map_err(|e| e.to_string())?;
+        let harness_rows = db.list_harness_accounts(None).unwrap_or_default();
+
+        for row in &harness_rows {
+            let authed = crate::auth::is_account_authenticated(row);
+            if !authed {
+                continue;
+            }
+            let email = crate::auth::resolve_account_email(row);
+            let display_email = if !email.is_empty() {
+                email
+            } else if row.auth_type.contains("api-key") {
+                "API Key".to_string()
+            } else {
+                "Authenticated".to_string()
+            };
+
+            if let Some(existing) = accounts.iter_mut().find(|q| {
+                q.harness == row.harness
+                    && (q.id == row.id || q.label.eq_ignore_ascii_case(&row.label))
+            }) {
+                if existing.email.trim().is_empty() || existing.email == "Authenticated" {
+                    existing.email = display_email;
+                }
+                existing.is_default = Some(row.is_default);
+            } else {
+                accounts.push(QuotaAccount {
+                    id: row.id.clone(),
+                    harness: row.harness.clone(),
+                    label: row.label.clone(),
+                    email: display_email,
+                    five_hour_pct: 0.0,
+                    five_hour_reset: "5h".to_string(),
+                    weekly_pct: 0.0,
+                    weekly_reset: "7d".to_string(),
+                    is_default: Some(row.is_default),
+                });
+            }
+        }
+
+        let mut windows = std::collections::HashMap::new();
+        for q in &accounts {
+            windows
+                .entry(q.harness.clone())
+                .or_insert_with(|| db.summarize_harness_usage_windows(&q.harness).unwrap_or((0, None, 0, None)));
+        }
+        (accounts, harness_rows, windows)
+    };
+
+    for q in &mut accounts {
+        let (t5h, r5h, t7d, r7d) = db_windows
+            .get(&q.harness)
+            .cloned()
+            .unwrap_or((0, None, 0, None));
+        let eff_7d = if t7d == 0 && q.harness == "claude-code" {
+            read_claude_recent_tokens_7d()
+        } else {
+            t7d
+        };
+
+        const BUDGET_5H: f64 = 500_000.0;
+        const BUDGET_7D: f64 = 5_000_000.0;
+
+        if t5h > 0 || q.five_hour_pct == 0.0 {
+            let pct_5h = ((t5h as f64 / BUDGET_5H) * 100.0).clamp(0.0, 100.0);
+            q.five_hour_pct = (pct_5h * 10.0).round() / 10.0;
+        }
+        if eff_7d > 0 || q.weekly_pct == 0.0 {
+            let pct_7d = ((eff_7d as f64 / BUDGET_7D) * 100.0).clamp(0.0, 100.0);
+            q.weekly_pct = (pct_7d * 10.0).round() / 10.0;
+        }
+        q.five_hour_reset = r5h.unwrap_or_else(|| "5h".to_string());
+        q.weekly_reset = r7d.unwrap_or_else(|| "7d".to_string());
+
+        if q.harness == "agy-cli" {
+            if let Some(row) = harness_rows.iter().find(|r| {
+                r.harness == "agy-cli" && (r.id == q.id || r.label.eq_ignore_ascii_case(&q.label))
+            }) {
+                if let Some((live_pct, live_reset)) = fetch_agy_live_quota(row).await {
+                    q.five_hour_pct = live_pct;
+                    q.five_hour_reset = live_reset;
+                }
+            }
+        }
+    }
+
+    Ok(accounts)
+}
+
+pub async fn upsert_quota_account_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
     id: Option<String>,
     harness: Option<String>,
     provider: Option<String>,
@@ -162,8 +402,50 @@ pub async fn upsert_quota_account(
         weekly_reset: weekly_reset.unwrap_or_else(|| "7d".to_string()),
         is_default,
     };
-    let db = state.0.lock().await;
+    let db = db.lock().await;
     db.upsert_account(&account).map_err(|e| e.to_string())?;
+    db.list_accounts().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_quota_account(
+    state: State<'_, DbState>,
+    id: Option<String>,
+    harness: Option<String>,
+    provider: Option<String>,
+    label: String,
+    email: Option<String>,
+    plan: Option<String>,
+    five_hour_pct: Option<f64>,
+    five_hour_reset: Option<String>,
+    weekly_pct: Option<f64>,
+    weekly_reset: Option<String>,
+    is_default: Option<bool>,
+) -> Result<Vec<QuotaAccount>, String> {
+    upsert_quota_account_inner(
+        &state.0,
+        id,
+        harness,
+        provider,
+        label,
+        email,
+        plan,
+        five_hour_pct,
+        five_hour_reset,
+        weekly_pct,
+        weekly_reset,
+        is_default,
+    )
+    .await
+}
+
+pub async fn delete_quota_account_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
+    id: String,
+) -> Result<Vec<QuotaAccount>, String> {
+    let db = db.lock().await;
+    db.delete_account(&id).map_err(|e| e.to_string())?;
     db.list_accounts().map_err(|e| e.to_string())
 }
 
@@ -172,9 +454,7 @@ pub async fn delete_quota_account(
     state: State<'_, DbState>,
     id: String,
 ) -> Result<Vec<QuotaAccount>, String> {
-    let db = state.0.lock().await;
-    db.delete_account(&id).map_err(|e| e.to_string())?;
-    db.list_accounts().map_err(|e| e.to_string())
+    delete_quota_account_inner(&state.0, id).await
 }
 
 #[tauri::command]
@@ -193,8 +473,7 @@ pub async fn list_env_secrets() -> Result<Vec<EnvSecret>, String> {
         .collect())
 }
 
-#[tauri::command]
-pub async fn reveal_env_secret(key: String) -> Result<String, String> {
+pub async fn reveal_env_secret_inner(key: String) -> Result<String, String> {
     let key = key.trim();
     for (k, v) in read_env_entries() {
         if k == key {
@@ -205,7 +484,11 @@ pub async fn reveal_env_secret(key: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn set_env_secret(key: String, value: String) -> Result<Vec<EnvSecret>, String> {
+pub async fn reveal_env_secret(key: String) -> Result<String, String> {
+    reveal_env_secret_inner(key).await
+}
+
+pub async fn set_env_secret_inner(key: String, value: String) -> Result<Vec<EnvSecret>, String> {
     let key = key.trim().to_string();
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err("Secret key must be non-empty alphanumeric/underscore".to_string());
@@ -222,12 +505,21 @@ pub async fn set_env_secret(key: String, value: String) -> Result<Vec<EnvSecret>
 }
 
 #[tauri::command]
-pub async fn delete_env_secret(key: String) -> Result<Vec<EnvSecret>, String> {
+pub async fn set_env_secret(key: String, value: String) -> Result<Vec<EnvSecret>, String> {
+    set_env_secret_inner(key, value).await
+}
+
+pub async fn delete_env_secret_inner(key: String) -> Result<Vec<EnvSecret>, String> {
     let key = key.trim().to_string();
     let mut entries = read_env_entries();
     entries.retain(|(k, _)| k != &key);
     write_env_entries(&entries)?;
     list_env_secrets().await
+}
+
+#[tauri::command]
+pub async fn delete_env_secret(key: String) -> Result<Vec<EnvSecret>, String> {
+    delete_env_secret_inner(key).await
 }
 
 #[tauri::command]

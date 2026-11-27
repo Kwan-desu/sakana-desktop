@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  Buildings,
   CaretDown,
   CaretRight,
   ChatCircle,
@@ -12,9 +13,11 @@ import {
   FolderSimple,
   GearSix,
   GitBranch,
+  GithubLogo,
   Globe,
   ListChecks,
   MagnifyingGlass,
+  PencilSimple,
   Plugs,
   Plus,
   SidebarSimple,
@@ -25,6 +28,7 @@ import {
 import type {
   DashboardSubtab,
   HarnessId,
+  Office,
   PrimarySection,
   Project,
   QuotaAccount,
@@ -55,7 +59,16 @@ interface SidebarProps {
     wslDistro?: string;
   }) => Promise<void> | void;
   onDeleteProject: (id: string) => Promise<void> | void;
+  onRenameProject?: (id: string, name: string) => Promise<void> | void;
+  onReorderProjects?: (orderedIds: string[]) => Promise<void> | void;
   onDeleteThread: (id: string) => Promise<void> | void;
+  onRenameThread?: (id: string, title: string) => Promise<void> | void;
+  onMoveThread?: (id: string, projectId: string) => Promise<void> | void;
+  onReorderThreads?: (
+    orderedIds: string[],
+    moved?: { id: string; projectId: string },
+  ) => Promise<void> | void;
+  onOpenGitHubClone?: () => void;
   dashSubtab: DashboardSubtab;
   onSelectDashSubtab: (tab: DashboardSubtab) => void;
   quotas: QuotaAccount[];
@@ -65,6 +78,11 @@ interface SidebarProps {
   activeHostId: string;
   onSwitchHost: (hostId: string) => void;
   onManageHosts: () => void;
+  offices?: Office[];
+  selectedOfficeId?: string;
+  onSelectOffice?: (id: string) => void;
+  onNewOffice?: () => void;
+  onDeleteOffice?: (id: string) => Promise<void> | void;
 }
 
 export function Sidebar({
@@ -81,7 +99,13 @@ export function Sidebar({
   onNewWorktreeThread,
   onCreateProject,
   onDeleteProject,
+  onRenameProject,
+  onReorderProjects,
   onDeleteThread,
+  onRenameThread,
+  onMoveThread,
+  onReorderThreads,
+  onOpenGitHubClone,
   dashSubtab,
   onSelectDashSubtab,
   quotas,
@@ -91,6 +115,11 @@ export function Sidebar({
   activeHostId,
   onSwitchHost,
   onManageHosts,
+  offices = [],
+  selectedOfficeId = '',
+  onSelectOffice,
+  onNewOffice,
+  onDeleteOffice,
 }: SidebarProps) {
   const [search, setSearch] = useState('');
   const [harnessFilter, setHarnessFilter] = useState<HarnessId | 'all'>('all');
@@ -106,6 +135,199 @@ export function Sidebar({
   const [newProjWslDistro, setNewProjWslDistro] = useState('');
   const [wslDistros, setWslDistros] = useState<WslDistro[]>([]);
   const [folderModalOpen, setFolderModalOpen] = useState(false);
+  const [threadCtxMenu, setThreadCtxMenu] = useState<{
+    thread: Thread;
+    x: number;
+    y: number;
+    showMoveList: boolean;
+  } | null>(null);
+  const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
+  const [renameProjectDraft, setRenameProjectDraft] = useState('');
+  const ctxMenuRef = useRef<HTMLDivElement | null>(null);
+
+  type DragItem =
+    | {
+        kind: 'project';
+        id: string;
+        label: string;
+        startX: number;
+        startY: number;
+        x: number;
+        y: number;
+        active: boolean;
+      }
+    | {
+        kind: 'thread';
+        id: string;
+        projectId: string;
+        label: string;
+        startX: number;
+        startY: number;
+        x: number;
+        y: number;
+        active: boolean;
+      };
+  type DropTarget =
+    | { kind: 'project-reorder'; projectId: string; position: 'before' | 'after' }
+    | { kind: 'thread-to-project'; projectId: string }
+    | { kind: 'thread-reorder'; threadId: string; projectId: string; position: 'before' | 'after' };
+
+  const [dragItem, setDragItem] = useState<DragItem | null>(null);
+  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
+  const dragItemRef = useRef<DragItem | null>(null);
+  const dropTargetRef = useRef<DropTarget | null>(null);
+  const suppressClickRef = useRef(false);
+  dragItemRef.current = dragItem;
+  dropTargetRef.current = dropTarget;
+
+  useEffect(() => {
+    if (!threadCtxMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (ctxMenuRef.current && !ctxMenuRef.current.contains(e.target as Node)) {
+        setThreadCtxMenu(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setThreadCtxMenu(null);
+    };
+    const onScroll = () => setThreadCtxMenu(null);
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', onScroll, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('scroll', onScroll, true);
+    };
+  }, [threadCtxMenu]);
+
+  const commitRename = async (threadId: string) => {
+    const next = renameDraft.trim();
+    setRenamingThreadId(null);
+    if (!next) return;
+    await onRenameThread?.(threadId, next);
+  };
+
+  const commitRenameProject = async (projectId: string) => {
+    const next = renameProjectDraft.trim();
+    setRenamingProjectId(null);
+    if (!next) return;
+    await onRenameProject?.(projectId, next);
+  };
+
+  useEffect(() => {
+    if (!dragItem) return;
+
+    const onPointerMove = (e: PointerEvent) => {
+      const cur = dragItemRef.current;
+      if (!cur) return;
+      const dist = Math.hypot(e.clientX - cur.startX, e.clientY - cur.startY);
+      const isActive = cur.active || dist >= 6;
+      if (isActive && !cur.active) {
+        suppressClickRef.current = true;
+      }
+      const nextDrag: DragItem = { ...cur, x: e.clientX, y: e.clientY, active: isActive };
+      dragItemRef.current = nextDrag;
+      setDragItem(nextDrag);
+
+      if (!isActive) return;
+
+      const els = document.elementsFromPoint(e.clientX, e.clientY);
+      let nextTarget: DropTarget | null = null;
+
+      if (cur.kind === 'project') {
+        const projEl = els.find((el) => el.hasAttribute('data-dnd-project-section')) as
+          | HTMLElement
+          | undefined;
+        const pid = projEl?.getAttribute('data-dnd-project-id');
+        if (projEl && pid && pid !== cur.id) {
+          const rect = projEl.getBoundingClientRect();
+          const position = e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+          nextTarget = { kind: 'project-reorder', projectId: pid, position };
+        }
+      } else {
+        const threadEl = els.find((el) => el.hasAttribute('data-dnd-thread-id')) as
+          | HTMLElement
+          | undefined;
+        const tid = threadEl?.getAttribute('data-dnd-thread-id');
+        const tpid = threadEl?.getAttribute('data-dnd-thread-project-id');
+        if (threadEl && tid && tpid && tid !== cur.id) {
+          const rect = threadEl.getBoundingClientRect();
+          const position = e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+          nextTarget = { kind: 'thread-reorder', threadId: tid, projectId: tpid, position };
+        } else {
+          const projEl = els.find((el) => el.hasAttribute('data-dnd-project-section')) as
+            | HTMLElement
+            | undefined;
+          const pid = projEl?.getAttribute('data-dnd-project-id');
+          if (pid && pid !== cur.projectId) {
+            nextTarget = { kind: 'thread-to-project', projectId: pid };
+          }
+        }
+      }
+
+      dropTargetRef.current = nextTarget;
+      setDropTarget(nextTarget);
+    };
+
+    const finishDrag = () => {
+      const cur = dragItemRef.current;
+      const target = dropTargetRef.current;
+      dragItemRef.current = null;
+      dropTargetRef.current = null;
+      setDragItem(null);
+      setDropTarget(null);
+
+      if (cur?.active && target) {
+        if (cur.kind === 'project' && target.kind === 'project-reorder') {
+          const ids = projects.map((p) => p.id).filter((id) => id !== cur.id);
+          const idx = ids.indexOf(target.projectId);
+          if (idx !== -1) {
+            const insertAt = target.position === 'before' ? idx : idx + 1;
+            ids.splice(insertAt, 0, cur.id);
+            void onReorderProjects?.(ids);
+          }
+        } else if (cur.kind === 'thread' && target.kind === 'thread-to-project') {
+          if (target.projectId !== cur.projectId) {
+            setCollapsedProjects((prev) => ({ ...prev, [target.projectId]: false }));
+            void onMoveThread?.(cur.id, target.projectId);
+          }
+        } else if (cur.kind === 'thread' && target.kind === 'thread-reorder') {
+          const ids = threads.map((t) => t.id).filter((id) => id !== cur.id);
+          const idx = ids.indexOf(target.threadId);
+          if (idx !== -1) {
+            const insertAt = target.position === 'before' ? idx : idx + 1;
+            ids.splice(insertAt, 0, cur.id);
+            const moved =
+              target.projectId !== cur.projectId
+                ? { id: cur.id, projectId: target.projectId }
+                : undefined;
+            if (moved) {
+              setCollapsedProjects((prev) => ({ ...prev, [target.projectId]: false }));
+            }
+            void onReorderThreads?.(ids, moved);
+          }
+        }
+      }
+
+      if (suppressClickRef.current) {
+        window.setTimeout(() => {
+          suppressClickRef.current = false;
+        }, 0);
+      }
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', finishDrag);
+    window.addEventListener('pointercancel', finishDrag);
+    return () => {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', finishDrag);
+      window.removeEventListener('pointercancel', finishDrag);
+    };
+  }, [Boolean(dragItem), projects, threads, onReorderProjects, onMoveThread, onReorderThreads]);
   const sidebarRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
@@ -188,34 +410,42 @@ export function Sidebar({
   const sakanaQuota = quotas.find((q) => q.harness === 'sakana');
 
   let footerWinLabel = '5h';
-  let footerPctNum = 0;
+  let footerUsedPct = 0;
+  let hasFooterQuota = false;
   if (activeHarness === 'kiro-cli' && kiroQuota) {
     footerWinLabel = '30d';
-    footerPctNum = kiroQuota.fiveHourPct;
+    footerUsedPct = kiroQuota.fiveHourPct;
+    hasFooterQuota = true;
   } else if (activeHarness === 'claude-code' && claudeQuota) {
+    hasFooterQuota = true;
     if (claudeQuota.fiveHourPct >= 100) {
       footerWinLabel = '7d';
-      footerPctNum = claudeQuota.weeklyPct;
+      footerUsedPct = claudeQuota.weeklyPct;
     } else {
       footerWinLabel = '5h';
-      footerPctNum = claudeQuota.fiveHourPct;
+      footerUsedPct = claudeQuota.fiveHourPct;
     }
   } else if (activeHarness === 'sakana' && sakanaQuota) {
     footerWinLabel = '5h';
-    footerPctNum = sakanaQuota.fiveHourPct;
+    footerUsedPct = sakanaQuota.fiveHourPct;
+    hasFooterQuota = true;
   } else if (agyQuota) {
+    hasFooterQuota = true;
     if (agyQuota.fiveHourPct >= 100) {
       footerWinLabel = '7d';
-      footerPctNum = agyQuota.weeklyPct;
+      footerUsedPct = agyQuota.weeklyPct;
     } else {
       footerWinLabel = '5h';
-      footerPctNum = agyQuota.fiveHourPct;
+      footerUsedPct = agyQuota.fiveHourPct;
     }
   }
+  const footerRemainingPct = hasFooterQuota
+    ? Math.max(0, Math.min(100, 100 - footerUsedPct))
+    : 0;
   const footerPctColor =
-    footerPctNum >= 90
+    footerUsedPct >= 90
       ? 'var(--accent-red)'
-      : footerPctNum >= 70
+      : footerUsedPct >= 70
         ? 'var(--accent-yellow)'
         : 'var(--text-main)';
 
@@ -446,23 +676,22 @@ export function Sidebar({
           </button>
           <button
             type="button"
-            onClick={() => onSwitchSection('dashboard')}
+            onClick={() => onSwitchSection('office')}
             className="h-7 px-2 rounded-[6px] text-[12px] font-medium flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
             style={
-              primarySection === 'dashboard'
+              primarySection === 'office'
                 ? { backgroundColor: 'var(--bg-card)', color: 'var(--text-main)', boxShadow: 'var(--surface-shadow)' }
                 : { color: 'var(--text-muted)' }
             }
           >
-            <ListChecks size={13} weight={primarySection === 'dashboard' ? 'fill' : 'regular'} />
-            <span>Dashboard</span>
-            {pendingApprovalCount > 0 && (
+            <Buildings size={13} weight={primarySection === 'office' ? 'fill' : 'regular'} />
+            <span>Work</span>
+            {offices.some((o) => o.status === 'RUNNING') && (
               <span
-                className="font-mono-tech text-[9.5px] px-1.5 rounded-full"
-                style={{ backgroundColor: 'var(--accent-yellow-bg)', color: 'var(--accent-yellow)' }}
-              >
-                {pendingApprovalCount}
-              </span>
+                className="h-1.5 w-1.5 rounded-full pulse-dot shrink-0"
+                style={{ backgroundColor: 'var(--accent-blue)' }}
+                title="Workspaces running"
+              />
             )}
           </button>
         </div>
@@ -501,6 +730,17 @@ export function Sidebar({
               >
                 <FolderPlus size={13} />
               </button>
+              {onOpenGitHubClone && (
+                <button
+                  type="button"
+                  onClick={onOpenGitHubClone}
+                  className="btn-ghost w-7 h-7 flex items-center justify-center cursor-pointer shrink-0"
+                  title="Clone from GitHub"
+                  aria-label="Clone from GitHub"
+                >
+                  <GithubLogo size={13} />
+                </button>
+              )}
               <button
                 type="button"
                 onClick={onNewWorktreeThread}
@@ -729,25 +969,112 @@ export function Sidebar({
                   return true;
                 });
 
+                const isDraggingProj = dragItem?.active && dragItem.kind === 'project' && dragItem.id === proj.id;
+                const isProjDropBefore =
+                  dropTarget?.kind === 'project-reorder' &&
+                  dropTarget.projectId === proj.id &&
+                  dropTarget.position === 'before';
+                const isProjDropAfter =
+                  dropTarget?.kind === 'project-reorder' &&
+                  dropTarget.projectId === proj.id &&
+                  dropTarget.position === 'after';
+                const isThreadDropOverProj =
+                  dropTarget?.kind === 'thread-to-project' && dropTarget.projectId === proj.id;
+                const isRenamingProj = renamingProjectId === proj.id;
+
                 return (
-                  <div key={proj.id} className="space-y-0.5">
-                    <div className="group flex items-center gap-1">
+                  <div
+                    key={proj.id}
+                    data-dnd-project-section="true"
+                    data-dnd-project-id={proj.id}
+                    className={`space-y-0.5 rounded-[7px] transition-opacity relative ${isDraggingProj ? 'opacity-40' : ''}`}
+                    style={
+                      isThreadDropOverProj
+                        ? {
+                            backgroundColor: 'var(--accent-blue-bg)',
+                            outline: '1.5px dashed var(--accent-blue)',
+                          }
+                        : undefined
+                    }
+                  >
+                    {isProjDropBefore && (
+                      <div
+                        className="h-0.5 rounded-full mx-1 pointer-events-none"
+                        style={{ backgroundColor: 'var(--accent-blue)' }}
+                      />
+                    )}
+                    <div
+                      className="group flex items-center gap-1"
+                      onPointerDown={(e) => {
+                        if (e.button !== 0 || isRenamingProj) return;
+                        const targetEl = e.target as HTMLElement;
+                        if (targetEl.closest('input') || targetEl.closest('[data-no-drag]')) return;
+                        setDragItem({
+                          kind: 'project',
+                          id: proj.id,
+                          label: proj.name,
+                          startX: e.clientX,
+                          startY: e.clientY,
+                          x: e.clientX,
+                          y: e.clientY,
+                          active: false,
+                        });
+                      }}
+                    >
                       <button
                         type="button"
-                        onClick={() => toggleProject(proj.id)}
-                        className="flex-1 min-w-0 px-2 py-1 rounded-[6px] flex items-center justify-between gap-1.5 hover:bg-[var(--bg-hover)] cursor-pointer"
+                        onClick={() => {
+                          if (suppressClickRef.current || isRenamingProj) return;
+                          toggleProject(proj.id);
+                        }}
+                        onDoubleClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setRenamingProjectId(proj.id);
+                          setRenameProjectDraft(proj.name);
+                        }}
+                        className="flex-1 min-w-0 px-2 py-1 rounded-[6px] flex items-center justify-between gap-1.5 hover:bg-[var(--bg-hover)] cursor-pointer select-none"
+                        title="Click to toggle · Double-click to rename · Drag to reorder"
                       >
-                        <span className="inline-flex items-center gap-1.5 min-w-0">
+                        <span className="inline-flex items-center gap-1.5 min-w-0 flex-1">
                           {collapsed ? (
-                            <CaretRight size={11} style={{ color: 'var(--text-muted)' }} />
+                            <CaretRight size={11} className="shrink-0" style={{ color: 'var(--text-muted)' }} />
                           ) : (
-                            <CaretDown size={11} style={{ color: 'var(--text-muted)' }} />
+                            <CaretDown size={11} className="shrink-0" style={{ color: 'var(--text-muted)' }} />
                           )}
-                          <FolderSimple size={13} style={{ color: 'var(--text-muted)' }} />
-                          <span className="text-[12px] font-medium truncate" style={{ color: 'var(--text-main)' }}>
-                            {proj.name}
-                          </span>
-                          {(proj.runtime === 'wsl' || proj.wslDistro) && (
+                          <FolderSimple size={13} className="shrink-0" style={{ color: 'var(--text-muted)' }} />
+                          {isRenamingProj ? (
+                            <input
+                              value={renameProjectDraft}
+                              onChange={(e) => setRenameProjectDraft(e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              onDoubleClick={(e) => e.stopPropagation()}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onKeyDown={(e) => {
+                                e.stopPropagation();
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  void commitRenameProject(proj.id);
+                                } else if (e.key === 'Escape') {
+                                  e.preventDefault();
+                                  setRenamingProjectId(null);
+                                }
+                              }}
+                              onBlur={() => void commitRenameProject(proj.id)}
+                              autoFocus
+                              className="w-full rounded-[4px] border px-1.5 py-0.5 text-[12px] focus:outline-none"
+                              style={{
+                                backgroundColor: 'var(--bg-app)',
+                                borderColor: 'var(--accent-blue)',
+                                color: 'var(--text-main)',
+                              }}
+                            />
+                          ) : (
+                            <span className="text-[12px] font-medium truncate" style={{ color: 'var(--text-main)' }}>
+                              {proj.name}
+                            </span>
+                          )}
+                          {(proj.runtime === 'wsl' || proj.wslDistro) && !isRenamingProj && (
                             <span
                               className="font-mono-tech text-[9px] px-1 rounded-[4px] shrink-0"
                               style={{ backgroundColor: 'var(--bg-elevated)', color: 'var(--text-muted)' }}
@@ -756,18 +1083,19 @@ export function Sidebar({
                               WSL
                             </span>
                           )}
-                          {proj.discordChannel && (
+                          {proj.discordChannel && !isRenamingProj && (
                             <span style={{ color: 'var(--accent-discord)' }} title={`Discord ${proj.discordChannel}`}>
                               <DiscordIcon size={11} />
                             </span>
                           )}
                         </span>
-                        <span className="font-mono-tech text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                        <span className="font-mono-tech text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>
                           {projThreads.length}
                         </span>
                       </button>
                       <button
                         type="button"
+                        data-no-drag="true"
                         onClick={() => void onQuickNewThread(proj.id)}
                         className="opacity-0 group-hover:opacity-100 p-1 rounded-[5px] hover:bg-[var(--bg-hover)] cursor-pointer transition-opacity"
                         style={{ color: 'var(--text-muted)' }}
@@ -779,6 +1107,7 @@ export function Sidebar({
                       {projects.length > 1 && (
                         <button
                           type="button"
+                          data-no-drag="true"
                           onClick={() => onDeleteProject(proj.id)}
                           className="opacity-0 group-hover:opacity-100 p-1 rounded-[5px] hover:bg-[var(--bg-hover)] cursor-pointer transition-opacity"
                           style={{ color: 'var(--text-muted)' }}
@@ -799,15 +1128,73 @@ export function Sidebar({
                         ) : (
                           projThreads.map((t) => {
                             const active = t.id === selectedThreadId;
+                            const isRenaming = renamingThreadId === t.id;
+                            const isDraggingThread =
+                              dragItem?.active && dragItem.kind === 'thread' && dragItem.id === t.id;
+                            const isThreadDropBefore =
+                              dropTarget?.kind === 'thread-reorder' &&
+                              dropTarget.threadId === t.id &&
+                              dropTarget.position === 'before';
+                            const isThreadDropAfter =
+                              dropTarget?.kind === 'thread-reorder' &&
+                              dropTarget.threadId === t.id &&
+                              dropTarget.position === 'after';
                             return (
                               <div
                                 key={t.id}
-                                className="group relative"
+                                data-dnd-thread-id={t.id}
+                                data-dnd-thread-project-id={t.projectId}
+                                className={`group relative transition-opacity ${isDraggingThread ? 'opacity-40' : ''}`}
+                                onPointerDown={(e) => {
+                                  if (e.button !== 0 || isRenaming) return;
+                                  const targetEl = e.target as HTMLElement;
+                                  if (targetEl.closest('input') || targetEl.closest('[data-no-drag]')) return;
+                                  setDragItem({
+                                    kind: 'thread',
+                                    id: t.id,
+                                    projectId: t.projectId,
+                                    label: t.title,
+                                    startX: e.clientX,
+                                    startY: e.clientY,
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                    active: false,
+                                  });
+                                }}
+                                onContextMenu={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  const menuW = 200;
+                                  const menuH = 220;
+                                  const x = Math.min(e.clientX, window.innerWidth - menuW - 8);
+                                  const y = Math.min(e.clientY, window.innerHeight - menuH - 8);
+                                  setThreadCtxMenu({
+                                    thread: t,
+                                    x: Math.max(8, x),
+                                    y: Math.max(8, y),
+                                    showMoveList: false,
+                                  });
+                                }}
                               >
+                                {isThreadDropBefore && (
+                                  <div
+                                    className="h-0.5 rounded-full mx-1 mb-0.5 pointer-events-none"
+                                    style={{ backgroundColor: 'var(--accent-blue)' }}
+                                  />
+                                )}
                                 <button
                                   type="button"
-                                  onClick={() => onSelectThread(t.id)}
-                                  className={`w-full text-left px-2 py-1.5 rounded-[7px] border transition-colors cursor-pointer space-y-0.5 ${
+                                  onClick={() => {
+                                    if (suppressClickRef.current || isRenaming) return;
+                                    onSelectThread(t.id);
+                                  }}
+                                  onDoubleClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    setRenamingThreadId(t.id);
+                                    setRenameDraft(t.title);
+                                  }}
+                                  className={`w-full text-left px-2 py-1.5 rounded-[7px] border transition-colors cursor-pointer space-y-0.5 select-none ${
                                     active ? '' : 'hover:bg-[var(--bg-hover)]'
                                   }`}
                                   style={
@@ -824,14 +1211,40 @@ export function Sidebar({
                                   }
                                 >
                                   <div className="flex items-center justify-between gap-2">
-                                    <span className="inline-flex items-center gap-1.5 min-w-0">
+                                    <span className="inline-flex items-center gap-1.5 min-w-0 flex-1">
                                       {renderStatusDot(t)}
-                                      <span
-                                        className={`text-[12px] truncate ${active ? 'font-semibold' : 'font-normal'}`}
-                                        style={{ color: active ? 'var(--text-main)' : 'var(--text-body)' }}
-                                      >
-                                        {t.title}
-                                      </span>
+                                      {isRenaming ? (
+                                        <input
+                                          value={renameDraft}
+                                          onChange={(e) => setRenameDraft(e.target.value)}
+                                          onClick={(e) => e.stopPropagation()}
+                                          onKeyDown={(e) => {
+                                            e.stopPropagation();
+                                            if (e.key === 'Enter') {
+                                              e.preventDefault();
+                                              void commitRename(t.id);
+                                            } else if (e.key === 'Escape') {
+                                              e.preventDefault();
+                                              setRenamingThreadId(null);
+                                            }
+                                          }}
+                                          onBlur={() => void commitRename(t.id)}
+                                          autoFocus
+                                          className="w-full rounded-[4px] border px-1.5 py-0.5 text-[12px] focus:outline-none"
+                                          style={{
+                                            backgroundColor: 'var(--bg-app)',
+                                            borderColor: 'var(--accent-blue)',
+                                            color: 'var(--text-main)',
+                                          }}
+                                        />
+                                      ) : (
+                                        <span
+                                          className={`text-[12px] truncate ${active ? 'font-semibold' : 'font-normal'}`}
+                                          style={{ color: active ? 'var(--text-main)' : 'var(--text-body)' }}
+                                        >
+                                          {t.title}
+                                        </span>
+                                      )}
                                     </span>
                                     <span className="font-mono-tech text-[10px] shrink-0 group-hover:opacity-0 transition-opacity" style={{ color: 'var(--text-muted)' }}>
                                       {t.timeAgo}
@@ -862,6 +1275,7 @@ export function Sidebar({
                                 </button>
                                 <button
                                   type="button"
+                                  data-no-drag="true"
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     onDeleteThread(t.id);
@@ -873,12 +1287,143 @@ export function Sidebar({
                                 >
                                   <Trash size={11} />
                                 </button>
+                                {isThreadDropAfter && (
+                                  <div
+                                    className="h-0.5 rounded-full mx-1 mt-0.5 pointer-events-none"
+                                    style={{ backgroundColor: 'var(--accent-blue)' }}
+                                  />
+                                )}
                               </div>
                             );
                           })
                         )}
                       </div>
                     )}
+                    {isProjDropAfter && (
+                      <div
+                        className="h-0.5 rounded-full mx-1 pointer-events-none"
+                        style={{ backgroundColor: 'var(--accent-blue)' }}
+                      />
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      ) : primarySection === 'office' ? (
+        <div className="flex-1 min-h-0 flex flex-col">
+          <div
+            className="px-3 py-2.5 border-b flex items-center justify-between gap-2 shrink-0"
+            style={{ borderColor: 'var(--border-line)' }}
+          >
+            <span className="text-[11.5px] font-semibold" style={{ color: 'var(--text-main)' }}>
+              Offices
+            </span>
+            <button
+              type="button"
+              onClick={() => onNewOffice?.()}
+              className="btn-solid px-2 py-1 text-[11px] inline-flex items-center gap-1 cursor-pointer shrink-0"
+              title="New Office"
+            >
+              <Plus size={11} weight="bold" />
+              <span>New Office</span>
+            </button>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1">
+            {offices.length === 0 ? (
+              <div className="px-2.5 py-6 text-center space-y-2">
+                <div className="text-[11.5px]" style={{ color: 'var(--text-muted)' }}>
+                  No offices yet
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onNewOffice?.()}
+                  className="btn-ghost px-2.5 py-1 text-[11.5px] inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Plus size={12} />
+                  <span>Create Office</span>
+                </button>
+              </div>
+            ) : (
+              offices.map((office) => {
+                const active = office.id === selectedOfficeId;
+                const running = office.status === 'RUNNING';
+                return (
+                  <div key={office.id} className="group relative">
+                    <button
+                      type="button"
+                      onClick={() => onSelectOffice?.(office.id)}
+                      className={`w-full text-left px-2.5 py-2 rounded-[7px] border transition-colors cursor-pointer space-y-1 ${
+                        active ? '' : 'hover:bg-[var(--bg-hover)]'
+                      }`}
+                      style={
+                        active
+                          ? {
+                              backgroundColor: 'var(--bg-card)',
+                              borderColor: 'var(--border-strong)',
+                              boxShadow: 'var(--surface-shadow)',
+                            }
+                          : {
+                              backgroundColor: 'transparent',
+                              borderColor: 'transparent',
+                            }
+                      }
+                    >
+                      <div className="flex items-center justify-between gap-2 pr-4">
+                        <span className="inline-flex items-center gap-1.5 min-w-0">
+                          {running ? (
+                            <span
+                              className="h-2 w-2 rounded-full pulse-dot shrink-0"
+                              style={{ backgroundColor: 'var(--accent-blue)' }}
+                              title="Running"
+                            />
+                          ) : (
+                            <span
+                              className="h-1.5 w-1.5 rounded-full shrink-0 opacity-35"
+                              style={{ backgroundColor: 'var(--text-muted)' }}
+                              title="Idle"
+                            />
+                          )}
+                          <span
+                            className={`text-[12px] truncate ${active ? 'font-semibold' : 'font-medium'}`}
+                            style={{ color: active ? 'var(--text-main)' : 'var(--text-body)' }}
+                          >
+                            {office.name}
+                          </span>
+                        </span>
+                        <span
+                          className="font-mono-tech text-[10px] px-1.5 py-0.5 rounded-full shrink-0"
+                          style={{
+                            backgroundColor: 'var(--bg-elevated)',
+                            color: 'var(--text-muted)',
+                          }}
+                          title={`${office.staff.length} staff`}
+                        >
+                          {office.staff.length}
+                        </span>
+                      </div>
+                      <div
+                        className="font-mono-tech text-[10px] truncate pl-3.5"
+                        style={{ color: 'var(--text-muted)' }}
+                        title={office.cwd}
+                      >
+                        {office.cwd || '.'}
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void onDeleteOffice?.(office.id);
+                      }}
+                      className="opacity-0 group-hover:opacity-100 absolute right-2 top-2 p-1 rounded-[5px] hover:bg-[var(--bg-hover)] cursor-pointer transition-opacity"
+                      style={{ color: 'var(--text-muted)' }}
+                      title={`Delete office ${office.name}`}
+                      aria-label={`Delete office ${office.name}`}
+                    >
+                      <Trash size={11} />
+                    </button>
                   </div>
                 );
               })
@@ -943,12 +1488,21 @@ export function Sidebar({
           }}
           className="flex items-center gap-1.5 text-[11.5px] font-mono-tech cursor-pointer hover:opacity-80 min-w-0"
           style={{ color: 'var(--text-body)' }}
-          title="Click to view all harness quotas"
+          title={
+            hasFooterQuota
+              ? `${footerWinLabel} limit remaining: ${footerRemainingPct}% (click to view all harness quotas)`
+              : 'No usage data yet — click to view all harness quotas'
+          }
+          aria-label={
+            hasFooterQuota
+              ? `${footerWinLabel} limit remaining ${footerRemainingPct}%, click to view all harness quotas`
+              : 'No usage data yet, click to view all harness quotas'
+          }
         >
           <HarnessIcon harness={activeHarness} size={13} />
           <span style={{ color: 'var(--text-muted)' }}>{footerWinLabel}</span>
           <span className="font-semibold" style={{ color: footerPctColor }}>
-            {footerPctNum}%
+            {footerRemainingPct}%
           </span>
         </button>
 
@@ -957,13 +1511,26 @@ export function Sidebar({
             type="button"
             onClick={() => {
               setUsageOpen(false);
-              onSelectDashSubtab('remote');
+              onSwitchSection('dashboard');
             }}
-            className="btn-ghost px-2 py-1 text-[11px] inline-flex items-center gap-1.5 cursor-pointer"
-            title="Open Preferences & System"
+            className="px-2 py-1 rounded-[6px] text-[11px] font-medium inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+            style={
+              primarySection === 'dashboard'
+                ? { backgroundColor: 'var(--bg-card)', color: 'var(--text-main)', border: '1px solid var(--border-line)' }
+                : { color: 'var(--text-body)', border: '1px solid transparent' }
+            }
+            title="Open Operations Dashboard"
           >
-            <GearSix size={13} />
-            <span>Preferences</span>
+            <ListChecks size={13} weight={primarySection === 'dashboard' ? 'fill' : 'regular'} />
+            <span>Dashboard</span>
+            {pendingApprovalCount > 0 && (
+              <span
+                className="font-mono-tech text-[9.5px] px-1 rounded-full"
+                style={{ backgroundColor: 'var(--accent-yellow-bg)', color: 'var(--accent-yellow)' }}
+              >
+                {pendingApprovalCount}
+              </span>
+            )}
           </button>
         </div>
 
@@ -1118,34 +1685,6 @@ export function Sidebar({
                 </div>
               )}
 
-              {/* Gemini Bridge Section */}
-              <div className="px-3.5 py-3 space-y-1.5">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span
-                      className="w-5 h-5 rounded-full border flex items-center justify-center shrink-0"
-                      style={{ backgroundColor: 'var(--bg-elevated)', borderColor: 'var(--border-line)' }}
-                    >
-                      <HarnessIcon harness="sakana" size={11} />
-                    </span>
-                    <span className="text-[12.5px] font-semibold truncate" style={{ color: 'var(--text-main)' }}>
-                      Gemini Bridge
-                    </span>
-                  </div>
-                  <span className="font-mono-tech text-[10.5px] shrink-0" style={{ color: 'var(--text-muted)' }}>
-                    {sakanaQuota ? `${sakanaQuota.fiveHourPct} (5h) · ${sakanaQuota.weeklyPct} (7d)` : '0 (5h) · 0 (7d)'}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between gap-2 text-[11px] pl-1">
-                  <span className="truncate" style={{ color: 'var(--text-muted)' }}>
-                    {sakanaQuota ? sakanaQuota.label : 'No usage yet'}
-                  </span>
-                  <span className="font-mono-tech text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>
-                    No cap
-                  </span>
-                </div>
-              </div>
-
               {/* Claude Section (only when linked/present in quotas) */}
               {claudeQuota && (
                 <div
@@ -1185,6 +1724,114 @@ export function Sidebar({
           </div>
         )}
       </div>
+
+      {dragItem?.active && (
+        <div
+          className="fixed z-[100] pointer-events-none px-2.5 py-1 rounded-[7px] border text-[11.5px] font-medium flex items-center gap-1.5 shadow-lg max-w-[220px]"
+          style={{
+            left: dragItem.x + 12,
+            top: dragItem.y + 10,
+            backgroundColor: 'var(--bg-card)',
+            borderColor: 'var(--accent-blue)',
+            color: 'var(--text-main)',
+          }}
+        >
+          {dragItem.kind === 'project' ? (
+            <FolderSimple size={12} className="shrink-0" style={{ color: 'var(--accent-blue)' }} />
+          ) : (
+            <ChatCircle size={12} className="shrink-0" style={{ color: 'var(--accent-blue)' }} />
+          )}
+          <span className="truncate">{dragItem.label}</span>
+        </div>
+      )}
+
+      {threadCtxMenu && (
+        <div
+          ref={ctxMenuRef}
+          className="sakana-popover pop-enter fixed z-50 w-52 rounded-[10px] p-1 space-y-0.5"
+          style={{ left: threadCtxMenu.x, top: threadCtxMenu.y }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              setRenamingThreadId(threadCtxMenu.thread.id);
+              setRenameDraft(threadCtxMenu.thread.title);
+              setThreadCtxMenu(null);
+            }}
+            className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+            style={{ color: 'var(--text-main)' }}
+          >
+            <PencilSimple size={13} style={{ color: 'var(--text-muted)' }} />
+            <span>Rename thread</span>
+          </button>
+          {projects.length > 1 && onMoveThread && (
+            <div>
+              <button
+                type="button"
+                onClick={() =>
+                  setThreadCtxMenu((prev) =>
+                    prev ? { ...prev, showMoveList: !prev.showMoveList } : null,
+                  )
+                }
+                className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center justify-between gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+                style={{ color: 'var(--text-main)' }}
+              >
+                <span className="inline-flex items-center gap-2">
+                  <FolderSimple size={13} style={{ color: 'var(--text-muted)' }} />
+                  <span>Move to project</span>
+                </span>
+                {threadCtxMenu.showMoveList ? (
+                  <CaretDown size={11} style={{ color: 'var(--text-muted)' }} />
+                ) : (
+                  <CaretRight size={11} style={{ color: 'var(--text-muted)' }} />
+                )}
+              </button>
+              {threadCtxMenu.showMoveList && (
+                <div
+                  className="mt-0.5 ml-3 pl-2 border-l space-y-0.5 max-h-40 overflow-y-auto"
+                  style={{ borderColor: 'var(--border-line)' }}
+                >
+                  {projects
+                    .filter((p) => p.id !== threadCtxMenu.thread.projectId)
+                    .map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => {
+                          void onMoveThread(threadCtxMenu.thread.id, p.id);
+                          setThreadCtxMenu(null);
+                        }}
+                        className="w-full px-2 py-1 rounded-[5px] text-[11.5px] flex items-center gap-1.5 cursor-pointer hover:bg-[var(--bg-hover)] truncate"
+                        style={{ color: 'var(--text-body)' }}
+                      >
+                        <FolderOpen size={11} style={{ color: 'var(--text-muted)' }} className="shrink-0" />
+                        <span className="truncate">{p.name}</span>
+                      </button>
+                    ))}
+                </div>
+              )}
+            </div>
+          )}
+          <div className="my-0.5 border-t" style={{ borderColor: 'var(--border-line)' }} />
+          <button
+            type="button"
+            onClick={() => {
+              const id = threadCtxMenu.thread.id;
+              setThreadCtxMenu(null);
+              void onDeleteThread(id);
+            }}
+            className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+            style={{ color: 'var(--accent-red)' }}
+          >
+            <Trash size={13} />
+            <span>Delete thread</span>
+          </button>
+        </div>
+      )}
 
       <FolderPickerModal
         open={folderModalOpen}

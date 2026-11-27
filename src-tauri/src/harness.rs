@@ -9,13 +9,13 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::models::{
-    ChatMessage, HarnessModelOption, InlineWidgetData, McpServer, SkillItem, SubagentInfo,
-    ToolCall, TraceSpan, WidgetBar, WidgetMetric,
+    ChatMessage, HarnessAccountRow, HarnessModelOption, InlineWidgetData, McpServer, SkillItem,
+    SubagentInfo, ToolCall, TraceSpan, WidgetBar, WidgetMetric,
 };
 use crate::DbState;
 
@@ -135,7 +135,7 @@ pub fn resolve_harness_binary(harness: &str) -> Option<PathBuf> {
     None
 }
 
-pub fn load_sakana_context(project_cwd: &str) -> String {
+pub fn load_sakana_context(project_cwd: &str, wsl_distro: Option<&str>) -> String {
     let mut sections = Vec::new();
 
     if let Some(home) = dirs::home_dir() {
@@ -152,7 +152,8 @@ pub fn load_sakana_context(project_cwd: &str) -> String {
         }
     }
 
-    let project_root = if let Some((distro, linux_path)) = crate::platform::parse_wsl_path(project_cwd) {
+    let encoded_cwd = crate::platform::encode_wsl_path(wsl_distro, project_cwd);
+    let project_root = if let Some((distro, linux_path)) = crate::platform::parse_wsl_path(&encoded_cwd) {
         crate::platform::wsl_to_unc_path(&distro, &linux_path)
     } else {
         PathBuf::from(project_cwd)
@@ -942,23 +943,18 @@ async fn run_cli_harness(
     Ok(())
 }
 
-async fn run_wsl_cli_harness(
-    distro: &str,
+fn wsl_posix_cwd(cwd: &str) -> String {
+    if let Some((_, linux_path)) = crate::platform::parse_wsl_path(cwd) {
+        linux_path
+    } else {
+        cwd.to_string()
+    }
+}
+
+fn build_wsl_env_exports(
     harness: &str,
     account: Option<&crate::models::HarnessAccountRow>,
-    model: &str,
-    effort: &str,
-    permission_mode: &str,
-    enabled_mcp_servers: &[McpServer],
-    cwd: &str,
-    full_prompt: &str,
-    app: Option<&AppHandle>,
-    session_id: &str,
-    message_id: &str,
-    started: Instant,
-    acc: &mut TurnAccumulator,
-    mut cancel_rx: oneshot::Receiver<()>,
-) -> Result<(), String> {
+) -> Vec<String> {
     let mut env_exports = Vec::new();
     for key in [
         "ANTHROPIC_API_KEY",
@@ -978,8 +974,55 @@ async fn run_wsl_cli_harness(
         }
     }
     if harness == "agy-cli" {
-        env_exports.push("export AGY_ACP_FORCE_FILE_STORAGE=1".to_string());
+        let agy_id = account
+            .map(|a| a.id.trim())
+            .filter(|id| !id.is_empty())
+            .unwrap_or("default");
+        let escaped_id = crate::platform::shell_escape_single(agy_id);
+        env_exports.push("export AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1".to_string());
+        env_exports.push(format!(
+            "_SAKANA_ORIG_HOME=\"$HOME\"; export PATH=\"$_SAKANA_ORIG_HOME/.local/bin:$_SAKANA_ORIG_HOME/.antigravity/bin:$PATH\"; _SAKANA_AGY_PROF=\"$_SAKANA_ORIG_HOME/.sakana/profiles/agy/\"{}; mkdir -p \"$_SAKANA_AGY_PROF/.gemini/antigravity-cli\"; export HOME=\"$_SAKANA_AGY_PROF\"; export SAKANA_AGY_GEMINI_DIR=\"$_SAKANA_AGY_PROF/.gemini\"",
+            escaped_id
+        ));
+    } else if let Some(acc) = account.filter(|a| !a.is_default && !a.id.trim().is_empty()) {
+        let id = acc.id.trim();
+        match harness {
+            "claude-code" => {
+                env_exports.push(format!(
+                    "export CLAUDE_CONFIG_DIR=\"$HOME/.sakana/profiles/{}\"",
+                    id
+                ));
+            }
+            "kiro-cli" => {
+                env_exports.push(format!(
+                    "export XDG_DATA_HOME=\"$HOME/.sakana/profiles/{}/.local/share\"",
+                    id
+                ));
+            }
+            _ => {}
+        }
     }
+    env_exports
+}
+
+async fn run_wsl_cli_harness(
+    distro: &str,
+    harness: &str,
+    account: Option<&crate::models::HarnessAccountRow>,
+    model: &str,
+    effort: &str,
+    permission_mode: &str,
+    enabled_mcp_servers: &[McpServer],
+    cwd: &str,
+    full_prompt: &str,
+    app: Option<&AppHandle>,
+    session_id: &str,
+    message_id: &str,
+    started: Instant,
+    acc: &mut TurnAccumulator,
+    mut cancel_rx: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    let env_exports = build_wsl_env_exports(harness, account);
 
     let mut mcp_setup_cmd: Option<String> = None;
     let mut wsl_mcp_path: Option<String> = None;
@@ -1054,7 +1097,8 @@ async fn run_wsl_cli_harness(
         cli_cmd = format!("{}; {}", env_exports.join("; "), cli_cmd);
     }
 
-    let mut cmd = crate::platform::wsl_tokio_shell(distro, cwd, &cli_cmd);
+    let posix_cwd = wsl_posix_cwd(cwd);
+    let mut cmd = crate::platform::wsl_tokio_shell(distro, &posix_cwd, &cli_cmd);
     crate::auth::apply_account_env(&mut cmd, harness, account);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
@@ -1408,6 +1452,13 @@ fn parse_cross_harness_command(prompt: &str, primary_harness: &str) -> Option<(S
     None
 }
 
+#[derive(Default)]
+pub struct TurnRunOptions {
+    pub extra_system_context: Option<String>,
+    pub completion_tx: Option<tokio::sync::oneshot::Sender<Result<ChatMessage, String>>>,
+    pub author_override: Option<String>,
+}
+
 pub async fn send_turn_inner(
     app: Option<AppHandle>,
     db_arc: Arc<Mutex<crate::db::Database>>,
@@ -1415,6 +1466,27 @@ pub async fn send_turn_inner(
     session_id: String,
     prompt: String,
     attachments: Option<Vec<Value>>,
+) -> Result<String, String> {
+    send_turn_with_options(
+        app,
+        db_arc,
+        active_arc,
+        session_id,
+        prompt,
+        attachments,
+        TurnRunOptions::default(),
+    )
+    .await
+}
+
+pub async fn send_turn_with_options(
+    app: Option<AppHandle>,
+    db_arc: Arc<Mutex<crate::db::Database>>,
+    active_arc: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    session_id: String,
+    prompt: String,
+    attachments: Option<Vec<Value>>,
+    opts: TurnRunOptions,
 ) -> Result<String, String> {
     let (session, project_cwd, project_wsl_distro) = {
         let db = db_arc.lock().await;
@@ -1473,6 +1545,11 @@ pub async fn send_turn_inner(
     let msg_id_clone = message_id.clone();
     let sid = session_id.clone();
     let attach_text = attachments.as_deref().map(format_attachments).unwrap_or_default();
+    let TurnRunOptions {
+        extra_system_context,
+        mut completion_tx,
+        author_override,
+    } = opts;
 
     tokio::spawn(async move {
         let started = Instant::now();
@@ -1490,7 +1567,17 @@ pub async fn send_turn_inner(
             project_cwd.clone()
         };
 
-        let sakana_ctx = load_sakana_context(&effective_cwd);
+        let mut sakana_ctx = load_sakana_context(&effective_cwd, project_wsl_distro.as_deref());
+        if let Some(extra) = extra_system_context.as_deref() {
+            let trimmed = extra.trim();
+            if !trimmed.is_empty() {
+                if sakana_ctx.trim().is_empty() {
+                    sakana_ctx = trimmed.to_string();
+                } else {
+                    sakana_ctx = format!("{}\n\n{}", trimmed, sakana_ctx);
+                }
+            }
+        }
         let cross_cmd = parse_cross_harness_command(&prompt, &session.harness);
 
         let (active_harness, effective_prompt) = if let Some((ref target_h, ref cmd_name, ref task)) = cross_cmd {
@@ -1536,6 +1623,15 @@ pub async fn send_turn_inner(
         let full_prompt_with_ctx =
             build_cli_prompt_with_history(&sakana_ctx, &recent_history, &effective_prompt);
 
+        let (resolved_model, resolved_effort) = if active_harness == "agy-cli" {
+            let (m, e) =
+                resolve_agy_model_and_effort_with_db(&db_arc, &session.model, &session.effort)
+                    .await;
+            (m.unwrap_or_default(), e.unwrap_or_default())
+        } else {
+            (session.model.clone(), session.effort.clone())
+        };
+
         let run_result = if let Some(ref distro) = project_wsl_distro {
             if active_harness == "sakana" {
                 run_http_sse_fallback(
@@ -1557,8 +1653,8 @@ pub async fn send_turn_inner(
                     distro,
                     &active_harness,
                     active_account.as_ref(),
-                    &session.model,
-                    &session.effort,
+                    &resolved_model,
+                    &resolved_effort,
                     &session.permission_mode,
                     &enabled_mcp_servers,
                     &effective_cwd,
@@ -1577,8 +1673,8 @@ pub async fn send_turn_inner(
                 &bin,
                 &active_harness,
                 active_account.as_ref(),
-                &session.model,
-                &session.effort,
+                &resolved_model,
+                &resolved_effort,
                 &session.permission_mode,
                 &enabled_mcp_servers,
                 &effective_cwd,
@@ -1645,7 +1741,8 @@ pub async fn send_turn_inner(
                 let mut input_tokens = acc.input_tokens;
                 let mut output_tokens = acc.output_tokens;
                 let cost_usd = acc.cost_usd;
-                let msg = acc.into_message(msg_id_clone.clone(), active_harness.clone());
+                let author = author_override.unwrap_or_else(|| active_harness.clone());
+                let msg = acc.into_message(msg_id_clone.clone(), author);
                 if input_tokens == 0 && output_tokens == 0 {
                     input_tokens = (full_prompt_with_ctx.len() / 4) as i64;
                     output_tokens = (msg.text.len() / 4) as i64;
@@ -1696,10 +1793,13 @@ pub async fn send_turn_inner(
                     TurnDoneEvent {
                         session_id: sid.clone(),
                         message_id: msg_id_clone.clone(),
-                        message: msg,
+                        message: msg.clone(),
                         status: final_status,
                     },
                 );
+                if let Some(tx) = completion_tx.take() {
+                    let _ = tx.send(Ok(msg));
+                }
             }
             Err(err_msg) => {
                 final_status = "IDLE".to_string();
@@ -1713,9 +1813,12 @@ pub async fn send_turn_inner(
                     TurnErrorEvent {
                         session_id: sid.clone(),
                         message_id: msg_id_clone.clone(),
-                        error: err_msg,
+                        error: err_msg.clone(),
                     },
                 );
+                if let Some(tx) = completion_tx.take() {
+                    let _ = tx.send(Err(err_msg));
+                }
             }
         }
 
@@ -1911,30 +2014,350 @@ fn parse_agy_models_output(raw: &str) -> Vec<HarnessModelOption> {
     models
 }
 
-async fn discover_agy_models() -> Option<Vec<HarnessModelOption>> {
-    let bin = resolve_harness_binary("agy-cli")?;
-    let mut cmd = crate::platform::tokio_command(&bin.to_string_lossy());
-    cmd.arg("models")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+async fn discover_agy_models_via_acp(
+    bin: &Path,
+    acc: Option<&HarnessAccountRow>,
+) -> Option<Vec<HarnessModelOption>> {
+    let gdir = acc
+        .map(crate::auth::agy_gemini_dir)
+        .unwrap_or_else(|| crate::auth::ensure_profile_dir("agy-cli", "default").join(".gemini"));
+    let auth_method = acc
+        .map(|a| a.auth_type.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("oauth-personal");
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output())
-        .await
-        .ok()?
+    let mut cmd = crate::platform::tokio_command(&bin.to_string_lossy());
+    crate::auth::apply_account_env(&mut cmd, "agy-cli", acc);
+    cmd.args([
+        "acp",
+        "--gemini-dir",
+        &gdir.to_string_lossy(),
+        "--app-data-dir",
+        "antigravity-cli",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let init_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{},\"clientInfo\":{\"name\":\"sakana-probe\",\"version\":\"2.0.0\"}}}\n";
+        stdin.write_all(init_req.as_bytes()).await.ok()?;
+        stdin.flush().await.ok()?;
+        let _init_line = reader.next_line().await.ok()??;
+
+        let auth_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "authenticate",
+            "params": { "methodId": auth_method }
+        })
+        .to_string()
+            + "\n";
+        stdin.write_all(auth_req.as_bytes()).await.ok()?;
+        stdin.flush().await.ok()?;
+        let auth_line = reader.next_line().await.ok()??;
+        let auth_val: Value = serde_json::from_str(&auth_line).ok()?;
+        if auth_val.get("error").is_some() {
+            return None;
+        }
+
+        let session_req = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/new\",\"params\":{\"cwd\":\".\",\"mcpServers\":[]}}\n";
+        stdin.write_all(session_req.as_bytes()).await.ok()?;
+        stdin.flush().await.ok()?;
+        let session_line = reader.next_line().await.ok()??;
+        let session_val: Value = serde_json::from_str(&session_line).ok()?;
+        let arr = session_val
+            .get("result")
+            .and_then(|r| r.get("models"))
+            .and_then(|m| m.get("availableModels"))
+            .and_then(|a| a.as_array())?;
+
+        let mut lines = String::new();
+        for item in arr {
+            let id = item.get("modelId").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or(id).trim();
+            if !id.is_empty() {
+                lines.push_str(id);
+                lines.push('\t');
+                lines.push_str(name);
+                lines.push('\n');
+            }
+        }
+        let parsed = parse_agy_models_output(&lines);
+        if parsed.is_empty() {
+            None
+        } else {
+            Some(parsed)
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let _ = child.kill().await;
+    res
+}
+
+async fn discover_agy_models_via_file_token(
+    acc: Option<&HarnessAccountRow>,
+) -> Option<Vec<HarnessModelOption>> {
+    let default_acc = HarnessAccountRow {
+        id: "default".to_string(),
+        harness: "agy-cli".to_string(),
+        label: "Primary AGY".to_string(),
+        email: String::new(),
+        profile_dir: String::new(),
+        auth_type: "oauth-personal".to_string(),
+        is_default: true,
+        status: "authenticated".to_string(),
+    };
+    let effective_acc = acc.unwrap_or(&default_acc);
+    let (access_token, _) = crate::auth::read_agy_file_token(effective_acc)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
         .ok()?;
 
-    if !output.status.success() {
+    let lca_resp = client
+        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", "antigravity/1.5.18 windows/amd64")
+        .json(&serde_json::json!({ "metadata": { "ideType": "ANTIGRAVITY" } }))
+        .send()
+        .await
+        .ok()?;
+    if !lca_resp.status().is_success() {
         return None;
     }
+    let lca_val: Value = lca_resp.json().await.ok()?;
+    let project = lca_val
+        .get("cloudaicompanionProject")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_agy_models_output(&stdout);
-    if parsed.is_empty() {
+    let body = match project {
+        Some(p) => serde_json::json!({ "project": p }),
+        None => serde_json::json!({}),
+    };
+    let models_resp = client
+        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", "antigravity/1.5.18 windows/amd64")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    if !models_resp.status().is_success() {
+        return None;
+    }
+    let val: Value = models_resp.json().await.ok()?;
+    let models_obj = val.get("models").and_then(|v| v.as_object())?;
+
+    let mut image_gen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(arr) = val.get("imageGenerationModelIds").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                image_gen_ids.insert(s.to_string());
+            }
+        }
+    }
+
+    let mut ordered_ids: Vec<String> = Vec::new();
+    let mut push_unique = |id: &str| {
+        if !id.is_empty() && !ordered_ids.iter().any(|x| x == id) {
+            ordered_ids.push(id.to_string());
+        }
+    };
+
+    if let Some(sorts) = val.get("agentModelSorts").and_then(|v| v.as_array()) {
+        for sort in sorts {
+            if let Some(groups) = sort.get("groups").and_then(|v| v.as_array()) {
+                for g in groups {
+                    if let Some(ids) = g.get("modelIds").and_then(|v| v.as_array()) {
+                        for id_val in ids {
+                            if let Some(s) = id_val.as_str() {
+                                push_unique(s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tiered) = val.get("tieredModelIds") {
+        if let Some(arr) = tiered.as_array() {
+            for id_val in arr {
+                if let Some(s) = id_val.as_str() {
+                    push_unique(s);
+                }
+            }
+        } else if let Some(obj) = tiered.as_object() {
+            for arr_val in obj.values() {
+                if let Some(arr) = arr_val.as_array() {
+                    for id_val in arr {
+                        if let Some(s) = id_val.as_str() {
+                            push_unique(s);
+                        }
+                    }
+                } else if let Some(s) = arr_val.as_str() {
+                    push_unique(s);
+                }
+            }
+        }
+    }
+    if models_obj.contains_key("gemini-4-hydrogen-sonar") {
+        push_unique("gemini-4-hydrogen-sonar");
+    }
+
+    let mut out: Vec<HarnessModelOption> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for raw_id in ordered_ids {
+        if raw_id.starts_with("tab_") || image_gen_ids.contains(&raw_id) {
+            continue;
+        }
+        let Some(meta) = models_obj.get(&raw_id) else {
+            continue;
+        };
+        let raw_display = meta
+            .get("displayName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        let (norm_id, label, efforts) = match raw_id.as_str() {
+            "gemini-4-hydrogen-sonar" => (
+                "gemini-4-hydrogen".to_string(),
+                "Gemini 4 Hydrogen".to_string(),
+                vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+            ),
+            "gemini-3.8-flash-tiered" => (
+                "gemini-3.8-flash".to_string(),
+                "Gemini 3.8 Flash".to_string(),
+                vec!["low".into(), "medium".into(), "high".into()],
+            ),
+            _ if raw_id.starts_with("gemini-2.5-") => continue,
+            _ if raw_display == "Gemini 3.5 Flash Lite" => continue,
+            _ => {
+                if raw_display.is_empty() {
+                    continue;
+                }
+                if let Some(parsed_one) = parse_agy_models_output(&format!("{raw_id}\t{raw_display}")).into_iter().next() {
+                    (parsed_one.id, parsed_one.label, parsed_one.efforts)
+                } else {
+                    (raw_id.clone(), raw_display.to_string(), vec![])
+                }
+            }
+        };
+
+        if seen_ids.insert(norm_id.clone()) {
+            let family = infer_model_family(&norm_id);
+            out.push(HarnessModelOption {
+                id: norm_id,
+                label,
+                family,
+                efforts,
+            });
+        }
+    }
+
+    if out.is_empty() {
         None
     } else {
-        Some(parsed)
+        Some(out)
     }
+}
+
+async fn discover_agy_models(acc: Option<&HarnessAccountRow>) -> Option<Vec<HarnessModelOption>> {
+    if let Some(bin) = resolve_harness_binary("agy-cli") {
+        if let Some(via_acp) = discover_agy_models_via_acp(&bin, acc).await {
+            return Some(via_acp);
+        }
+        let mut cmd = crate::platform::tokio_command(&bin.to_string_lossy());
+        crate::auth::apply_account_env(&mut cmd, "agy-cli", acc);
+        cmd.arg("models")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Ok(Ok(output)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let parsed = parse_agy_models_output(&stdout);
+                if !parsed.is_empty() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+
+    discover_agy_models_via_file_token(acc).await
+}
+
+pub fn resolve_agy_model_and_effort(
+    model: &str,
+    effort: &str,
+    catalog: &[HarnessModelOption],
+) -> (Option<String>, Option<String>) {
+    let trimmed_model = model.trim();
+    let (base_id, _, suffix_effort) = strip_effort_suffix(trimmed_model, "");
+    let matched = if !trimmed_model.is_empty() {
+        catalog
+            .iter()
+            .find(|m| m.id == trimmed_model)
+            .or_else(|| catalog.iter().find(|m| m.id == base_id))
+            .or_else(|| catalog.first())
+    } else {
+        catalog.first()
+    };
+
+    let Some(entry) = matched else {
+        return (None, None);
+    };
+
+    let resolved_effort = if entry.efforts.is_empty() {
+        None
+    } else {
+        let req = effort.trim();
+        let candidate = if !req.is_empty() {
+            req
+        } else if let Some(ref sfx) = suffix_effort {
+            sfx.as_str()
+        } else {
+            ""
+        };
+        if let Some(found) = entry.efforts.iter().find(|e| e.as_str() == candidate) {
+            Some(found.clone())
+        } else if let Some(med) = entry.efforts.iter().find(|e| e.as_str() == "medium") {
+            Some(med.clone())
+        } else {
+            entry.efforts.first().cloned()
+        }
+    };
+
+    (Some(entry.id.clone()), resolved_effort)
+}
+
+async fn resolve_agy_model_and_effort_with_db(
+    db: &Arc<Mutex<crate::db::Database>>,
+    model: &str,
+    effort: &str,
+) -> (Option<String>, Option<String>) {
+    let catalog = list_harness_models_with_db(db, false)
+        .await
+        .ok()
+        .and_then(|mut m| m.remove("agy-cli"))
+        .unwrap_or_else(fallback_agy_models);
+    resolve_agy_model_and_effort(model, effort, &catalog)
 }
 
 fn opt(id: &str, label: &str, family: &str, efforts: &[&str]) -> HarnessModelOption {
@@ -1948,16 +2371,10 @@ fn opt(id: &str, label: &str, family: &str, efforts: &[&str]) -> HarnessModelOpt
 
 fn fallback_agy_models() -> Vec<HarnessModelOption> {
     vec![
-        opt("gemini-4-neon", "Gemini 4 Neon", "gemini", &["low", "medium", "high", "xhigh"]),
         opt("gemini-4-hydrogen", "Gemini 4 Hydrogen", "gemini", &["low", "medium", "high", "xhigh"]),
-        opt("gemini-4-argon", "Gemini 4 Argon", "gemini", &["low", "medium", "high"]),
-        opt("gemini-4-carbon", "Gemini 4 Carbon", "gemini", &["low", "medium", "high"]),
         opt("gemini-3.8-flash", "Gemini 3.8 Flash", "gemini", &["low", "medium", "high"]),
-        opt("gemini-pro-orchestrator-neon", "Orchestrator (Neon)", "gemini", &[]),
-        opt("gemini-pro-orchestrator", "Orchestrator (Carbon)", "gemini", &[]),
-        opt("gemini-pro-orchestrator-argon", "Orchestrator (Argon)", "gemini", &[]),
-        opt("claude-opus-5-5", "Claude Opus 5.5", "claude", &["low", "medium", "high"]),
-        opt("claude-sonnet-5-5", "Claude Sonnet 5.5", "claude", &["low", "medium", "high"]),
+        opt("claude-sonnet-4-6", "Claude Sonnet 4.6", "claude", &[]),
+        opt("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)", "claude", &[]),
         opt("gpt-oss-120b", "GPT-OSS 120B", "openai", &["medium"]),
     ]
 }
@@ -1998,12 +2415,14 @@ fn fallback_sakana_models() -> Vec<HarnessModelOption> {
     ]
 }
 
-const HARNESS_MODELS_CACHE_KEY: &str = "harness_models_cache_v1";
+pub const HARNESS_MODELS_CACHE_KEY: &str = "harness_models_cache_v5";
 const HARNESS_MODELS_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct HarnessModelsCache {
     fetched_at: u64,
+    #[serde(default)]
+    account_fingerprint: String,
     models: HashMap<String, Vec<HarnessModelOption>>,
 }
 
@@ -2012,6 +2431,138 @@ fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn compute_account_fingerprint(
+    agy: Option<&HarnessAccountRow>,
+    claude: Option<&HarnessAccountRow>,
+    kiro: Option<&HarnessAccountRow>,
+) -> String {
+    let fmt = |a: Option<&HarnessAccountRow>| -> String {
+        a.map(|r| format!("{}:{}:{}", r.id, r.auth_type, r.status))
+            .unwrap_or_else(|| "none".to_string())
+    };
+    format!("agy={}|claude={}|kiro={}", fmt(agy), fmt(claude), fmt(kiro))
+}
+
+async fn discover_claude_models(acc: Option<&HarnessAccountRow>) -> Option<Vec<HarnessModelOption>> {
+    // 1. If an Anthropic API key is configured, query /v1/models for exact key entitlements
+    let use_api_key = acc.map(|a| a.auth_type == "anthropic-api-key").unwrap_or(false)
+        || crate::platform::get_env_or_dotenv("ANTHROPIC_API_KEY").is_some();
+    if use_api_key {
+        if let Some(api_key) = crate::platform::get_env_or_dotenv("ANTHROPIC_API_KEY") {
+            if let Ok(client) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                if let Ok(resp) = client
+                    .get("https://api.anthropic.com/v1/models")
+                    .header("x-api-key", api_key.trim())
+                    .header("anthropic-version", "2023-06-01")
+                    .send()
+                    .await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(val) = resp.json::<Value>().await {
+                            if let Some(items) = val.get("data").and_then(|v| v.as_array()) {
+                                let mut models = Vec::new();
+                                for item in items {
+                                    let id = item
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_string();
+                                    if id.is_empty() {
+                                        continue;
+                                    }
+                                    let label = item
+                                        .get("display_name")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| id.clone());
+                                    let efforts = if id.contains("opus") {
+                                        vec!["low".into(), "medium".into(), "high".into(), "max".into()]
+                                    } else {
+                                        vec!["low".into(), "medium".into(), "high".into()]
+                                    };
+                                    models.push(HarnessModelOption {
+                                        id,
+                                        label,
+                                        family: "claude".to_string(),
+                                        efforts,
+                                    });
+                                }
+                                if !models.is_empty() {
+                                    return Some(models);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Otherwise inspect `claude auth status` + `.claude.json` subscription tier
+    let mut tier_hint = String::new();
+    if let Some(bin) = resolve_harness_binary("claude-code") {
+        let mut cmd = crate::platform::tokio_command(&bin.to_string_lossy());
+        crate::auth::apply_account_env(&mut cmd, "claude-code", acc);
+        cmd.args(["auth", "status"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Ok(val) = serde_json::from_str::<Value>(&stdout) {
+                    if let Some(sub) = val
+                        .get("subscriptionType")
+                        .or_else(|| val.get("plan"))
+                        .or_else(|| val.get("tier"))
+                        .and_then(|v| v.as_str())
+                    {
+                        tier_hint = sub.to_ascii_lowercase();
+                    }
+                }
+            }
+        }
+    }
+
+    if tier_hint.is_empty() {
+        let claude_json_path = match acc {
+            Some(a) if a.id != "claude_default" && !a.profile_dir.trim().is_empty() => {
+                PathBuf::from(&a.profile_dir).join(".claude.json")
+            }
+            _ => dirs::home_dir().unwrap_or_default().join(".claude.json"),
+        };
+        if let Ok(content) = std::fs::read_to_string(claude_json_path) {
+            if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                if let Some(sub) = val
+                    .get("oauthAccount")
+                    .and_then(|o| {
+                        o.get("subscriptionType")
+                            .or_else(|| o.get("rateLimitTier"))
+                            .or_else(|| o.get("billingType"))
+                    })
+                    .and_then(|v| v.as_str())
+                {
+                    tier_hint = sub.to_ascii_lowercase();
+                }
+            }
+        }
+    }
+
+    if tier_hint.contains("free") {
+        return Some(vec![
+            opt("claude-sonnet-4-6", "Claude Sonnet 4.6", "claude", &["low", "medium", "high"]),
+            opt("claude-haiku-4-5", "Claude Haiku 4.5", "claude", &["low", "medium", "high"]),
+        ]);
+    }
+
+    None
 }
 
 fn parse_kiro_models_output(raw: &str) -> Vec<HarnessModelOption> {
@@ -2046,9 +2597,10 @@ fn parse_kiro_models_output(raw: &str) -> Vec<HarnessModelOption> {
     parse_agy_models_output(raw)
 }
 
-async fn discover_kiro_models() -> Option<Vec<HarnessModelOption>> {
+async fn discover_kiro_models(acc: Option<&HarnessAccountRow>) -> Option<Vec<HarnessModelOption>> {
     let bin = resolve_harness_binary("kiro-cli")?;
     let mut cmd = crate::platform::tokio_command(&bin.to_string_lossy());
+    crate::auth::apply_account_env(&mut cmd, "kiro-cli", acc);
     cmd.arg("models")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2072,50 +2624,35 @@ async fn discover_kiro_models() -> Option<Vec<HarnessModelOption>> {
     }
 }
 
-fn merge_model_lists(
-    primary: Vec<HarnessModelOption>,
+fn pick_discovered_or_fallback(
+    discovered: Option<Vec<HarnessModelOption>>,
     fallback: Vec<HarnessModelOption>,
 ) -> Vec<HarnessModelOption> {
-    let mut merged = primary;
-    for item in fallback {
-        if !merged.iter().any(|m| m.id == item.id) {
-            merged.push(item);
-        }
+    match discovered {
+        Some(list) if !list.is_empty() => list,
+        _ => fallback,
     }
-    merged
 }
 
-fn merge_catalog_with_fallbacks(
+fn resolve_catalog_with_fallbacks(
     mut cached: HashMap<String, Vec<HarnessModelOption>>,
 ) -> HashMap<String, Vec<HarnessModelOption>> {
     let mut out = HashMap::new();
     out.insert(
         "agy-cli".to_string(),
-        merge_model_lists(
-            cached.remove("agy-cli").unwrap_or_default(),
-            fallback_agy_models(),
-        ),
+        pick_discovered_or_fallback(cached.remove("agy-cli"), fallback_agy_models()),
     );
     out.insert(
         "claude-code".to_string(),
-        merge_model_lists(
-            cached.remove("claude-code").unwrap_or_default(),
-            fallback_claude_models(),
-        ),
+        pick_discovered_or_fallback(cached.remove("claude-code"), fallback_claude_models()),
     );
     out.insert(
         "kiro-cli".to_string(),
-        merge_model_lists(
-            cached.remove("kiro-cli").unwrap_or_default(),
-            fallback_kiro_models(),
-        ),
+        pick_discovered_or_fallback(cached.remove("kiro-cli"), fallback_kiro_models()),
     );
     out.insert(
         "sakana".to_string(),
-        merge_model_lists(
-            cached.remove("sakana").unwrap_or_default(),
-            fallback_sakana_models(),
-        ),
+        pick_discovered_or_fallback(cached.remove("sakana"), fallback_sakana_models()),
     );
     out
 }
@@ -2124,33 +2661,56 @@ pub async fn list_harness_models_with_db(
     db: &Arc<Mutex<crate::db::Database>>,
     refresh: bool,
 ) -> Result<HashMap<String, Vec<HarnessModelOption>>, String> {
-    if !refresh {
-        let cached_raw = {
-            let db_lock = db.lock().await;
+    let (agy_acc, claude_acc, kiro_acc, cached_raw) = {
+        let db_lock = db.lock().await;
+        let agy = db_lock.get_default_harness_account("agy-cli").ok().flatten();
+        let claude = db_lock.get_default_harness_account("claude-code").ok().flatten();
+        let kiro = db_lock.get_default_harness_account("kiro-cli").ok().flatten();
+        let raw = if !refresh {
             db_lock
                 .get_setting(HARNESS_MODELS_CACHE_KEY)
                 .map_err(|e| e.to_string())?
+        } else {
+            None
         };
+        (agy, claude, kiro, raw)
+    };
+
+    let fingerprint = compute_account_fingerprint(agy_acc.as_ref(), claude_acc.as_ref(), kiro_acc.as_ref());
+    let now = now_epoch_secs();
+
+    if !refresh {
         if let Some(json_str) = cached_raw {
             if let Ok(cache) = serde_json::from_str::<HarnessModelsCache>(&json_str) {
-                return Ok(merge_catalog_with_fallbacks(cache.models));
+                let not_expired = now.saturating_sub(cache.fetched_at) < HARNESS_MODELS_CACHE_TTL_SECS;
+                let same_accounts = cache.account_fingerprint == fingerprint;
+                if not_expired && same_accounts {
+                    return Ok(resolve_catalog_with_fallbacks(cache.models));
+                }
             }
         }
-        return Ok(merge_catalog_with_fallbacks(HashMap::new()));
     }
 
-    let (agy_opt, kiro_opt) = tokio::join!(discover_agy_models(), discover_kiro_models());
+    let (agy_opt, claude_opt, kiro_opt) = tokio::join!(
+        discover_agy_models(agy_acc.as_ref()),
+        discover_claude_models(claude_acc.as_ref()),
+        discover_kiro_models(kiro_acc.as_ref()),
+    );
     let mut discovered = HashMap::new();
     if let Some(agy) = agy_opt {
         discovered.insert("agy-cli".to_string(), agy);
+    }
+    if let Some(claude) = claude_opt {
+        discovered.insert("claude-code".to_string(), claude);
     }
     if let Some(kiro) = kiro_opt {
         discovered.insert("kiro-cli".to_string(), kiro);
     }
 
-    let catalog = merge_catalog_with_fallbacks(discovered);
+    let catalog = resolve_catalog_with_fallbacks(discovered);
     let cache_entry = HarnessModelsCache {
-        fetched_at: now_epoch_secs(),
+        fetched_at: now,
+        account_fingerprint: fingerprint,
         models: catalog.clone(),
     };
     if let Ok(json_str) = serde_json::to_string(&cache_entry) {
@@ -2237,7 +2797,7 @@ pub async fn run_one_shot_prompt_with_opts(
 
     let reply_text = if let Some(ref distro) = proj_wsl.filter(|_| session.harness != "sakana") {
         let escaped_prompt = crate::platform::shell_escape_single(prompt);
-        let cli_cmd = match session.harness.as_str() {
+        let mut cli_cmd = match session.harness.as_str() {
             "claude-code" => {
                 let mut parts = vec!["claude".to_string(), "-p".to_string(), escaped_prompt];
                 if !session.model.trim().is_empty() {
@@ -2250,18 +2810,21 @@ pub async fn run_one_shot_prompt_with_opts(
                 parts.join(" ")
             }
             "agy-cli" => {
+                let (resolved_model, resolved_effort) =
+                    resolve_agy_model_and_effort_with_db(&db, &session.model, &session.effort)
+                        .await;
                 let mut parts = vec![
                     "$(command -v agy-cli || command -v agy || echo agy)".to_string(),
                     "-p".to_string(),
                     escaped_prompt,
                 ];
-                if !session.model.trim().is_empty() {
+                if let Some(m) = resolved_model {
                     parts.push("--model".to_string());
-                    parts.push(crate::platform::shell_escape_single(session.model.trim()));
+                    parts.push(crate::platform::shell_escape_single(&m));
                 }
-                if matches!(session.effort.trim(), "low" | "medium" | "high" | "xhigh" | "max") {
+                if let Some(e) = resolved_effort {
                     parts.push("--effort".to_string());
-                    parts.push(crate::platform::shell_escape_single(session.effort.trim()));
+                    parts.push(crate::platform::shell_escape_single(&e));
                 }
                 for flag in build_permission_args("agy-cli", permission_mode) {
                     parts.push(flag.to_string());
@@ -2271,7 +2834,12 @@ pub async fn run_one_shot_prompt_with_opts(
             "kiro-cli" => format!("kiro-cli chat --no-interactive {}", escaped_prompt),
             _ => format!("claude -p {}", escaped_prompt),
         };
-        let mut cmd = crate::platform::wsl_tokio_shell(distro, &effective_cwd, &cli_cmd);
+        let env_exports = build_wsl_env_exports(&session.harness, account.as_ref());
+        if !env_exports.is_empty() {
+            cli_cmd = format!("{}; {}", env_exports.join("; "), cli_cmd);
+        }
+        let posix_cwd = wsl_posix_cwd(&effective_cwd);
+        let mut cmd = crate::platform::wsl_tokio_shell(distro, &posix_cwd, &cli_cmd);
         crate::auth::apply_account_env(&mut cmd, &session.harness, account.as_ref());
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2310,15 +2878,21 @@ pub async fn run_one_shot_prompt_with_opts(
         }
         if active_harness == "kiro-cli" {
             cmd.args(["chat", "--no-interactive", prompt]);
+        } else if active_harness == "agy-cli" {
+            let (resolved_model, resolved_effort) =
+                resolve_agy_model_and_effort_with_db(&db, &session.model, &session.effort).await;
+            cmd.args(["-p", prompt]);
+            if let Some(m) = resolved_model {
+                cmd.args(["--model", &m]);
+            }
+            if let Some(e) = resolved_effort {
+                cmd.args(["--effort", &e]);
+            }
+            cmd.args(build_permission_args(active_harness, permission_mode));
         } else {
             cmd.args(["-p", prompt]);
             if !session.model.trim().is_empty() {
                 cmd.args(["--model", session.model.trim()]);
-            }
-            if active_harness == "agy-cli"
-                && matches!(session.effort.trim(), "low" | "medium" | "high" | "xhigh" | "max")
-            {
-                cmd.args(["--effort", session.effort.trim()]);
             }
             cmd.args(build_permission_args(active_harness, permission_mode));
         }
@@ -2597,8 +3171,16 @@ mod tests {
             "agy-cli".to_string(),
             vec![opt("custom-sub-model", "Custom Sub", "gemini", &["high"])],
         );
+        let agy_acc = db.get_default_harness_account("agy-cli").ok().flatten();
+        let claude_acc = db.get_default_harness_account("claude-code").ok().flatten();
+        let kiro_acc = db.get_default_harness_account("kiro-cli").ok().flatten();
         let cache_entry = HarnessModelsCache {
             fetched_at: now_epoch_secs(),
+            account_fingerprint: compute_account_fingerprint(
+                agy_acc.as_ref(),
+                claude_acc.as_ref(),
+                kiro_acc.as_ref(),
+            ),
             models: cached,
         };
         db.set_setting(
@@ -2611,7 +3193,7 @@ mod tests {
         let res = list_harness_models_with_db(&db_arc, false).await.unwrap();
         let agy = res.get("agy-cli").unwrap();
         assert!(agy.iter().any(|m| m.id == "custom-sub-model"));
-        assert!(agy.iter().any(|m| m.id == "gemini-4-neon"));
+        assert!(!agy.iter().any(|m| m.id == "gemini-4-hydrogen"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2627,6 +3209,7 @@ mod tests {
         );
         let expired_entry = HarnessModelsCache {
             fetched_at: 1,
+            account_fingerprint: String::new(),
             models: stale,
         };
         db.set_setting(
@@ -2639,7 +3222,7 @@ mod tests {
         let res = list_harness_models_with_db(&db_arc, false).await.unwrap();
         let agy = res.get("agy-cli").unwrap();
         assert!(!agy.iter().any(|m| m.id == "stale-only-model"));
-        assert!(agy.iter().any(|m| m.id == "gemini-4-neon"));
+        assert!(agy.iter().any(|m| m.id == "gemini-4-hydrogen"));
 
         let raw_updated = db_arc
             .lock()
@@ -2709,6 +3292,47 @@ mod tests {
         let single = build_cli_prompt_with_history("", &history[2..], "Follow up");
         assert!(!single.contains("<conversation_history>"));
         assert_eq!(single, "Follow up");
+    }
+
+    #[test]
+    fn resolve_agy_model_and_effort_handles_efforts_suffixes_and_stale_ids() {
+        let catalog = fallback_agy_models();
+
+        // No-effort model omits --effort even when high is requested.
+        assert_eq!(
+            resolve_agy_model_and_effort("claude-sonnet-4-6", "high", &catalog),
+            (Some("claude-sonnet-4-6".to_string()), None)
+        );
+
+        // Restricted model clamps unsupported effort to "medium".
+        assert_eq!(
+            resolve_agy_model_and_effort("gpt-oss-120b", "high", &catalog),
+            (Some("gpt-oss-120b".to_string()), Some("medium".to_string()))
+        );
+
+        // Model without xhigh clamps xhigh to "medium".
+        assert_eq!(
+            resolve_agy_model_and_effort("gemini-3.8-flash", "xhigh", &catalog),
+            (Some("gemini-3.8-flash".to_string()), Some("medium".to_string()))
+        );
+
+        // Effort-suffixed ID strips suffix and resolves base model + effort.
+        assert_eq!(
+            resolve_agy_model_and_effort("gpt-oss-120b-medium", "", &catalog),
+            (Some("gpt-oss-120b".to_string()), Some("medium".to_string()))
+        );
+
+        // Stale / foreign model ID falls back to catalog.first().
+        assert_eq!(
+            resolve_agy_model_and_effort("gemini-4-neon", "high", &catalog),
+            (Some("gemini-4-hydrogen".to_string()), Some("high".to_string()))
+        );
+
+        // Empty catalog returns (None, None).
+        assert_eq!(
+            resolve_agy_model_and_effort("gemini-4-hydrogen", "high", &[]),
+            (None, None)
+        );
     }
 }
 

@@ -4,11 +4,11 @@ export type HarnessId = 'agy-cli' | 'claude-code' | 'kiro-cli' | 'sakana';
 
 export type ThreadStatus = 'RUNNING' | 'AWAITING_APPROVAL' | 'DONE' | 'IDLE';
 
-export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | '';
 
 export type PermissionMode = 'supervised' | 'auto-edit' | 'yolo';
 
-export type PrimarySection = 'chat' | 'dashboard';
+export type PrimarySection = 'chat' | 'office' | 'dashboard';
 
 export type InspectorTab = 'changes' | 'files' | 'preview' | 'terminal' | 'traces';
 
@@ -395,6 +395,30 @@ export interface HarnessLoginResponse {
   message: string;
 }
 
+export interface GitHubAuthStatus {
+  authenticated: boolean;
+  login: string;
+  name: string;
+  avatarUrl: string;
+  source: 'token' | 'gh-cli' | 'none' | string;
+  ghInstalled: boolean;
+  defaultCloneDir: string;
+}
+
+export interface GitHubRepo {
+  id: number;
+  name: string;
+  fullName: string;
+  description: string;
+  cloneUrl: string;
+  htmlUrl: string;
+  private: boolean;
+  defaultBranch: string;
+  language: string;
+  updatedAt: string;
+  stargazersCount: number;
+}
+
 export interface UpdateCheckResult {
   available: boolean;
   currentVersion: string;
@@ -430,4 +454,118 @@ export interface BootstrapState {
   discordUsers?: DiscordUserRule[];
   envSecrets?: EnvSecret[];
   secrets?: EnvSecret[];
+}
+
+export type OfficeStaffStatus = 'IDLE' | 'WORKING' | 'DONE' | 'ERROR';
+
+export type OfficeEventKind =
+  | 'delegation'
+  | 'hire'
+  | 'fire'
+  | 'report'
+  | 'message'
+  | 'system'
+  | 'error';
+
+export interface OfficeStaff {
+  id: string;
+  officeId: string;
+  sessionId: string;
+  name: string;
+  role: string;
+  isMaster: boolean;
+  isDynamic: boolean;
+  harness: HarnessId;
+  model: string;
+  effort: ReasoningEffort;
+  account: string;
+  permissionMode: PermissionMode;
+  systemPrompt: string;
+  isolatedWorktree: boolean;
+  worktreePath: string;
+  branch: string;
+  status: OfficeStaffStatus;
+  currentTask?: string | null;
+  avatarColor: string;
+  deskOrder: number;
+  createdAt: string;
+}
+
+export interface OfficeEvent {
+  id: string;
+  officeId: string;
+  kind: OfficeEventKind;
+  fromStaffId?: string | null;
+  fromName?: string | null;
+  toStaffId?: string | null;
+  toName?: string | null;
+  summary: string;
+  detail?: string | null;
+  timestamp: string;
+}
+
+export interface Office {
+  id: string;
+  name: string;
+  projectId: string;
+  cwd: string;
+  masterStaffId: string;
+  maxRounds: number;
+  status: 'IDLE' | 'RUNNING';
+  createdAt: string;
+  updatedAt: string;
+  staff: OfficeStaff[];
+  events: OfficeEvent[];
+}
+
+export interface OfficeDelegationEdge {
+  officeId: string;
+  fromStaffId: string;
+  toStaffId: string;
+  task: string;
+}
+
+export interface CreateOfficeInput {
+  name: string;
+  projectId?: string;
+  cwd?: string;
+  runtime?: 'native' | 'wsl';
+  wslDistro?: string;
+  masterName?: string;
+  masterHarness: HarnessId;
+  masterModel: string;
+  masterEffort?: ReasoningEffort;
+  masterAccount?: string;
+  masterPermissionMode?: PermissionMode;
+  maxRounds?: number;
+}
+
+export interface HireStaffInput {
+  officeId: string;
+  name: string;
+  role: string;
+  harness: HarnessId;
+  model: string;
+  effort?: ReasoningEffort;
+  account?: string;
+  permissionMode?: PermissionMode;
+  systemPrompt?: string;
+  isolatedWorktree?: boolean;
+  avatarColor?: string;
+  isDynamic?: boolean;
+}
+
+export interface UpdateStaffInput {
+  id: string;
+  name?: string;
+  role?: string;
+  harness?: HarnessId;
+  model?: string;
+  effort?: ReasoningEffort;
+  account?: string;
+  permissionMode?: PermissionMode;
+  systemPrompt?: string;
+  isolatedWorktree?: boolean;
+  worktreePath?: string;
+  branch?: string;
 }

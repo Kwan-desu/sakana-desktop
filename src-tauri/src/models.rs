@@ -320,6 +320,7 @@ pub struct CreateSessionInput {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSessionInput {
     pub id: String,
+    pub project_id: Option<String>,
     pub title: Option<String>,
     pub status: Option<String>,
     pub harness: Option<String>,
@@ -511,4 +512,118 @@ pub struct AttachmentItem {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_data_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Office {
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub cwd: String,
+    pub master_staff_id: String,
+    pub max_rounds: i64,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub staff: Vec<OfficeStaff>,
+    pub events: Vec<OfficeEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeStaff {
+    pub id: String,
+    pub office_id: String,
+    pub session_id: String,
+    pub name: String,
+    pub role: String,
+    pub is_master: bool,
+    pub is_dynamic: bool,
+    pub harness: String,
+    pub model: String,
+    pub effort: String,
+    pub account: String,
+    pub permission_mode: String,
+    pub system_prompt: String,
+    pub isolated_worktree: bool,
+    pub worktree_path: String,
+    pub branch: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_task: Option<String>,
+    pub avatar_color: String,
+    pub desk_order: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeEvent {
+    pub id: String,
+    pub office_id: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_staff_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_staff_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_name: Option<String>,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateOfficeInput {
+    pub name: String,
+    pub project_id: Option<String>,
+    pub cwd: Option<String>,
+    pub runtime: Option<String>,
+    pub wsl_distro: Option<String>,
+    pub master_name: Option<String>,
+    pub master_harness: String,
+    pub master_model: String,
+    pub master_effort: Option<String>,
+    pub master_account: Option<String>,
+    pub master_permission_mode: Option<String>,
+    pub max_rounds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HireStaffInput {
+    pub office_id: String,
+    pub name: String,
+    pub role: String,
+    pub harness: String,
+    pub model: String,
+    pub effort: Option<String>,
+    pub account: Option<String>,
+    pub permission_mode: Option<String>,
+    pub system_prompt: Option<String>,
+    pub isolated_worktree: Option<bool>,
+    pub avatar_color: Option<String>,
+    pub is_dynamic: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStaffInput {
+    pub id: String,
+    pub name: Option<String>,
+    pub role: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub account: Option<String>,
+    pub permission_mode: Option<String>,
+    pub system_prompt: Option<String>,
+    pub isolated_worktree: Option<bool>,
+    pub worktree_path: Option<String>,
+    pub branch: Option<String>,
 }

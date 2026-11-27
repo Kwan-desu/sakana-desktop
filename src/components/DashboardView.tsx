@@ -7,9 +7,14 @@ import {
   Check,
   Copy,
   DownloadSimple,
+  ArrowSquareOut,
   Eye,
   EyeSlash,
+  GithubLogo,
+  Key,
   Palette,
+  PencilSimple,
+  SignOut,
   Play,
   Plugs,
   Plus,
@@ -26,11 +31,13 @@ import type {
   DiscordStatus,
   DiscordUserRule,
   EnvSecret,
+  GitHubAuthStatus,
   GuardConfig,
   GuardMode,
   HarnessAuthAccount,
   HarnessId,
   HarnessLoginResponse,
+  HarnessModelOption,
   McpServer,
   QuotaAccount,
   RemoteHost,
@@ -101,8 +108,10 @@ interface DashboardViewProps {
   onToast: (msg: string) => void;
   disabledHarnesses: HarnessId[];
   onToggleHarness: (hid: HarnessId) => void;
+  harnessModels?: Record<string, HarnessModelOption[]>;
   onRefreshModels: () => Promise<void> | void;
   refreshingModels?: boolean;
+  onOpenGitHubClone?: () => void;
 }
 
 function formatUptime(seconds: number): string {
@@ -163,9 +172,31 @@ export function DashboardView({
   onToast,
   disabledHarnesses,
   onToggleHarness,
+  harnessModels = {},
   onRefreshModels,
   refreshingModels = false,
+  onOpenGitHubClone,
 }: DashboardViewProps) {
+  const [ghStatus, setGhStatus] = useState<GitHubAuthStatus | null>(null);
+  const [ghTokenInput, setGhTokenInput] = useState('');
+  const [ghBusy, setGhBusy] = useState(false);
+  const [ghError, setGhError] = useState('');
+
+  const refreshGitHubStatus = async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const st = await tauriApi.githubAuthStatus();
+      setGhStatus(st);
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    if (subtab === 'remote') {
+      void refreshGitHubStatus();
+    }
+  }, [subtab]);
   const [openAutoHistory, setOpenAutoHistory] = useState<Record<string, boolean>>({});
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, string>>({});
   const [hostName, setHostName] = useState('');
@@ -216,6 +247,28 @@ export function DashboardView({
   // Harness Auth (AGY, Kiro, Claude)
   const [selectedHarness, setSelectedHarness] = useState<'agy-cli' | 'kiro-cli' | 'claude-code'>('agy-cli');
   const [authAccounts, setAuthAccounts] = useState<HarnessAuthAccount[]>([]);
+  const [renamingAccId, setRenamingAccId] = useState<string | null>(null);
+  const [renameAccDraft, setRenameAccDraft] = useState('');
+  const [savingAccRename, setSavingAccRename] = useState(false);
+
+  const commitRenameAccount = async (accountId: string) => {
+    const trimmed = renameAccDraft.trim();
+    if (!trimmed) {
+      setRenamingAccId(null);
+      return;
+    }
+    setSavingAccRename(true);
+    try {
+      const next = await tauriApi.renameHarnessAccount(accountId, trimmed);
+      setAuthAccounts(next);
+      setRenamingAccId(null);
+      onToast(`Renamed account to "${trimmed}"`);
+    } catch (err) {
+      onToast(`Rename failed: ${String(err)}`);
+    } finally {
+      setSavingAccRename(false);
+    }
+  };
   const [authLoading, setAuthLoading] = useState(false);
   const [addingAccount, setAddingAccount] = useState(false);
   const [creatingAccount, setCreatingAccount] = useState(false);
@@ -294,7 +347,12 @@ export function DashboardView({
       );
       if (res) {
         setLoginSessions((prev) => ({ ...prev, [acc.id]: res }));
-        if (res.authUrl && (acc.harness !== 'agy-cli' || agyLoginMode === 'loopback')) {
+        setExpandedLogs((prev) => {
+          const copy = { ...prev };
+          delete copy[acc.id];
+          return copy;
+        });
+        if (res.authUrl) {
           void tauriApi.openExternalUrl(res.authUrl).catch(() => {});
         }
         onToast(res.authenticated ? `${acc.label} authenticated` : res.message.slice(0, 140));
@@ -315,6 +373,11 @@ export function DashboardView({
       const res = await tauriApi.submitHarnessLoginCode(accountId, code);
       if (res) {
         setLoginSessions((prev) => ({ ...prev, [accountId]: res }));
+        setExpandedLogs((prev) => {
+          const copy = { ...prev };
+          delete copy[accountId];
+          return copy;
+        });
         if (res.authenticated) {
           setLoginCodes((prev) => ({ ...prev, [accountId]: '' }));
         }
@@ -334,6 +397,8 @@ export function DashboardView({
       const updated = await tauriApi.checkHarnessAuth(accountId);
       if (updated) {
         setAuthAccounts((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
+        onRefreshQuotas?.();
+        void onRefreshModels();
         onToast(
           updated.authenticated
             ? `${updated.label} is signed in${updated.email ? ` (${updated.email})` : ''}`
@@ -352,6 +417,8 @@ export function DashboardView({
     try {
       const next = await tauriApi.logoutHarnessAccount(acc.id);
       setAuthAccounts(next);
+      onRefreshQuotas?.();
+      void onRefreshModels();
       setLoginSessions((prev) => {
         const copy = { ...prev };
         delete copy[acc.id];
@@ -932,7 +999,12 @@ export function DashboardView({
                   const selectedAuthType = activeAcc
                     ? authTypeOverrides[activeAcc.id] || activeAcc.authType
                     : '';
-                  const logOpen = activeAcc ? Boolean(expandedLogs[activeAcc.id]) : false;
+                  const isLoginError = Boolean(
+                    session && session.started && !session.authenticated && !session.authUrl && session.message,
+                  );
+                  const logOpen = activeAcc
+                    ? (expandedLogs[activeAcc.id] ?? isLoginError)
+                    : false;
 
                   return (
                     <>
@@ -1019,19 +1091,84 @@ export function DashboardView({
                       {/* Account */}
                       <div className="space-y-3 pt-2 border-t" style={{ borderColor: 'var(--border-line)' }}>
                         <div className="flex flex-wrap items-center justify-between gap-3">
-                          <div>
+                          <div className="min-w-0">
                             <div className="text-[12.5px] font-medium" style={{ color: 'var(--text-main)' }}>
                               Account
                             </div>
-                            <div className="text-[11.5px]" style={{ color: 'var(--text-muted)' }}>
-                              {activeAcc
-                                ? activeAcc.authenticated
-                                  ? `Signed in · ${activeAcc.label}${activeAcc.email ? ` (${activeAcc.email})` : ''}`
-                                  : `Profile "${activeAcc.label}" · Signed out`
-                                : isTauriRuntime()
-                                  ? 'No account profile configured'
-                                  : 'Run desktop app to manage local CLI auth'}
-                            </div>
+                            {activeAcc && renamingAccId === activeAcc.id && !changeAccountOpen ? (
+                              <div className="flex items-center gap-1 mt-1">
+                                <input
+                                  type="text"
+                                  autoFocus
+                                  value={renameAccDraft}
+                                  disabled={savingAccRename}
+                                  onChange={(e) => setRenameAccDraft(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      e.preventDefault();
+                                      void commitRenameAccount(activeAcc.id);
+                                    } else if (e.key === 'Escape') {
+                                      e.preventDefault();
+                                      setRenamingAccId(null);
+                                    }
+                                  }}
+                                  placeholder="Account name..."
+                                  className="px-2 py-0.5 rounded-[5px] border text-[11.5px] w-44 focus:outline-none"
+                                  style={{
+                                    backgroundColor: 'var(--bg-card)',
+                                    borderColor: 'var(--accent-blue)',
+                                    color: 'var(--text-main)',
+                                  }}
+                                />
+                                <button
+                                  type="button"
+                                  disabled={savingAccRename}
+                                  onClick={() => void commitRenameAccount(activeAcc.id)}
+                                  className="p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer"
+                                  style={{ color: 'var(--accent-green)' }}
+                                  title="Save name"
+                                >
+                                  <Check size={12} weight="bold" />
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={savingAccRename}
+                                  onClick={() => setRenamingAccId(null)}
+                                  className="p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer"
+                                  style={{ color: 'var(--text-muted)' }}
+                                  title="Cancel"
+                                >
+                                  <X size={12} />
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-1.5 text-[11.5px]" style={{ color: 'var(--text-muted)' }}>
+                                <span>
+                                  {activeAcc
+                                    ? activeAcc.authenticated
+                                      ? `Signed in · ${activeAcc.label}${activeAcc.email ? ` (${activeAcc.email})` : ''}`
+                                      : `Profile "${activeAcc.label}" · Signed out`
+                                    : isTauriRuntime()
+                                      ? 'No account profile configured'
+                                      : 'Run desktop app to manage local CLI auth'}
+                                </span>
+                                {activeAcc && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setRenamingAccId(activeAcc.id);
+                                      setRenameAccDraft(activeAcc.label);
+                                    }}
+                                    className="p-0.5 rounded hover:bg-[var(--bg-hover)] cursor-pointer"
+                                    style={{ color: 'var(--text-muted)' }}
+                                    title="Rename account"
+                                    aria-label={`Rename account ${activeAcc.label}`}
+                                  >
+                                    <PencilSimple size={11} />
+                                  </button>
+                                )}
+                              </div>
+                            )}
                           </div>
 
                           <div ref={accountMenuRef} className="flex items-center gap-2 relative">
@@ -1088,65 +1225,129 @@ export function DashboardView({
                                       key={acc.id}
                                       className="px-2 py-1.5 rounded-[7px] flex items-center justify-between gap-2 hover:bg-[var(--bg-hover)]"
                                     >
-                                      <button
-                                        type="button"
-                                        onClick={async () => {
-                                          if (!acc.isDefault) {
-                                            const next = await tauriApi.setDefaultHarnessAccount(acc.id);
-                                            setAuthAccounts(next);
-                                            onToast(`Switched ${meta.name} to ${acc.label}`);
-                                            void onRefreshModels();
-                                          }
-                                          setChangeAccountOpen(false);
-                                        }}
-                                        className="min-w-0 flex-1 text-left cursor-pointer"
-                                      >
-                                        <div className="flex items-center gap-1.5 text-[12px] font-medium" style={{ color: 'var(--text-main)' }}>
-                                          <span
-                                            className="w-1.5 h-1.5 rounded-full shrink-0"
+                                      {renamingAccId === acc.id ? (
+                                        <div className="flex items-center gap-1 flex-1 min-w-0">
+                                          <input
+                                            type="text"
+                                            autoFocus
+                                            value={renameAccDraft}
+                                            disabled={savingAccRename}
+                                            onChange={(e) => setRenameAccDraft(e.target.value)}
+                                            onKeyDown={(e) => {
+                                              if (e.key === 'Enter') {
+                                                e.preventDefault();
+                                                void commitRenameAccount(acc.id);
+                                              } else if (e.key === 'Escape') {
+                                                e.preventDefault();
+                                                setRenamingAccId(null);
+                                              }
+                                            }}
+                                            placeholder="Account name..."
+                                            className="flex-1 min-w-0 px-2 py-1 rounded-[5px] border text-[11.5px] focus:outline-none"
                                             style={{
-                                              backgroundColor: acc.authenticated ? 'var(--accent-green)' : 'var(--text-muted)',
+                                              backgroundColor: 'var(--bg-card)',
+                                              borderColor: 'var(--accent-blue)',
+                                              color: 'var(--text-main)',
                                             }}
                                           />
-                                          <span className="truncate">{acc.label}</span>
-                                          {acc.isDefault && <Check size={11} weight="bold" style={{ color: 'var(--accent-blue)' }} />}
-                                        </div>
-                                        {acc.email && (
-                                          <div className="font-mono-tech text-[10px] truncate pl-3" style={{ color: 'var(--text-muted)' }}>
-                                            {acc.email}
-                                          </div>
-                                        )}
-                                      </button>
-                                      <div className="flex items-center gap-1 shrink-0">
-                                        {!acc.authenticated && (
                                           <button
                                             type="button"
-                                            onClick={() => {
-                                              setChangeAccountOpen(false);
-                                              void handleStartHarnessLogin(acc);
-                                            }}
-                                            className="btn-ghost px-1.5 py-0.5 text-[10.5px] cursor-pointer"
+                                            disabled={savingAccRename}
+                                            onClick={() => void commitRenameAccount(acc.id)}
+                                            className="p-1 rounded hover:bg-[var(--bg-elevated)] cursor-pointer"
+                                            style={{ color: 'var(--accent-green)' }}
+                                            title="Save name"
                                           >
-                                            Sign in
+                                            <Check size={12} weight="bold" />
                                           </button>
-                                        )}
-                                        {!isPrimary && (
+                                          <button
+                                            type="button"
+                                            disabled={savingAccRename}
+                                            onClick={() => setRenamingAccId(null)}
+                                            className="p-1 rounded hover:bg-[var(--bg-elevated)] cursor-pointer"
+                                            style={{ color: 'var(--text-muted)' }}
+                                            title="Cancel"
+                                          >
+                                            <X size={12} />
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <>
                                           <button
                                             type="button"
                                             onClick={async () => {
-                                              const next = await tauriApi.deleteHarnessAccount(acc.id);
-                                              setAuthAccounts(next);
-                                              onToast(`Removed ${acc.label}`);
+                                              if (!acc.isDefault) {
+                                                const next = await tauriApi.setDefaultHarnessAccount(acc.id);
+                                                setAuthAccounts(next);
+                                                onToast(`Switched ${meta.name} to ${acc.label}`);
+                                                void onRefreshModels();
+                                              }
+                                              setChangeAccountOpen(false);
                                             }}
-                                            className="p-1 rounded hover:bg-[var(--bg-elevated)] cursor-pointer"
-                                            style={{ color: 'var(--accent-red)' }}
-                                            title="Delete account"
-                                            aria-label={`Delete account ${acc.label}`}
+                                            className="min-w-0 flex-1 text-left cursor-pointer"
                                           >
-                                            <Trash size={11} />
+                                            <div className="flex items-center gap-1.5 text-[12px] font-medium" style={{ color: 'var(--text-main)' }}>
+                                              <span
+                                                className="w-1.5 h-1.5 rounded-full shrink-0"
+                                                style={{
+                                                  backgroundColor: acc.authenticated ? 'var(--accent-green)' : 'var(--text-muted)',
+                                                }}
+                                              />
+                                              <span className="truncate">{acc.label}</span>
+                                              {acc.isDefault && <Check size={11} weight="bold" style={{ color: 'var(--accent-blue)' }} />}
+                                            </div>
+                                            {acc.email && (
+                                              <div className="font-mono-tech text-[10px] truncate pl-3" style={{ color: 'var(--text-muted)' }}>
+                                                {acc.email}
+                                              </div>
+                                            )}
                                           </button>
-                                        )}
-                                      </div>
+                                          <div className="flex items-center gap-1 shrink-0">
+                                            <button
+                                              type="button"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                setRenamingAccId(acc.id);
+                                                setRenameAccDraft(acc.label);
+                                              }}
+                                              className="p-1 rounded hover:bg-[var(--bg-elevated)] cursor-pointer"
+                                              style={{ color: 'var(--text-muted)' }}
+                                              title="Rename account"
+                                              aria-label={`Rename account ${acc.label}`}
+                                            >
+                                              <PencilSimple size={11} />
+                                            </button>
+                                            {!acc.authenticated && (
+                                              <button
+                                                type="button"
+                                                onClick={() => {
+                                                  setChangeAccountOpen(false);
+                                                  void handleStartHarnessLogin(acc);
+                                                }}
+                                                className="btn-ghost px-1.5 py-0.5 text-[10.5px] cursor-pointer"
+                                              >
+                                                Sign in
+                                              </button>
+                                            )}
+                                            {!isPrimary && (
+                                              <button
+                                                type="button"
+                                                onClick={async () => {
+                                                  const next = await tauriApi.deleteHarnessAccount(acc.id);
+                                                  setAuthAccounts(next);
+                                                  onToast(`Removed ${acc.label}`);
+                                                }}
+                                                className="p-1 rounded hover:bg-[var(--bg-elevated)] cursor-pointer"
+                                                style={{ color: 'var(--accent-red)' }}
+                                                title="Delete account"
+                                                aria-label={`Delete account ${acc.label}`}
+                                              >
+                                                <Trash size={11} />
+                                              </button>
+                                            )}
+                                          </div>
+                                        </>
+                                      )}
                                     </div>
                                   );
                                 })}
@@ -1291,10 +1492,10 @@ export function DashboardView({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    setExpandedLogs((prev) => ({ ...prev, [activeAcc.id]: !prev[activeAcc.id] }))
+                                    setExpandedLogs((prev) => ({ ...prev, [activeAcc.id]: !logOpen }))
                                   }
                                   className="inline-flex items-center gap-1 text-[10.5px] font-mono-tech cursor-pointer"
-                                  style={{ color: 'var(--text-muted)' }}
+                                  style={{ color: isLoginError ? 'var(--accent-red, #ef4444)' : 'var(--text-muted)' }}
                                 >
                                   {logOpen ? <CaretDown size={11} /> : <CaretRight size={11} />}
                                   <span>CLI Output</span>
@@ -1302,14 +1503,17 @@ export function DashboardView({
                                 {logOpen && (
                                   <pre
                                     className="font-mono-tech text-[10px] whitespace-pre-wrap break-all max-h-28 overflow-y-auto p-2 rounded-[5px]"
-                                    style={{ color: 'var(--text-muted)', backgroundColor: 'var(--bg-surface)' }}
+                                    style={{
+                                      color: isLoginError ? 'var(--accent-red, #ef4444)' : 'var(--text-muted)',
+                                      backgroundColor: 'var(--bg-surface)',
+                                    }}
                                   >
                                     {session.message}
                                   </pre>
                                 )}
                               </div>
                             )}
-                            {(session.needsCode || hid === 'agy-cli') && !activeAcc.authenticated && (
+                            {(session.needsCode || (hid === 'agy-cli' && !activeAcc.authenticated)) && (
                               <div className="flex items-center gap-1.5 pt-1">
                                 <input
                                   type="text"
@@ -1495,7 +1699,7 @@ export function DashboardView({
                       <div className="flex justify-between font-mono-tech text-[11px]">
                         <span style={{ color: 'var(--text-body)' }}>5-Hour Window</span>
                         <span style={{ color: 'var(--text-main)' }}>
-                          {q.fiveHourPct}% · resets in {q.fiveHourReset}
+                          {q.fiveHourPct}% used · resets in {q.fiveHourReset}
                         </span>
                       </div>
                       <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-elevated)' }}>
@@ -1510,7 +1714,7 @@ export function DashboardView({
                       <div className="flex justify-between font-mono-tech text-[11px]">
                         <span style={{ color: 'var(--text-body)' }}>Weekly Window</span>
                         <span style={{ color: 'var(--text-main)' }}>
-                          {q.weeklyPct}% · resets in {q.weeklyReset}
+                          {q.weeklyPct}% used · resets in {q.weeklyReset}
                         </span>
                       </div>
                       <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-elevated)' }}>
@@ -1543,6 +1747,11 @@ export function DashboardView({
                 {(Object.keys(HARNESS_META) as HarnessId[]).map((hid) => {
                   const meta = HARNESS_META[hid];
                   const activeCount = threads.filter((t) => t.harness === hid).length;
+                  const liveModels = harnessModels[hid];
+                  const modelBadges =
+                    liveModels && liveModels.length > 0
+                      ? liveModels.map((m) => ({ id: m.id, label: m.label || m.id }))
+                      : meta.models.map((m) => ({ id: m, label: m }));
                   return (
                     <div
                       key={hid}
@@ -1559,13 +1768,14 @@ export function DashboardView({
                         </span>
                       </div>
                       <div className="flex flex-wrap gap-1.5">
-                        {meta.models.map((m) => (
+                        {modelBadges.map((m) => (
                           <span
-                            key={m}
+                            key={m.id}
                             className="font-mono-tech text-[10.5px] px-2 py-0.5 rounded-[5px]"
                             style={{ backgroundColor: 'var(--bg-elevated)', color: 'var(--text-body)' }}
+                            title={m.id !== m.label ? m.id : undefined}
                           >
-                            {m}
+                            {m.label}
                           </span>
                         ))}
                       </div>
@@ -2305,6 +2515,187 @@ export function DashboardView({
                   );
                 })}
               </div>
+            </div>
+
+            {/* GitHub Integration */}
+            <div className="sakana-card rounded-[12px] p-5 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <GithubLogo size={16} weight="fill" style={{ color: 'var(--text-main)' }} />
+                  <h2 className="text-[14.5px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
+                    GitHub Account &amp; Repository Clone
+                  </h2>
+                </div>
+                <span
+                  className="font-mono-tech text-[10px] px-2 py-0.5 rounded-[5px]"
+                  style={
+                    ghStatus?.authenticated
+                      ? { backgroundColor: 'var(--accent-green-bg)', color: 'var(--accent-green)' }
+                      : { backgroundColor: 'var(--bg-elevated)', color: 'var(--text-muted)' }
+                  }
+                >
+                  {ghStatus?.authenticated
+                    ? `@${ghStatus.login} (${ghStatus.source === 'gh-cli' ? 'gh CLI' : 'Token'})`
+                    : 'Not Connected'}
+                </span>
+              </div>
+              {ghStatus?.authenticated ? (
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    {ghStatus.avatarUrl && (
+                      <img
+                        src={ghStatus.avatarUrl}
+                        alt={ghStatus.login}
+                        className="w-9 h-9 rounded-full border shrink-0"
+                        style={{ borderColor: 'var(--border-line)' }}
+                      />
+                    )}
+                    <div className="min-w-0">
+                      <div className="text-[13px] font-medium truncate" style={{ color: 'var(--text-main)' }}>
+                        {ghStatus.name || ghStatus.login}{' '}
+                        <span className="font-mono-tech text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                          @{ghStatus.login}
+                        </span>
+                      </div>
+                      <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                        Default clone folder: <span className="font-mono-tech">{ghStatus.defaultCloneDir}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {onOpenGitHubClone && (
+                      <button
+                        type="button"
+                        onClick={onOpenGitHubClone}
+                        className="btn-solid px-3 py-1.5 text-[11.5px] font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <GithubLogo size={13} weight="fill" />
+                        <span>Browse &amp; Clone Repos</span>
+                      </button>
+                    )}
+                    {ghStatus.source === 'token' && (
+                      <button
+                        type="button"
+                        disabled={ghBusy}
+                        onClick={async () => {
+                          setGhBusy(true);
+                          setGhError('');
+                          try {
+                            const st = await tauriApi.githubSaveToken('');
+                            setGhStatus(st);
+                            onToast('Disconnected GitHub token');
+                          } catch (err) {
+                            setGhError(String(err));
+                          } finally {
+                            setGhBusy(false);
+                          }
+                        }}
+                        className="btn-ghost px-2.5 py-1.5 text-[11.5px] inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <SignOut size={12} />
+                        <span>Disconnect</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-[12px] m-0 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                    Connect your GitHub account to automatically list your repositories and clone them directly into a Sakana workspace.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void tauriApi.openExternalUrl(
+                          'https://github.com/settings/tokens/new?scopes=repo,read:user&description=Sakana%20Desktop',
+                        )
+                      }
+                      className="btn-ghost px-2.5 py-1.5 text-[11.5px] font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <ArrowSquareOut size={12} />
+                      <span>Create Token on GitHub</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={ghBusy}
+                      onClick={async () => {
+                        setGhBusy(true);
+                        setGhError('');
+                        await refreshGitHubStatus();
+                        setGhBusy(false);
+                      }}
+                      className="btn-ghost px-2.5 py-1.5 text-[11.5px] font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <ArrowClockwise size={12} />
+                      <span>Auto-detect gh CLI</span>
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Key
+                        size={12}
+                        className="absolute left-2.5 top-1/2 -translate-y-1/2"
+                        style={{ color: 'var(--text-muted)' }}
+                      />
+                      <input
+                        type="password"
+                        value={ghTokenInput}
+                        onChange={(e) => setGhTokenInput(e.target.value)}
+                        onKeyDown={async (e) => {
+                          if (e.key === 'Enter' && ghTokenInput.trim()) {
+                            setGhBusy(true);
+                            setGhError('');
+                            try {
+                              const st = await tauriApi.githubSaveToken(ghTokenInput.trim());
+                              setGhStatus(st);
+                              setGhTokenInput('');
+                              if (st?.authenticated) onToast(`Connected to GitHub as @${st.login}`);
+                            } catch (err) {
+                              setGhError(String(err));
+                            } finally {
+                              setGhBusy(false);
+                            }
+                          }
+                        }}
+                        placeholder="Paste GitHub Personal Access Token (ghp_...)"
+                        className="w-full rounded-[7px] border pl-8 pr-3 py-1.5 font-mono-tech text-[11.5px] focus:outline-none"
+                        style={{
+                          backgroundColor: 'var(--bg-app)',
+                          borderColor: 'var(--border-line)',
+                          color: 'var(--text-main)',
+                        }}
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      disabled={ghBusy || !ghTokenInput.trim()}
+                      onClick={async () => {
+                        setGhBusy(true);
+                        setGhError('');
+                        try {
+                          const st = await tauriApi.githubSaveToken(ghTokenInput.trim());
+                          setGhStatus(st);
+                          setGhTokenInput('');
+                          if (st?.authenticated) onToast(`Connected to GitHub as @${st.login}`);
+                        } catch (err) {
+                          setGhError(String(err));
+                        } finally {
+                          setGhBusy(false);
+                        }
+                      }}
+                      className="btn-solid px-3.5 py-1.5 text-[11.5px] font-medium cursor-pointer disabled:opacity-50"
+                    >
+                      {ghBusy ? 'Connecting…' : 'Connect'}
+                    </button>
+                  </div>
+                  {ghError && (
+                    <div className="text-[11px] font-mono-tech" style={{ color: 'var(--accent-red)' }}>
+                      {ghError}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">

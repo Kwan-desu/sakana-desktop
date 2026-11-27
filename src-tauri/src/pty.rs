@@ -386,9 +386,8 @@ fn sanitize_nl_command(raw: &str) -> String {
         .to_string()
 }
 
-#[tauri::command]
-pub async fn translate_nl_command(
-    state: State<'_, crate::DbState>,
+pub async fn translate_nl_command_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
     prompt: String,
     os: String,
     shell: String,
@@ -444,7 +443,7 @@ pub async fn translate_nl_command(
         &translated.unwrap_or_else(|| deterministic_nl_fallback(&clean, &os, &shell)),
     );
     let guard_cfg = {
-        let db = state.0.lock().await;
+        let db = db.lock().await;
         crate::guard::load_guard_config(&db).unwrap_or_else(|_| crate::models::GuardConfig {
             mode: "guarded".to_string(),
             catastrophic_guardrail: true,
@@ -461,6 +460,16 @@ pub async fn translate_nl_command(
         }
         crate::guard::GuardDecision::Allow => Ok(cmd),
     }
+}
+
+#[tauri::command]
+pub async fn translate_nl_command(
+    state: State<'_, crate::DbState>,
+    prompt: String,
+    os: String,
+    shell: String,
+) -> Result<String, String> {
+    translate_nl_command_inner(&state.0, prompt, os, shell).await
 }
 
 #[cfg(test)]

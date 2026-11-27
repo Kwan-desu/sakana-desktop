@@ -7,9 +7,9 @@ use uuid::Uuid;
 
 use crate::models::{
     AutomationHistoryItem, AutomationItem, BootstrapState, ChatMessage, CreateProjectInput,
-    CreateSessionInput, DiscordUserRule, HarnessAccountRow, McpServer, PendingApproval, Project,
-    QuotaAccount, RemoteHost, Session, Thread, TraceSpan, TurnCheckpoint, UpdateSessionInput,
-    UpsertRemoteHostInput,
+    CreateSessionInput, DiscordUserRule, HarnessAccountRow, McpServer, Office, OfficeEvent,
+    OfficeStaff, PendingApproval, Project, QuotaAccount, RemoteHost, Session, Thread, TraceSpan,
+    TurnCheckpoint, UpdateSessionInput, UpdateStaffInput, UpsertRemoteHostInput,
 };
 
 pub struct Database {
@@ -223,6 +223,58 @@ impl Database {
                 last_seen_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS offices (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                cwd TEXT NOT NULL,
+                master_staff_id TEXT NOT NULL DEFAULT '',
+                max_rounds INTEGER NOT NULL DEFAULT 6,
+                status TEXT NOT NULL DEFAULT 'idle',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS office_staff (
+                id TEXT PRIMARY KEY,
+                office_id TEXT NOT NULL REFERENCES offices(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                is_master INTEGER NOT NULL DEFAULT 0,
+                is_dynamic INTEGER NOT NULL DEFAULT 0,
+                harness TEXT NOT NULL,
+                model TEXT NOT NULL,
+                effort TEXT NOT NULL,
+                account TEXT NOT NULL,
+                permission_mode TEXT NOT NULL,
+                system_prompt TEXT NOT NULL DEFAULT '',
+                isolated_worktree INTEGER NOT NULL DEFAULT 0,
+                worktree_path TEXT NOT NULL DEFAULT '',
+                branch TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'idle',
+                current_task TEXT,
+                avatar_color TEXT NOT NULL DEFAULT '#6366f1',
+                desk_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS office_events (
+                id TEXT PRIMARY KEY,
+                office_id TEXT NOT NULL REFERENCES offices(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                from_staff_id TEXT,
+                from_name TEXT,
+                to_staff_id TEXT,
+                to_name TEXT,
+                summary TEXT NOT NULL,
+                detail TEXT,
+                timestamp TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_office_staff_office ON office_staff(office_id, desk_order);
+            CREATE INDEX IF NOT EXISTS idx_office_events_office ON office_events(office_id, timestamp);
             ",
         )?;
         // Idempotent migrations for native WSL support on projects
@@ -234,6 +286,31 @@ impl Database {
             "ALTER TABLE projects ADD COLUMN wsl_distro TEXT",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Idempotently add office_id column to sessions
+        let has_office_id = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(sessions)")?;
+            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for col in cols {
+                if col? == "office_id" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_office_id {
+            self.conn
+                .execute("ALTER TABLE sessions ADD COLUMN office_id TEXT", [])?;
+        }
         if current_version < SCHEMA_VERSION {
             self.conn
                 .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION))?;
@@ -313,7 +390,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, cwd, repo_url, discord_channel, runtime, wsl_distro
              FROM projects
-             ORDER BY created_at ASC",
+             ORDER BY sort_order ASC, created_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Project {
@@ -503,6 +580,38 @@ impl Database {
         Ok(changed > 0)
     }
 
+    pub fn rename_project(&self, id: &str, name: &str) -> Result<bool> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        let changed = self.conn.execute(
+            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            params![id, trimmed],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn reorder_projects(&self, ordered_ids: &[String]) -> Result<()> {
+        for (idx, id) in ordered_ids.iter().enumerate() {
+            self.conn.execute(
+                "UPDATE projects SET sort_order = ?2 WHERE id = ?1",
+                params![id, idx as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn reorder_sessions(&self, ordered_ids: &[String]) -> Result<()> {
+        for (idx, id) in ordered_ids.iter().enumerate() {
+            self.conn.execute(
+                "UPDATE sessions SET sort_order = ?2 WHERE id = ?1",
+                params![id, idx as i64],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn delete_project(&self, id: &str) -> Result<bool> {
         let changed = self
             .conn
@@ -516,14 +625,15 @@ impl Database {
                               additions, deletions, time_ago, is_discord, discord_channel,
                               unread_done
                        FROM sessions
-                       ORDER BY updated_at DESC";
+                       WHERE office_id IS NULL
+                       ORDER BY sort_order ASC, updated_at DESC";
         let sql_filtered = "SELECT id, project_id, title, status, harness, model, effort, account,
                                    permission_mode, worktree_path, branch, shared_deps_json,
                                    additions, deletions, time_ago, is_discord, discord_channel,
                                    unread_done
                             FROM sessions
-                            WHERE project_id = ?1
-                            ORDER BY updated_at DESC";
+                            WHERE project_id = ?1 AND office_id IS NULL
+                            ORDER BY sort_order ASC, updated_at DESC";
 
         let mut sessions = Vec::new();
         if let Some(pid) = project_id {
@@ -601,6 +711,18 @@ impl Database {
     }
 
     pub fn create_session(&self, input: CreateSessionInput) -> Result<Session> {
+        self.insert_session(input, None)
+    }
+
+    pub fn create_session_for_office(
+        &self,
+        input: CreateSessionInput,
+        office_id: &str,
+    ) -> Result<Session> {
+        self.insert_session(input, Some(office_id))
+    }
+
+    fn insert_session(&self, input: CreateSessionInput, office_id: Option<&str>) -> Result<Session> {
         let id = format!("thr-{}", Uuid::new_v4());
         let now = Utc::now().to_rfc3339();
         let harness = input.harness.unwrap_or_else(|| "sakana".to_string());
@@ -621,12 +743,12 @@ impl Database {
                 id, project_id, title, status, harness, model, effort, account,
                 permission_mode, worktree_path, branch, shared_deps_json,
                 additions, deletions, time_ago, is_discord, discord_channel,
-                unread_done, created_at, updated_at
+                unread_done, created_at, updated_at, office_id
              ) VALUES (
                 ?1, ?2, ?3, 'IDLE', ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10, ?11,
                 0, 0, 'just now', ?12, ?13,
-                0, ?14, ?14
+                0, ?14, ?14, ?15
              )",
             params![
                 id,
@@ -642,7 +764,8 @@ impl Database {
                 shared_deps_json,
                 if is_discord { 1 } else { 0 },
                 input.discord_channel,
-                now
+                now,
+                office_id
             ],
         )?;
 
@@ -675,6 +798,7 @@ impl Database {
             return Ok(None);
         };
 
+        let project_id = input.project_id.unwrap_or(existing.project_id);
         let title = input.title.unwrap_or(existing.title);
         let status = input.status.unwrap_or(existing.status);
         let harness = input.harness.unwrap_or(existing.harness);
@@ -708,7 +832,8 @@ impl Database {
                 additions = ?12,
                 deletions = ?13,
                 unread_done = ?14,
-                updated_at = ?15
+                updated_at = ?15,
+                project_id = ?16
              WHERE id = ?1",
             params![
                 input.id,
@@ -725,7 +850,8 @@ impl Database {
                 additions,
                 deletions,
                 if unread_done { 1 } else { 0 },
-                now
+                now,
+                project_id
             ],
         )?;
 
@@ -967,6 +1093,63 @@ impl Database {
             params![id, session_id, harness, model, input_tokens, output_tokens, cost_usd, now],
         )?;
         Ok(())
+    }
+
+    pub fn summarize_harness_usage_windows(
+        &self,
+        harness: &str,
+    ) -> Result<(i64, Option<String>, i64, Option<String>)> {
+        let now = Utc::now();
+        let cutoff_5h = (now - chrono::Duration::hours(5)).to_rfc3339();
+        let cutoff_7d = (now - chrono::Duration::days(7)).to_rfc3339();
+
+        let (tokens_5h, oldest_5h): (i64, Option<String>) = self.conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens + output_tokens), 0), MIN(created_at)
+             FROM usage WHERE harness = ?1 AND created_at >= ?2",
+            params![harness, cutoff_5h],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let (tokens_7d, oldest_7d): (i64, Option<String>) = self.conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens + output_tokens), 0), MIN(created_at)
+             FROM usage WHERE harness = ?1 AND created_at >= ?2",
+            params![harness, cutoff_7d],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let five_hour_reset = oldest_5h.and_then(|ts| {
+            chrono::DateTime::parse_from_rfc3339(&ts)
+                .ok()
+                .map(|dt| {
+                    let reset_at = dt.with_timezone(&Utc) + chrono::Duration::hours(5);
+                    let rem_mins = (reset_at - now).num_minutes().max(0);
+                    let h = rem_mins / 60;
+                    let m = rem_mins % 60;
+                    if h > 0 {
+                        format!("{h}h {m}m")
+                    } else {
+                        format!("{m}m")
+                    }
+                })
+        });
+
+        let weekly_reset = oldest_7d.and_then(|ts| {
+            chrono::DateTime::parse_from_rfc3339(&ts)
+                .ok()
+                .map(|dt| {
+                    let reset_at = dt.with_timezone(&Utc) + chrono::Duration::days(7);
+                    let rem_hours = (reset_at - now).num_hours().max(0);
+                    let d = rem_hours / 24;
+                    let h = rem_hours % 24;
+                    if d > 0 {
+                        format!("{d}d {h}h")
+                    } else {
+                        format!("{h}h")
+                    }
+                })
+        });
+
+        Ok((tokens_5h, five_hour_reset, tokens_7d, weekly_reset))
     }
 
     pub fn append_message(&self, session_id: &str, msg: &ChatMessage) -> Result<()> {
@@ -1768,6 +1951,14 @@ impl Database {
         Ok(())
     }
 
+    pub fn rename_harness_account(&self, id: &str, label: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE harness_accounts SET label = ?2 WHERE id = ?1",
+            params![id, label],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn set_default_harness_account(&self, harness: &str, id: &str) -> Result<bool> {
         self.conn.execute(
             "UPDATE harness_accounts SET is_default = 0 WHERE harness = ?1",
@@ -1980,6 +2171,365 @@ impl Database {
             .optional()?;
         Ok(role)
     }
+
+    // =========================================================================
+    // Office CRUD & helpers
+    // =========================================================================
+
+    pub fn list_messages_for_session(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
+        self.list_messages(session_id)
+    }
+
+    fn map_office_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Office> {
+        Ok(Office {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            project_id: row.get(2)?,
+            cwd: row.get(3)?,
+            master_staff_id: row.get(4)?,
+            max_rounds: row.get(5)?,
+            status: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+            staff: Vec::new(),
+            events: Vec::new(),
+        })
+    }
+
+    fn map_office_staff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OfficeStaff> {
+        let is_master_int: i64 = row.get(5)?;
+        let is_dynamic_int: i64 = row.get(6)?;
+        let isolated_worktree_int: i64 = row.get(13)?;
+        Ok(OfficeStaff {
+            id: row.get(0)?,
+            office_id: row.get(1)?,
+            session_id: row.get(2)?,
+            name: row.get(3)?,
+            role: row.get(4)?,
+            is_master: is_master_int != 0,
+            is_dynamic: is_dynamic_int != 0,
+            harness: row.get(7)?,
+            model: row.get(8)?,
+            effort: row.get(9)?,
+            account: row.get(10)?,
+            permission_mode: row.get(11)?,
+            system_prompt: row.get(12)?,
+            isolated_worktree: isolated_worktree_int != 0,
+            worktree_path: row.get(14)?,
+            branch: row.get(15)?,
+            status: row.get(16)?,
+            current_task: row.get(17)?,
+            avatar_color: row.get(18)?,
+            desk_order: row.get(19)?,
+            created_at: row.get(20)?,
+        })
+    }
+
+    fn map_office_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OfficeEvent> {
+        Ok(OfficeEvent {
+            id: row.get(0)?,
+            office_id: row.get(1)?,
+            kind: row.get(2)?,
+            from_staff_id: row.get(3)?,
+            from_name: row.get(4)?,
+            to_staff_id: row.get(5)?,
+            to_name: row.get(6)?,
+            summary: row.get(7)?,
+            detail: row.get(8)?,
+            timestamp: row.get(9)?,
+        })
+    }
+
+    fn list_office_staff_for_office(&self, office_id: &str) -> Result<Vec<OfficeStaff>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, office_id, session_id, name, role, is_master, is_dynamic,
+                    harness, model, effort, account, permission_mode, system_prompt,
+                    isolated_worktree, worktree_path, branch, status, current_task,
+                    avatar_color, desk_order, created_at
+             FROM office_staff
+             WHERE office_id = ?1
+             ORDER BY desk_order ASC, created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![office_id], Self::map_office_staff_row)?;
+        let mut staff = Vec::new();
+        for row in rows {
+            staff.push(row?);
+        }
+        Ok(staff)
+    }
+
+    pub fn list_offices(&self) -> Result<Vec<Office>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, project_id, cwd, master_staff_id, max_rounds, status, created_at, updated_at
+             FROM offices
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], Self::map_office_row)?;
+        let mut offices = Vec::new();
+        for row in rows {
+            offices.push(row?);
+        }
+        for office in &mut offices {
+            office.staff = self.list_office_staff_for_office(&office.id)?;
+            office.events = self.list_office_events(&office.id)?;
+        }
+        Ok(offices)
+    }
+
+    pub fn get_office(&self, id: &str) -> Result<Option<Office>> {
+        let mut office = self
+            .conn
+            .query_row(
+                "SELECT id, name, project_id, cwd, master_staff_id, max_rounds, status, created_at, updated_at
+                 FROM offices
+                 WHERE id = ?1",
+                params![id],
+                Self::map_office_row,
+            )
+            .optional()?;
+        if let Some(ref mut o) = office {
+            o.staff = self.list_office_staff_for_office(&o.id)?;
+            o.events = self.list_office_events(&o.id)?;
+        }
+        Ok(office)
+    }
+
+    pub fn create_office_row(&self, office: &Office) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO offices (
+                id, name, project_id, cwd, master_staff_id, max_rounds, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                office.id,
+                office.name,
+                office.project_id,
+                office.cwd,
+                office.master_staff_id,
+                office.max_rounds,
+                office.status,
+                office.created_at,
+                office.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_office(&self, id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM offices WHERE id = ?1", params![id])?;
+        if changed > 0 {
+            self.conn
+                .execute("DELETE FROM sessions WHERE office_id = ?1", params![id])?;
+        }
+        Ok(changed > 0)
+    }
+
+    pub fn update_office_status(&self, id: &str, status: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE offices SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, status, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_office_max_rounds(&self, id: &str, max_rounds: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE offices SET max_rounds = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, max_rounds, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_office_staff(&self, staff: &OfficeStaff) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO office_staff (
+                id, office_id, session_id, name, role, is_master, is_dynamic,
+                harness, model, effort, account, permission_mode, system_prompt,
+                isolated_worktree, worktree_path, branch, status, current_task,
+                avatar_color, desk_order, created_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18,
+                ?19, ?20, ?21
+             )",
+            params![
+                staff.id,
+                staff.office_id,
+                staff.session_id,
+                staff.name,
+                staff.role,
+                if staff.is_master { 1 } else { 0 },
+                if staff.is_dynamic { 1 } else { 0 },
+                staff.harness,
+                staff.model,
+                staff.effort,
+                staff.account,
+                staff.permission_mode,
+                staff.system_prompt,
+                if staff.isolated_worktree { 1 } else { 0 },
+                staff.worktree_path,
+                staff.branch,
+                staff.status,
+                staff.current_task,
+                staff.avatar_color,
+                staff.desk_order,
+                staff.created_at,
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE offices SET updated_at = ?2 WHERE id = ?1",
+            params![staff.office_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_office_staff(&self, id: &str) -> Result<Option<OfficeStaff>> {
+        self.conn
+            .query_row(
+                "SELECT id, office_id, session_id, name, role, is_master, is_dynamic,
+                        harness, model, effort, account, permission_mode, system_prompt,
+                        isolated_worktree, worktree_path, branch, status, current_task,
+                        avatar_color, desk_order, created_at
+                 FROM office_staff
+                 WHERE id = ?1",
+                params![id],
+                Self::map_office_staff_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_office_staff(&self, input: UpdateStaffInput) -> Result<Option<OfficeStaff>> {
+        let Some(existing) = self.get_office_staff(&input.id)? else {
+            return Ok(None);
+        };
+        let name = input.name.unwrap_or(existing.name);
+        let role = input.role.unwrap_or(existing.role);
+        let harness = input.harness.unwrap_or(existing.harness);
+        let model = input.model.unwrap_or(existing.model);
+        let effort = input.effort.unwrap_or(existing.effort);
+        let account = input.account.unwrap_or(existing.account);
+        let permission_mode = input.permission_mode.unwrap_or(existing.permission_mode);
+        let system_prompt = input.system_prompt.unwrap_or(existing.system_prompt);
+        let isolated_worktree = input.isolated_worktree.unwrap_or(existing.isolated_worktree);
+        let worktree_path = input.worktree_path.unwrap_or(existing.worktree_path);
+        let branch = input.branch.unwrap_or(existing.branch);
+
+        self.conn.execute(
+            "UPDATE office_staff SET
+                name = ?2,
+                role = ?3,
+                harness = ?4,
+                model = ?5,
+                effort = ?6,
+                account = ?7,
+                permission_mode = ?8,
+                system_prompt = ?9,
+                isolated_worktree = ?10,
+                worktree_path = ?11,
+                branch = ?12
+             WHERE id = ?1",
+            params![
+                input.id,
+                name,
+                role,
+                harness,
+                model,
+                effort,
+                account,
+                permission_mode,
+                system_prompt,
+                if isolated_worktree { 1 } else { 0 },
+                worktree_path,
+                branch,
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE offices SET updated_at = ?2 WHERE id = ?1",
+            params![existing.office_id, Utc::now().to_rfc3339()],
+        )?;
+        self.get_office_staff(&input.id)
+    }
+
+    pub fn delete_office_staff(&self, id: &str) -> Result<bool> {
+        let session_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM office_staff WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let changed = self
+            .conn
+            .execute("DELETE FROM office_staff WHERE id = ?1", params![id])?;
+        if changed > 0 {
+            if let Some(sid) = session_id {
+                self.conn
+                    .execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
+            }
+        }
+        Ok(changed > 0)
+    }
+
+    pub fn update_staff_runtime_state(
+        &self,
+        id: &str,
+        status: &str,
+        current_task: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE office_staff SET status = ?2, current_task = ?3 WHERE id = ?1",
+            params![id, status, current_task],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_office_event(&self, event: &OfficeEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO office_events (
+                id, office_id, kind, from_staff_id, from_name, to_staff_id, to_name,
+                summary, detail, timestamp
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.id,
+                event.office_id,
+                event.kind,
+                event.from_staff_id,
+                event.from_name,
+                event.to_staff_id,
+                event.to_name,
+                event.summary,
+                event.detail,
+                event.timestamp,
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE offices SET updated_at = ?2 WHERE id = ?1",
+            params![event.office_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_office_events(&self, office_id: &str) -> Result<Vec<OfficeEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, office_id, kind, from_staff_id, from_name, to_staff_id, to_name,
+                    summary, detail, timestamp
+             FROM office_events
+             WHERE office_id = ?1
+             ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![office_id], Self::map_office_event_row)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
@@ -2142,5 +2692,169 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM usage WHERE session_id = 'thr-1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn office_crud_and_session_isolation() {
+        let (_dir, db) = open_temp_db();
+        let proj = db
+            .create_project(CreateProjectInput {
+                name: "OfficeProj".to_string(),
+                cwd: ".".to_string(),
+                repo_url: None,
+                discord_channel: None,
+                runtime: None,
+                wsl_distro: None,
+            })
+            .unwrap();
+
+        let regular_sess = db
+            .create_session(CreateSessionInput {
+                project_id: proj.id.clone(),
+                title: "Regular".to_string(),
+                harness: None,
+                model: None,
+                effort: None,
+                account: None,
+                permission_mode: None,
+                worktree_path: None,
+                branch: None,
+                shared_deps: None,
+                is_discord: None,
+                discord_channel: None,
+            })
+            .unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        let office_id = "off-1".to_string();
+        let office = Office {
+            id: office_id.clone(),
+            name: "Main Office".to_string(),
+            project_id: proj.id.clone(),
+            cwd: ".".to_string(),
+            master_staff_id: "stf-master".to_string(),
+            max_rounds: 6,
+            status: "idle".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            staff: Vec::new(),
+            events: Vec::new(),
+        };
+        db.create_office_row(&office).unwrap();
+
+        let office_sess = db
+            .create_session_for_office(
+                CreateSessionInput {
+                    project_id: proj.id.clone(),
+                    title: "Master Session".to_string(),
+                    harness: Some("claude-code".to_string()),
+                    model: Some("claude-sonnet-4".to_string()),
+                    effort: None,
+                    account: None,
+                    permission_mode: None,
+                    worktree_path: None,
+                    branch: None,
+                    shared_deps: None,
+                    is_discord: None,
+                    discord_channel: None,
+                },
+                &office_id,
+            )
+            .unwrap();
+
+        // Regular list_sessions must exclude office sessions
+        let all_sessions = db.list_sessions(None).unwrap();
+        assert_eq!(all_sessions.len(), 1);
+        assert_eq!(all_sessions[0].id, regular_sess.id);
+        let proj_sessions = db.list_sessions(Some(&proj.id)).unwrap();
+        assert_eq!(proj_sessions.len(), 1);
+        assert_eq!(proj_sessions[0].id, regular_sess.id);
+
+        // Office session still accessible by id and messages
+        db.append_message(&office_sess.id, &make_msg("m-off-1", "user", "hello office"))
+            .unwrap();
+        let msgs = db.list_messages_for_session(&office_sess.id).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text, "hello office");
+
+        let staff = OfficeStaff {
+            id: "stf-master".to_string(),
+            office_id: office_id.clone(),
+            session_id: office_sess.id.clone(),
+            name: "Director".to_string(),
+            role: "Coordinator".to_string(),
+            is_master: true,
+            is_dynamic: false,
+            harness: "claude-code".to_string(),
+            model: "claude-sonnet-4".to_string(),
+            effort: "medium".to_string(),
+            account: "default".to_string(),
+            permission_mode: "supervised".to_string(),
+            system_prompt: "Lead the team".to_string(),
+            isolated_worktree: false,
+            worktree_path: ".".to_string(),
+            branch: "main".to_string(),
+            status: "idle".to_string(),
+            current_task: None,
+            avatar_color: "#6366f1".to_string(),
+            desk_order: 0,
+            created_at: now.clone(),
+        };
+        db.insert_office_staff(&staff).unwrap();
+
+        db.update_office_status(&office_id, "running").unwrap();
+        db.update_office_max_rounds(&office_id, 10).unwrap();
+        db.update_staff_runtime_state("stf-master", "working", Some("Planning"))
+            .unwrap();
+
+        let updated_staff = db
+            .update_office_staff(UpdateStaffInput {
+                id: "stf-master".to_string(),
+                name: Some("Chief".to_string()),
+                role: None,
+                harness: None,
+                model: None,
+                effort: Some("high".to_string()),
+                account: None,
+                permission_mode: None,
+                system_prompt: None,
+                isolated_worktree: Some(true),
+                worktree_path: None,
+                branch: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_staff.name, "Chief");
+        assert_eq!(updated_staff.effort, "high");
+        assert!(updated_staff.isolated_worktree);
+        assert_eq!(updated_staff.status, "working");
+        assert_eq!(updated_staff.current_task.as_deref(), Some("Planning"));
+
+        let evt = OfficeEvent {
+            id: "evt-1".to_string(),
+            office_id: office_id.clone(),
+            kind: "assign".to_string(),
+            from_staff_id: Some("stf-master".to_string()),
+            from_name: Some("Chief".to_string()),
+            to_staff_id: None,
+            to_name: None,
+            summary: "Started".to_string(),
+            detail: Some("Details".to_string()),
+            timestamp: now,
+        };
+        db.append_office_event(&evt).unwrap();
+
+        let fetched = db.get_office(&office_id).unwrap().unwrap();
+        assert_eq!(fetched.status, "running");
+        assert_eq!(fetched.max_rounds, 10);
+        assert_eq!(fetched.staff.len(), 1);
+        assert_eq!(fetched.events.len(), 1);
+        assert_eq!(db.list_offices().unwrap().len(), 1);
+        assert_eq!(db.list_office_events(&office_id).unwrap().len(), 1);
+
+        assert!(db.delete_office_staff("stf-master").unwrap());
+        assert!(db.get_office_staff("stf-master").unwrap().is_none());
+        assert!(db.delete_office(&office_id).unwrap());
+        assert!(db.get_office(&office_id).unwrap().is_none());
     }
 }

@@ -256,6 +256,17 @@ pub fn wsl_to_unc_path(distro: &str, linux_path: &str) -> PathBuf {
     }
 }
 
+/// Encode a POSIX `cwd` with an optional WSL distro into `wsl://<distro>/<path>`
+/// unless `cwd` is already a WSL URI/UNC path or `distro` is empty/None.
+pub fn encode_wsl_path(distro: Option<&str>, cwd: &str) -> String {
+    if let Some(d) = distro.map(str::trim).filter(|s| !s.is_empty()) {
+        if parse_wsl_path(cwd).is_none() {
+            return format!("wsl://{}/{}", d, cwd.trim_start_matches('/'));
+        }
+    }
+    cwd.to_string()
+}
+
 /// Build a `std::process::Command` that runs inside a WSL2 distro.
 pub fn wsl_std_command(distro: &str, cwd: Option<&str>, program: &str, args: &[&str]) -> std::process::Command {
     let mut cmd = std_command("wsl.exe");
@@ -487,4 +498,44 @@ pub async fn list_directories(
     tokio::task::spawn_blocking(move || list_directories_impl(path.as_deref(), wsl_distro.as_deref()))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_wsl_path;
+
+    #[test]
+    fn encode_wsl_path_encodes_posix_path_with_distro() {
+        assert_eq!(
+            encode_wsl_path(Some("Ubuntu"), "/home/user/repo"),
+            "wsl://Ubuntu/home/user/repo"
+        );
+        assert_eq!(
+            encode_wsl_path(Some("  Ubuntu-22.04  "), "home/user/repo"),
+            "wsl://Ubuntu-22.04/home/user/repo"
+        );
+    }
+
+    #[test]
+    fn encode_wsl_path_skips_when_distro_missing_or_empty() {
+        assert_eq!(encode_wsl_path(None, "/home/user/repo"), "/home/user/repo");
+        assert_eq!(encode_wsl_path(Some(""), "/home/user/repo"), "/home/user/repo");
+        assert_eq!(encode_wsl_path(Some("   "), "/home/user/repo"), "/home/user/repo");
+    }
+
+    #[test]
+    fn encode_wsl_path_preserves_existing_wsl_paths() {
+        assert_eq!(
+            encode_wsl_path(Some("Ubuntu"), "wsl://Debian/home/user/repo"),
+            "wsl://Debian/home/user/repo"
+        );
+        assert_eq!(
+            encode_wsl_path(Some("Ubuntu"), r"\\wsl.localhost\Debian\home\user\repo"),
+            r"\\wsl.localhost\Debian\home\user\repo"
+        );
+        assert_eq!(
+            encode_wsl_path(Some("Ubuntu"), r"\\wsl$\Debian\home\user\repo"),
+            r"\\wsl$\Debian\home\user\repo"
+        );
+    }
 }

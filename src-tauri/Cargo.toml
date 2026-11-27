@@ -1,6 +1,6 @@
 [package]
 name = "sakana"
-version = "2.0.0"
+version = "2.0.1"
 description = "Sakana Desktop — Cross-Platform Agentic AI Control Surface"
 authors = ["Sakana"]
 edition = "2021"

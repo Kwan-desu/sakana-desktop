@@ -24,8 +24,8 @@ use crate::auth::AuthState;
 use crate::db::Database;
 use crate::harness::HarnessState;
 use crate::models::{
-    CreateProjectInput, CreateSessionInput, HostInfo, RemoteHost, RemoteStatus,
-    UpdateSessionInput, UpsertRemoteHostInput,
+    CreateOfficeInput, CreateProjectInput, CreateSessionInput, HireStaffInput, HostInfo,
+    RemoteHost, RemoteStatus, UpdateSessionInput, UpdateStaffInput, UpsertRemoteHostInput,
 };
 use crate::pty::PtyState;
 use crate::DbState;
@@ -73,8 +73,10 @@ impl Default for RemoteState {
 pub struct ServerContext {
     pub db: Arc<Mutex<Database>>,
     pub harness_active: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    pub office_active: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     pub pty_state: Arc<PtyState>,
     pub auth_state: Arc<AuthState>,
+    pub discord_state: Arc<crate::discord::DiscordState>,
     pub app: Option<AppHandle>,
     pub token: String,
     pub port: u16,
@@ -313,6 +315,37 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             let proj = db.create_project(input).map_err(|e| e.to_string())?;
             serde_json::to_value(proj).map_err(|e| e.to_string())
         }
+        "rename_project" => {
+            let id = get_str(&args, "id")?;
+            let name = get_str(&args, "name")?;
+            let db = ctx.db.lock().await;
+            let ok = db.rename_project(&id, &name).map_err(|e| e.to_string())?;
+            Ok(json!(ok))
+        }
+        "reorder_projects" => {
+            let ordered_ids: Vec<String> = serde_json::from_value(
+                args.get("orderedIds")
+                    .or_else(|| args.get("ordered_ids"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            )
+            .map_err(|e| e.to_string())?;
+            let db = ctx.db.lock().await;
+            db.reorder_projects(&ordered_ids).map_err(|e| e.to_string())?;
+            Ok(json!(true))
+        }
+        "reorder_sessions" => {
+            let ordered_ids: Vec<String> = serde_json::from_value(
+                args.get("orderedIds")
+                    .or_else(|| args.get("ordered_ids"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            )
+            .map_err(|e| e.to_string())?;
+            let db = ctx.db.lock().await;
+            db.reorder_sessions(&ordered_ids).map_err(|e| e.to_string())?;
+            Ok(json!(true))
+        }
         "delete_project" => {
             let id = get_str(&args, "id")?;
             let db = ctx.db.lock().await;
@@ -456,30 +489,35 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             serde_json::to_value(items).map_err(|e| e.to_string())
         }
         "get_git_diffs" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let turn_id = get_opt_str(&args, "turnId").or_else(|| get_opt_str(&args, "turn_id"));
-            let res = crate::git::get_git_diffs(cwd, turn_id).await?;
+            let res = crate::git::get_git_diffs_inner(&ctx.db, cwd, turn_id, wsl_distro).await?;
             serde_json::to_value(res).map_err(|e| e.to_string())
         }
         "list_branches" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
-            let res = crate::git::list_branches(cwd).await?;
+            let res = crate::git::list_branches_inner(&ctx.db, cwd, wsl_distro).await?;
             serde_json::to_value(res).map_err(|e| e.to_string())
         }
         "checkout_branch" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let branch = get_str(&args, "branch")?;
-            crate::git::checkout_branch(cwd, branch).await?;
+            crate::git::checkout_branch_inner(&ctx.db, cwd, branch, wsl_distro).await?;
             Ok(Value::Null)
         }
         "git_pull" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
-            let out = crate::git::git_pull(cwd).await?;
+            let out = crate::git::git_pull_inner(&ctx.db, cwd, wsl_distro).await?;
             Ok(json!(out))
         }
         "git_push" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
-            let out = crate::git::git_push(cwd).await?;
+            let out = crate::git::git_push_inner(&ctx.db, cwd, wsl_distro).await?;
             Ok(json!(out))
         }
         "create_worktree" => {
@@ -491,65 +529,73 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
                 .or_else(|| args.get("shared_deps"))
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
-            let wt = crate::git::create_worktree(session_id, project_cwd, branch, shared_deps).await?;
+            let wt = crate::git::create_worktree_inner(&ctx.db, session_id, project_cwd, branch, shared_deps).await?;
             Ok(json!(wt))
         }
         "remove_worktree" => {
             let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
             let project_cwd = get_str(&args, "projectCwd").or_else(|_| get_str(&args, "project_cwd"))?;
-            crate::git::remove_worktree(session_id, project_cwd).await?;
+            crate::git::remove_worktree_inner(&ctx.db, session_id, project_cwd).await?;
             Ok(Value::Null)
         }
         "create_pr" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let title = get_str(&args, "title")?;
             let body = get_opt_str(&args, "body").unwrap_or_default();
             let base_branch = get_str(&args, "baseBranch").or_else(|_| get_str(&args, "base_branch"))?;
-            let url = crate::git::create_pr(cwd, title, body, base_branch).await?;
+            let url = crate::git::create_pr_inner(&ctx.db, cwd, title, body, base_branch, wsl_distro).await?;
             Ok(json!(url))
         }
         "stage_hunk" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let file_path = get_str(&args, "filePath").or_else(|_| get_str(&args, "file_path"))?;
             let hunk_header = get_str(&args, "hunkHeader").or_else(|_| get_str(&args, "hunk_header"))?;
             let stage = args.get("stage").and_then(|v| v.as_bool()).unwrap_or(true);
-            crate::git::stage_hunk(cwd, file_path, hunk_header, stage).await?;
+            crate::git::stage_hunk_inner(&ctx.db, cwd, file_path, hunk_header, stage, wsl_distro).await?;
             Ok(Value::Null)
         }
         "discard_hunk" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let file_path = get_str(&args, "filePath").or_else(|_| get_str(&args, "file_path"))?;
             let hunk_header = get_str(&args, "hunkHeader").or_else(|_| get_str(&args, "hunk_header"))?;
-            crate::git::discard_hunk(cwd, file_path, hunk_header).await?;
+            crate::git::discard_hunk_inner(&ctx.db, cwd, file_path, hunk_header, wsl_distro).await?;
             Ok(Value::Null)
         }
         "draft_commit_message" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
-            let msg = crate::git::draft_commit_message(cwd).await?;
+            let msg = crate::git::draft_commit_message_inner(&ctx.db, cwd, wsl_distro).await?;
             Ok(json!(msg))
         }
         "git_commit" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let message = get_str(&args, "message")?;
-            let out = crate::git::git_commit(cwd, message).await?;
+            let out = crate::git::git_commit_inner(&ctx.db, cwd, message, wsl_distro).await?;
             Ok(json!(out))
         }
         "list_workspace_files" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
-            let files = crate::git::list_workspace_files(cwd).await?;
+            let files = crate::git::list_workspace_files_inner(&ctx.db, cwd, wsl_distro).await?;
             serde_json::to_value(files).map_err(|e| e.to_string())
         }
         "read_workspace_file" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let rel_path = get_str(&args, "relPath").or_else(|_| get_str(&args, "rel_path"))?;
-            let file = crate::git::read_workspace_file(cwd, rel_path).await?;
+            let file = crate::git::read_workspace_file_inner(&ctx.db, cwd, rel_path, wsl_distro).await?;
             serde_json::to_value(file).map_err(|e| e.to_string())
         }
         "write_workspace_file" => {
+            let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let rel_path = get_str(&args, "relPath").or_else(|_| get_str(&args, "rel_path"))?;
             let content = get_str(&args, "content")?;
-            crate::git::write_workspace_file(cwd, rel_path, content).await?;
+            crate::git::write_workspace_file_inner(&ctx.db, cwd, rel_path, content, wsl_distro).await?;
             Ok(Value::Null)
         }
         "pty_spawn" => {
@@ -762,6 +808,371 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             db.resolve_approval(&approval_id, approved).map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
+        "list_offices" => {
+            let db = ctx.db.lock().await;
+            let items = db.list_offices().map_err(|e| e.to_string())?;
+            serde_json::to_value(items).map_err(|e| e.to_string())
+        }
+        "get_office" => {
+            let id = get_str(&args, "officeId")
+                .or_else(|_| get_str(&args, "office_id"))
+                .or_else(|_| get_str(&args, "id"))?;
+            let db = ctx.db.lock().await;
+            let office = db.get_office(&id).map_err(|e| e.to_string())?;
+            serde_json::to_value(office).map_err(|e| e.to_string())
+        }
+        "create_office" => {
+            let input_val = args.get("input").cloned().unwrap_or(args);
+            let input: CreateOfficeInput =
+                serde_json::from_value(input_val).map_err(|e| e.to_string())?;
+            let office =
+                crate::office::create_office_inner(ctx.app.as_ref(), &ctx.db, input).await?;
+            serde_json::to_value(office).map_err(|e| e.to_string())
+        }
+        "delete_office" => {
+            let id = get_str(&args, "officeId")
+                .or_else(|_| get_str(&args, "office_id"))
+                .or_else(|_| get_str(&args, "id"))?;
+            let ok = crate::office::delete_office_inner(
+                ctx.app.as_ref(),
+                &ctx.db,
+                &ctx.office_active,
+                &ctx.harness_active,
+                id,
+            )
+            .await?;
+            Ok(json!(ok))
+        }
+        "update_office_settings" => {
+            let office_id =
+                get_str(&args, "officeId").or_else(|_| get_str(&args, "office_id"))?;
+            let max_rounds = args
+                .get("maxRounds")
+                .or_else(|| args.get("max_rounds"))
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| "Missing integer argument 'maxRounds'".to_string())?;
+            let office = crate::office::update_office_settings_inner(
+                ctx.app.as_ref(),
+                &ctx.db,
+                office_id,
+                max_rounds,
+            )
+            .await?;
+            serde_json::to_value(office).map_err(|e| e.to_string())
+        }
+        "hire_office_staff" => {
+            let input_val = args.get("input").cloned().unwrap_or(args);
+            let input: HireStaffInput =
+                serde_json::from_value(input_val).map_err(|e| e.to_string())?;
+            let staff =
+                crate::office::hire_staff_internal(ctx.app.as_ref(), &ctx.db, input).await?;
+            serde_json::to_value(staff).map_err(|e| e.to_string())
+        }
+        "update_office_staff" => {
+            let input_val = args.get("input").cloned().unwrap_or(args);
+            let input: UpdateStaffInput =
+                serde_json::from_value(input_val).map_err(|e| e.to_string())?;
+            let staff =
+                crate::office::update_office_staff_inner(ctx.app.as_ref(), &ctx.db, input).await?;
+            serde_json::to_value(staff).map_err(|e| e.to_string())
+        }
+        "fire_office_staff" => {
+            let id = get_str(&args, "staffId")
+                .or_else(|_| get_str(&args, "staff_id"))
+                .or_else(|_| get_str(&args, "id"))?;
+            let ok = crate::office::fire_office_staff_inner(
+                ctx.app.as_ref(),
+                &ctx.db,
+                &ctx.harness_active,
+                id,
+            )
+            .await?;
+            Ok(json!(ok))
+        }
+        "get_office_staff_messages" => {
+            let staff_id = get_str(&args, "staffId")
+                .or_else(|_| get_str(&args, "staff_id"))
+                .or_else(|_| get_str(&args, "id"))?;
+            let db = ctx.db.lock().await;
+            let staff = db
+                .get_office_staff(&staff_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Office staff '{}' not found", staff_id))?;
+            let msgs = db
+                .list_messages_for_session(&staff.session_id)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(msgs).map_err(|e| e.to_string())
+        }
+        "send_office_message" => {
+            let office_id =
+                get_str(&args, "officeId").or_else(|_| get_str(&args, "office_id"))?;
+            let target_staff_id = get_str(&args, "targetStaffId")
+                .or_else(|_| get_str(&args, "target_staff_id"))?;
+            let prompt = get_str(&args, "prompt")?;
+            let attachments = args
+                .get("attachments")
+                .and_then(|v| v.as_array())
+                .cloned();
+            crate::office::send_office_message_inner(
+                ctx.app.clone(),
+                Arc::clone(&ctx.db),
+                Arc::clone(&ctx.harness_active),
+                Arc::clone(&ctx.office_active),
+                office_id,
+                target_staff_id,
+                prompt,
+                attachments,
+            )
+            .await?;
+            Ok(Value::Null)
+        }
+        "report_staff_to_master" => {
+            let office_id =
+                get_str(&args, "officeId").or_else(|_| get_str(&args, "office_id"))?;
+            let staff_id =
+                get_str(&args, "staffId").or_else(|_| get_str(&args, "staff_id"))?;
+            let note = get_opt_str(&args, "note");
+            let ev = crate::office::report_staff_to_master_inner(
+                ctx.app.as_ref(),
+                &ctx.db,
+                office_id,
+                staff_id,
+                note,
+            )
+            .await?;
+            serde_json::to_value(ev).map_err(|e| e.to_string())
+        }
+        "stop_office_run" => {
+            let office_id =
+                get_str(&args, "officeId").or_else(|_| get_str(&args, "office_id"))?;
+            crate::office::stop_office_run_inner(
+                ctx.app.as_ref(),
+                &ctx.db,
+                &ctx.harness_active,
+                &ctx.office_active,
+                office_id,
+            )
+            .await?;
+            Ok(Value::Null)
+        }
+        "create_checkpoint" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let turn_number = args
+                .get("turnNumber")
+                .or_else(|| args.get("turn_number"))
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| "Missing 'turnNumber'".to_string())?;
+            let label = get_str(&args, "label")?;
+            let cwd = get_str(&args, "cwd")?;
+            let cp = crate::git::create_checkpoint_inner(&ctx.db, session_id, turn_number, label, cwd).await?;
+            serde_json::to_value(cp).map_err(|e| e.to_string())
+        }
+        "get_checkpoint_diff" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let checkpoint_id = get_str(&args, "checkpointId").or_else(|_| get_str(&args, "checkpoint_id"))?;
+            let diffs = crate::git::get_checkpoint_diff_inner(&ctx.db, session_id, checkpoint_id).await?;
+            serde_json::to_value(diffs).map_err(|e| e.to_string())
+        }
+        "revert_to_checkpoint" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let checkpoint_id = get_str(&args, "checkpointId").or_else(|_| get_str(&args, "checkpoint_id"))?;
+            crate::git::revert_to_checkpoint_inner(&ctx.db, session_id, checkpoint_id).await?;
+            Ok(Value::Null)
+        }
+        "list_trace_spans" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let spans = crate::git::list_trace_spans_inner(&ctx.db, session_id).await?;
+            serde_json::to_value(spans).map_err(|e| e.to_string())
+        }
+        "create_harness_account" => {
+            let harness = get_str(&args, "harness")?;
+            let label = get_str(&args, "label")?;
+            let email = get_opt_str(&args, "email");
+            let auth_type = get_opt_str(&args, "authType").or_else(|| get_opt_str(&args, "auth_type"));
+            let accounts = crate::auth::create_harness_account_inner(
+                &ctx.db,
+                &ctx.auth_state,
+                harness,
+                label,
+                email,
+                auth_type,
+            )
+            .await?;
+            serde_json::to_value(accounts).map_err(|e| e.to_string())
+        }
+        "delete_harness_account" => {
+            let account_id = get_str(&args, "accountId").or_else(|_| get_str(&args, "account_id"))?;
+            let accounts = crate::auth::delete_harness_account_inner(&ctx.db, &ctx.auth_state, account_id).await?;
+            serde_json::to_value(accounts).map_err(|e| e.to_string())
+        }
+        "set_default_harness_account" => {
+            let account_id = get_str(&args, "accountId").or_else(|_| get_str(&args, "account_id"))?;
+            let accounts = crate::auth::set_default_harness_account_inner(&ctx.db, &ctx.auth_state, account_id).await?;
+            serde_json::to_value(accounts).map_err(|e| e.to_string())
+        }
+        "rename_harness_account" => {
+            let account_id = get_str(&args, "accountId").or_else(|_| get_str(&args, "account_id"))?;
+            let label = get_str(&args, "label")?;
+            let accounts = crate::auth::rename_harness_account_inner(&ctx.db, &ctx.auth_state, account_id, label).await?;
+            serde_json::to_value(accounts).map_err(|e| e.to_string())
+        }
+        "check_harness_auth" => {
+            let account_id = get_str(&args, "accountId").or_else(|_| get_str(&args, "account_id"))?;
+            let account = crate::auth::check_harness_auth_inner(&ctx.db, &ctx.auth_state, account_id).await?;
+            serde_json::to_value(account).map_err(|e| e.to_string())
+        }
+        "start_harness_login" => {
+            let account_id = get_str(&args, "accountId").or_else(|_| get_str(&args, "account_id"))?;
+            let auth_type = get_opt_str(&args, "authType").or_else(|| get_opt_str(&args, "auth_type"));
+            let mode = get_opt_str(&args, "mode");
+            let res = crate::auth::start_harness_login_inner(&ctx.db, &ctx.auth_state, account_id, auth_type, mode).await?;
+            serde_json::to_value(res).map_err(|e| e.to_string())
+        }
+        "submit_harness_login_code" => {
+            let account_id = get_str(&args, "accountId").or_else(|_| get_str(&args, "account_id"))?;
+            let code = get_str(&args, "code")?;
+            let res = crate::auth::submit_harness_login_code_inner(&ctx.db, &ctx.auth_state, account_id, code).await?;
+            serde_json::to_value(res).map_err(|e| e.to_string())
+        }
+        "logout_harness_account" => {
+            let account_id = get_str(&args, "accountId").or_else(|_| get_str(&args, "account_id"))?;
+            let accounts = crate::auth::logout_harness_account_inner(&ctx.db, &ctx.auth_state, account_id).await?;
+            serde_json::to_value(accounts).map_err(|e| e.to_string())
+        }
+        "set_env_secret" => {
+            let key = get_str(&args, "key")?;
+            let value = get_str(&args, "value")?;
+            let secrets = crate::telemetry::set_env_secret_inner(key, value).await?;
+            serde_json::to_value(secrets).map_err(|e| e.to_string())
+        }
+        "delete_env_secret" => {
+            let key = get_str(&args, "key")?;
+            let secrets = crate::telemetry::delete_env_secret_inner(key).await?;
+            serde_json::to_value(secrets).map_err(|e| e.to_string())
+        }
+        "reveal_env_secret" => {
+            let key = get_str(&args, "key")?;
+            let val = crate::telemetry::reveal_env_secret_inner(key).await?;
+            Ok(json!(val))
+        }
+        "upsert_quota_account" => {
+            let id = get_opt_str(&args, "id");
+            let harness = get_opt_str(&args, "harness");
+            let provider = get_opt_str(&args, "provider");
+            let label = get_str(&args, "label")?;
+            let email = get_opt_str(&args, "email");
+            let plan = get_opt_str(&args, "plan");
+            let five_hour_pct = args.get("fiveHourPct").or_else(|| args.get("five_hour_pct")).and_then(|v| v.as_f64());
+            let five_hour_reset = get_opt_str(&args, "fiveHourReset").or_else(|| get_opt_str(&args, "five_hour_reset"));
+            let weekly_pct = args.get("weeklyPct").or_else(|| args.get("weekly_pct")).and_then(|v| v.as_f64());
+            let weekly_reset = get_opt_str(&args, "weeklyReset").or_else(|| get_opt_str(&args, "weekly_reset"));
+            let is_default = args.get("isDefault").or_else(|| args.get("is_default")).and_then(|v| v.as_bool());
+            let accounts = crate::telemetry::upsert_quota_account_inner(
+                &ctx.db,
+                id,
+                harness,
+                provider,
+                label,
+                email,
+                plan,
+                five_hour_pct,
+                five_hour_reset,
+                weekly_pct,
+                weekly_reset,
+                is_default,
+            )
+            .await?;
+            serde_json::to_value(accounts).map_err(|e| e.to_string())
+        }
+        "delete_quota_account" => {
+            let id = get_str(&args, "id")?;
+            let accounts = crate::telemetry::delete_quota_account_inner(&ctx.db, id).await?;
+            serde_json::to_value(accounts).map_err(|e| e.to_string())
+        }
+        "list_approvals" => {
+            let session_id = get_opt_str(&args, "sessionId").or_else(|| get_opt_str(&args, "session_id"));
+            let approvals = crate::guard::list_approvals_inner(&ctx.db, session_id).await?;
+            serde_json::to_value(approvals).map_err(|e| e.to_string())
+        }
+        "request_approval" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let command = get_str(&args, "command")?;
+            let cwd = get_str(&args, "cwd")?;
+            let reason = get_str(&args, "reason")?;
+            let risk = get_str(&args, "risk")?;
+            let requested_by = get_str(&args, "requestedBy").or_else(|_| get_str(&args, "requested_by"))?;
+            let approval = crate::guard::request_approval_inner(
+                ctx.app.as_ref(),
+                &ctx.db,
+                session_id,
+                command,
+                cwd,
+                reason,
+                risk,
+                requested_by,
+            )
+            .await?;
+            serde_json::to_value(approval).map_err(|e| e.to_string())
+        }
+        "add_allowlist_prefix" => {
+            let prefix = get_str(&args, "prefix")?;
+            crate::guard::add_allowlist_prefix_inner(&ctx.db, prefix).await?;
+            Ok(Value::Null)
+        }
+        "ping_mcp_server" => {
+            let id = get_str(&args, "id")?;
+            let server = crate::mcp::ping_mcp_server_inner(&ctx.db, id).await?;
+            serde_json::to_value(server).map_err(|e| e.to_string())
+        }
+        "import_agy_mcp_servers" => {
+            let servers = crate::mcp::import_agy_mcp_servers_inner(&ctx.db).await?;
+            serde_json::to_value(servers).map_err(|e| e.to_string())
+        }
+        "save_clipboard_attachment" => {
+            let name = get_str(&args, "name")?;
+            let mime = get_opt_str(&args, "mime").unwrap_or_default();
+            let data_base64 = get_str(&args, "dataBase64").or_else(|_| get_str(&args, "data_base64"))?;
+            let item = crate::save_clipboard_attachment_inner(name, mime, data_base64)?;
+            serde_json::to_value(item).map_err(|e| e.to_string())
+        }
+        "translate_nl_command" => {
+            let prompt = get_str(&args, "prompt")?;
+            let os = get_str(&args, "os")?;
+            let shell = get_str(&args, "shell")?;
+            let cmd = crate::pty::translate_nl_command_inner(&ctx.db, prompt, os, shell).await?;
+            Ok(json!(cmd))
+        }
+        "get_discord_status" => {
+            let status = crate::discord::get_discord_status_inner(&ctx.discord_state, &ctx.db).await?;
+            serde_json::to_value(status).map_err(|e| e.to_string())
+        }
+        "start_discord_bot" => {
+            let token = get_opt_str(&args, "token");
+            let status = crate::discord::start_discord_bot_inner(
+                &ctx.discord_state,
+                &ctx.db,
+                ctx.app.clone(),
+                token,
+            )
+            .await?;
+            serde_json::to_value(status).map_err(|e| e.to_string())
+        }
+        "stop_discord_bot" => {
+            let status = crate::discord::stop_discord_bot_inner(&ctx.discord_state, &ctx.db).await?;
+            serde_json::to_value(status).map_err(|e| e.to_string())
+        }
+        "upsert_discord_rule" => {
+            let user_id = get_str(&args, "userId").or_else(|_| get_str(&args, "user_id"))?;
+            let label = get_str(&args, "label")?;
+            let role = get_str(&args, "role")?;
+            let rule = crate::discord::upsert_discord_rule_inner(&ctx.db, user_id, label, role).await?;
+            serde_json::to_value(rule).map_err(|e| e.to_string())
+        }
+        "delete_discord_rule" => {
+            let id = get_str(&args, "id")?;
+            let ok = crate::discord::delete_discord_rule_inner(&ctx.db, id).await?;
+            Ok(json!(ok))
+        }
         other => Err(format!("Unsupported remote RPC command: '{}'", other)),
     }
 }
@@ -804,15 +1215,15 @@ async fn api_webhook(
         )
             .into_response();
     }
-    let Some(app) = ctx.app.clone() else {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({ "ok": false, "error": "Webhooks require desktop runtime" })),
-        )
-            .into_response();
-    };
     let payload = if body.trim().is_empty() { None } else { Some(body) };
-    match crate::automation::trigger_webhook_by_path(Arc::clone(&ctx.db), app, &hook_path, payload).await {
+    match crate::automation::trigger_webhook_by_path(
+        Arc::clone(&ctx.db),
+        ctx.app.clone(),
+        &hook_path,
+        payload,
+    )
+    .await
+    {
         Ok(triggered) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "path": hook_path, "triggered": triggered })),
@@ -895,8 +1306,10 @@ pub async fn serve_remote_daemon(
     let ctx = ServerContext {
         db,
         harness_active: Arc::new(Mutex::new(HashMap::new())),
+        office_active: Arc::new(Mutex::new(HashMap::new())),
         pty_state: Arc::new(PtyState::default()),
         auth_state: Arc::new(AuthState::default()),
+        discord_state: Arc::new(crate::discord::DiscordState::default()),
         app: None,
         token,
         port,
@@ -928,8 +1341,10 @@ pub async fn start_remote_server(
     state: State<'_, RemoteState>,
     db_state: State<'_, DbState>,
     harness_state: State<'_, HarnessState>,
+    office_state: State<'_, crate::office::OfficeState>,
     pty_state: State<'_, PtyState>,
     auth_state: State<'_, AuthState>,
+    discord_state: State<'_, crate::discord::DiscordState>,
     port: Option<u16>,
     lan_enabled: Option<bool>,
 ) -> Result<RemoteStatus, String> {
@@ -958,12 +1373,20 @@ pub async fn start_remote_server(
     let ctx = ServerContext {
         db: Arc::clone(&db_state.0),
         harness_active: Arc::clone(&harness_state.active_turns),
+        office_active: Arc::clone(&office_state.active_runs),
         pty_state: Arc::new(PtyState {
             sessions: Arc::clone(&pty_state.sessions),
         }),
         auth_state: Arc::new(AuthState {
             login_procs: Arc::clone(&auth_state.login_procs),
             last_outputs: Arc::clone(&auth_state.last_outputs),
+        }),
+        discord_state: Arc::new(crate::discord::DiscordState {
+            running: Arc::clone(&discord_state.running),
+            bot_tag: Arc::clone(&discord_state.bot_tag),
+            connected_guilds: Arc::clone(&discord_state.connected_guilds),
+            last_error: Arc::clone(&discord_state.last_error),
+            shard_manager: Arc::clone(&discord_state.shard_manager),
         }),
         app: Some(app.clone()),
         token,
@@ -1438,5 +1861,308 @@ mod tests {
         drain_valid_utf8(&mut pending, &mut out);
         assert_eq!(out, full);
         assert!(pending.is_empty());
+    }
+
+    fn make_test_context(temp_dir: &std::path::Path) -> ServerContext {
+        let db = Database::open_in_dir(temp_dir).unwrap();
+        ServerContext {
+            db: Arc::new(Mutex::new(db)),
+            harness_active: Arc::new(Mutex::new(HashMap::new())),
+            office_active: Arc::new(Mutex::new(HashMap::new())),
+            pty_state: Arc::new(PtyState::default()),
+            auth_state: Arc::new(AuthState::default()),
+            discord_state: Arc::new(crate::discord::DiscordState::default()),
+            app: None,
+            token: "test-token".to_string(),
+            port: 0,
+            host_id: "test-host".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_office_lifecycle_headless() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sakana-remote-office-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = make_test_context(&temp_dir);
+
+        // create_office
+        let created = dispatch_rpc(
+            &ctx,
+            "create_office",
+            json!({
+                "input": {
+                    "name": "Remote Office",
+                    "masterHarness": "claude",
+                    "masterModel": "claude-sonnet-4-5"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let office_id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["name"], "Remote Office");
+
+        // list_offices
+        let list = dispatch_rpc(&ctx, "list_offices", json!({})).await.unwrap();
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], office_id);
+
+        // get_office
+        let fetched = dispatch_rpc(&ctx, "get_office", json!({ "officeId": office_id }))
+            .await
+            .unwrap();
+        assert_eq!(fetched["id"], office_id);
+
+        // update_office_settings
+        let updated_settings = dispatch_rpc(
+            &ctx,
+            "update_office_settings",
+            json!({ "officeId": office_id, "maxRounds": 7 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated_settings["maxRounds"], 7);
+
+        // hire_office_staff
+        let hired = dispatch_rpc(
+            &ctx,
+            "hire_office_staff",
+            json!({
+                "input": {
+                    "officeId": office_id,
+                    "name": "Worker One",
+                    "role": "engineer",
+                    "harness": "claude",
+                    "model": "claude-sonnet-4-5"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let staff_id = hired["id"].as_str().unwrap().to_string();
+        assert_eq!(hired["name"], "Worker One");
+
+        // update_office_staff
+        let updated_staff = dispatch_rpc(
+            &ctx,
+            "update_office_staff",
+            json!({
+                "input": {
+                    "id": staff_id,
+                    "name": "Worker Updated",
+                    "role": "senior-engineer"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated_staff["name"], "Worker Updated");
+        assert_eq!(updated_staff["role"], "senior-engineer");
+
+        // get_office_staff_messages
+        let msgs = dispatch_rpc(
+            &ctx,
+            "get_office_staff_messages",
+            json!({ "staffId": staff_id }),
+        )
+        .await
+        .unwrap();
+        assert!(msgs.as_array().unwrap().is_empty());
+
+        // fire_office_staff
+        let fired = dispatch_rpc(
+            &ctx,
+            "fire_office_staff",
+            json!({ "staffId": staff_id }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fired, json!(true));
+
+        // delete_office
+        let deleted = dispatch_rpc(
+            &ctx,
+            "delete_office",
+            json!({ "officeId": office_id }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, json!(true));
+
+        let after_delete = dispatch_rpc(&ctx, "list_offices", json!({})).await.unwrap();
+        assert!(after_delete.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_checkpoints_headless() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sakana-remote-cp-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&temp_dir)
+            .output()
+            .unwrap();
+        assert!(git_init.status.success());
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@sakana.local"])
+            .current_dir(&temp_dir)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Sakana Test"])
+            .current_dir(&temp_dir)
+            .output();
+        std::fs::write(temp_dir.join("README.md"), "init\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&temp_dir)
+            .output();
+        let git_commit = std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&temp_dir)
+            .output()
+            .unwrap();
+        assert!(git_commit.status.success());
+
+        let ctx = make_test_context(&temp_dir);
+
+        let proj = dispatch_rpc(
+            &ctx,
+            "create_project",
+            json!({
+                "name": "Checkpoint Test Project",
+                "cwd": temp_dir.to_string_lossy().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let project_id = proj["id"].as_str().unwrap().to_string();
+
+        let sess = dispatch_rpc(
+            &ctx,
+            "create_session",
+            json!({
+                "projectId": project_id,
+                "title": "Test Session",
+                "harness": "claude",
+            }),
+        )
+        .await
+        .unwrap();
+        let session_id = sess["id"].as_str().unwrap().to_string();
+
+        let spans = dispatch_rpc(
+            &ctx,
+            "list_trace_spans",
+            json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        assert!(spans.as_array().unwrap().is_empty());
+
+        let cp = dispatch_rpc(
+            &ctx,
+            "create_checkpoint",
+            json!({
+                "sessionId": session_id,
+                "turnNumber": 1,
+                "label": "initial",
+                "cwd": temp_dir.to_string_lossy().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(cp.is_null() || cp.is_object());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_guard_allowlist_and_approvals_headless() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sakana-remote-guard-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = make_test_context(&temp_dir);
+
+        let added = dispatch_rpc(
+            &ctx,
+            "add_allowlist_prefix",
+            json!({ "prefix": "git status" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(added, Value::Null);
+
+        let approvals = dispatch_rpc(&ctx, "list_approvals", json!({}))
+            .await
+            .unwrap();
+        assert!(approvals.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_env_secrets_headless() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sakana-remote-env-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = make_test_context(&temp_dir);
+        let key = format!("SAKANA_TEST_SECRET_{}", Uuid::new_v4().simple());
+
+        let set_res = dispatch_rpc(
+            &ctx,
+            "set_env_secret",
+            json!({ "key": key, "value": "super-secret-value" }),
+        )
+        .await
+        .unwrap();
+        assert!(set_res.is_array());
+
+        let revealed = dispatch_rpc(&ctx, "reveal_env_secret", json!({ "key": key }))
+            .await
+            .unwrap();
+        assert_eq!(revealed, json!("super-secret-value"));
+
+        let del_res = dispatch_rpc(&ctx, "delete_env_secret", json!({ "key": key }))
+            .await
+            .unwrap();
+        assert!(del_res.is_array());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_quota_accounts_headless() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sakana-remote-quota-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ctx = make_test_context(&temp_dir);
+
+        let created = dispatch_rpc(
+            &ctx,
+            "upsert_quota_account",
+            json!({
+                "harness": "claude",
+                "provider": "anthropic",
+                "label": "Test Quota Account",
+                "isDefault": true,
+            }),
+        )
+        .await
+        .unwrap();
+        let arr = created.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let id = arr[0]["id"].as_str().unwrap().to_string();
+
+        let after_delete = dispatch_rpc(&ctx, "delete_quota_account", json!({ "id": id }))
+            .await
+            .unwrap();
+        assert!(after_delete.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { GitBranch, X } from '@phosphor-icons/react';
-import type { HarnessId, HarnessModelOption, Project } from '../types';
+import type { HarnessId, HarnessModelOption, Project, ReasoningEffort } from '../types';
 import { HARNESS_META } from './HarnessBadge';
+
+const VALID_EFFORTS: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
+const EFFORT_LABELS: Record<Exclude<ReasoningEffort, ''>, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'XHigh',
+};
 
 interface NewWorktreeModalProps {
   open: boolean;
@@ -14,6 +22,7 @@ interface NewWorktreeModalProps {
     branch: string;
     harness: HarnessId;
     model?: string;
+    effort?: ReasoningEffort;
     sharedDeps: string[];
   }) => Promise<void> | void;
 }
@@ -30,6 +39,7 @@ export function NewWorktreeModal({
   const [branch, setBranch] = useState('feat/new-agent-task');
   const [harness, setHarness] = useState<HarnessId>('agy-cli');
   const [model, setModel] = useState('');
+  const [effort, setEffort] = useState<ReasoningEffort>('medium');
   const [shareNode, setShareNode] = useState(true);
   const [shareVenv, setShareVenv] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -49,8 +59,9 @@ export function NewWorktreeModal({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, onClose]);
 
+  const hasBackendModels = Boolean(harnessModels?.[harness]?.length);
   const availableModels: HarnessModelOption[] =
-    harnessModels?.[harness]?.length
+    hasBackendModels && harnessModels?.[harness]
       ? harnessModels[harness]
       : (HARNESS_META[harness]?.models ?? []).map((id) => ({
           id,
@@ -59,11 +70,26 @@ export function NewWorktreeModal({
           efforts: [],
         }));
 
+  const currentModelEntry = availableModels.find((m) => m.id === model);
+  const validEfforts: ReasoningEffort[] = hasBackendModels
+    ? (currentModelEntry?.efforts ?? []).filter((e): e is ReasoningEffort =>
+        VALID_EFFORTS.includes(e as ReasoningEffort),
+      )
+    : VALID_EFFORTS;
+
   useEffect(() => {
     if (!availableModels.some((m) => m.id === model)) {
       setModel(availableModels[0]?.id || '');
     }
   }, [harness, availableModels, model]);
+
+  useEffect(() => {
+    if (validEfforts.length === 0) {
+      if (effort !== '') setEffort('');
+    } else if (!validEfforts.includes(effort)) {
+      setEffort(validEfforts.includes('medium') ? 'medium' : validEfforts[0]);
+    }
+  }, [validEfforts, effort]);
 
   useEffect(() => {
     if (!projectId && projects[0]?.id) {
@@ -122,6 +148,7 @@ export function NewWorktreeModal({
                 branch: branch.trim() || 'feat/task',
                 harness,
                 model: model || undefined,
+                effort,
                 sharedDeps: deps,
               });
               setTitle('');
@@ -212,26 +239,51 @@ export function NewWorktreeModal({
             </div>
           </div>
 
-          <div>
-            <label className="block text-[11.5px] font-medium mb-1" style={{ color: 'var(--text-muted)' }}>
-              Model
-            </label>
-            <select
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="w-full rounded-[7px] border px-2.5 py-1.5 font-mono-tech text-[12px]"
-              style={{
-                backgroundColor: 'var(--bg-app)',
-                borderColor: 'var(--border-line)',
-                color: 'var(--text-main)',
-              }}
-            >
-              {availableModels.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
+          <div className={validEfforts.length > 0 ? 'grid grid-cols-2 gap-2.5' : ''}>
+            <div>
+              <label className="block text-[11.5px] font-medium mb-1" style={{ color: 'var(--text-muted)' }}>
+                Model
+              </label>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                className="w-full rounded-[7px] border px-2.5 py-1.5 font-mono-tech text-[12px]"
+                style={{
+                  backgroundColor: 'var(--bg-app)',
+                  borderColor: 'var(--border-line)',
+                  color: 'var(--text-main)',
+                }}
+              >
+                {availableModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {validEfforts.length > 0 && (
+              <div>
+                <label className="block text-[11.5px] font-medium mb-1" style={{ color: 'var(--text-muted)' }}>
+                  Effort
+                </label>
+                <select
+                  value={effort}
+                  onChange={(e) => setEffort(e.target.value as ReasoningEffort)}
+                  className="w-full rounded-[7px] border px-2.5 py-1.5 text-[12px]"
+                  style={{
+                    backgroundColor: 'var(--bg-app)',
+                    borderColor: 'var(--border-line)',
+                    color: 'var(--text-main)',
+                  }}
+                >
+                  {validEfforts.map((ef) => (
+                    <option key={ef} value={ef}>
+                      {ef ? EFFORT_LABELS[ef] : ef}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           <div className="pt-1 space-y-1.5">

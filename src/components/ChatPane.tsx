@@ -31,6 +31,7 @@ import { isTauriRuntime, tauriApi } from '../lib/tauriApi';
 import type {
   AttachedContextChip,
   ChatMessage,
+  HarnessAuthAccount,
   HarnessId,
   InlineWidgetData,
   PermissionMode,
@@ -62,7 +63,7 @@ interface ChatPaneProps {
   onStopStreaming: (threadId: string) => void;
   onUpdateThreadConfig: (
     threadId: string,
-    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'permissionMode'>>,
+    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'permissionMode' | 'account'>>,
   ) => void;
   onResolveApproval: (
     threadId: string,
@@ -80,6 +81,8 @@ interface ChatPaneProps {
   onRemoveQueued: (id: string) => void;
   onOpenCommandPalette?: () => void;
   harnessModels?: Record<string, { id: string; label: string; family: string; efforts: string[] }[]>;
+  harnessAccounts?: HarnessAuthAccount[];
+  onOpenHarnessAccounts?: () => void;
   disabledHarnesses?: HarnessId[];
   onToast: (msg: string) => void;
   skills?: SkillItem[];
@@ -844,6 +847,27 @@ function formatEffortLabel(ef: string): string {
   }
 }
 
+const VALID_EFFORTS: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
+
+function resolveNextEffort(
+  modelEfforts: string[] | undefined,
+  currentEffort: ReasoningEffort,
+): ReasoningEffort | undefined {
+  if (modelEfforts === undefined) {
+    return VALID_EFFORTS.includes(currentEffort) ? undefined : 'medium';
+  }
+  const valid = modelEfforts.filter((e): e is ReasoningEffort =>
+    VALID_EFFORTS.includes(e as ReasoningEffort),
+  );
+  if (valid.length === 0) {
+    return '';
+  }
+  if (!valid.includes(currentEffort)) {
+    return valid.includes('medium') ? 'medium' : valid[0];
+  }
+  return undefined;
+}
+
 interface MessageRowProps {
   m: ChatMessage;
   idx: number;
@@ -1222,6 +1246,8 @@ export function ChatPane({
   onRemoveQueued,
   onOpenCommandPalette,
   harnessModels,
+  harnessAccounts = [],
+  onOpenHarnessAccounts,
   disabledHarnesses = [],
   onToast,
   skills = [],
@@ -1229,7 +1255,7 @@ export function ChatPane({
 }: ChatPaneProps) {
   const [input, setInput] = useState('');
   const [secondaryInput, setSecondaryInput] = useState('');
-  const [openMenu, setOpenMenu] = useState<'harness' | 'model' | 'effort' | 'perm' | null>(null);
+  const [openMenu, setOpenMenu] = useState<'harness' | 'model' | 'effort' | 'perm' | 'account' | null>(null);
   const composerToolbarRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -2018,8 +2044,8 @@ export function ChatPane({
       </div>
 
       {/* Floating Bottom Composer */}
-      <div className="px-4 sm:px-8 pb-3.5 pt-2 shrink-0">
-        <div className="max-w-3xl mx-auto space-y-2">
+      <div className="px-4 sm:px-6 pb-3.5 pt-2 shrink-0">
+        <div className="max-w-4xl mx-auto space-y-2">
           {/* Prompt Queue Strip */}
           {queuedPrompts.length > 0 && (
             <div
@@ -2328,15 +2354,7 @@ export function ChatPane({
                           const nextModels = harnessModels?.[hid];
                           const firstModel = nextModels?.[0];
                           const defaultModel = firstModel?.id || HARNESS_META[hid].models[0];
-                          const validEfforts = (firstModel?.efforts || []).filter(
-                            (e): e is ReasoningEffort => ['low', 'medium', 'high', 'xhigh'].includes(e),
-                          );
-                          const nextEffort: ReasoningEffort | undefined =
-                            validEfforts.length > 0 && !validEfforts.includes(thread.effort)
-                              ? validEfforts.includes('medium')
-                                ? 'medium'
-                                : validEfforts[0]
-                              : undefined;
+                          const nextEffort = resolveNextEffort(firstModel?.efforts, thread.effort);
                           return (
                             <button
                               key={hid}
@@ -2345,10 +2363,14 @@ export function ChatPane({
                               title={isDisabled ? `${HARNESS_META[hid].name} is unavailable` : HARNESS_META[hid].name}
                               onClick={() => {
                                 if (isDisabled) return;
+                                const nextHarnessAccs = harnessAccounts.filter((a) => a.harness === hid);
+                                const nextDefaultAcc =
+                                  nextHarnessAccs.find((a) => a.isDefault) || nextHarnessAccs[0];
                                 onUpdateThreadConfig(thread.id, {
                                   harness: hid,
                                   model: defaultModel,
-                                  ...(nextEffort ? { effort: nextEffort } : {}),
+                                  ...(nextEffort !== undefined ? { effort: nextEffort } : {}),
+                                  ...(nextDefaultAcc ? { account: nextDefaultAcc.id } : {}),
                                 });
                                 setOpenMenu(null);
                               }}
@@ -2404,18 +2426,10 @@ export function ChatPane({
                                 key={mod.id}
                                 type="button"
                                 onClick={() => {
-                                  const validEfforts = (mod.efforts || []).filter(
-                                    (e): e is ReasoningEffort => ['low', 'medium', 'high', 'xhigh'].includes(e),
-                                  );
-                                  const nextEffort: ReasoningEffort | undefined =
-                                    validEfforts.length > 0 && !validEfforts.includes(thread.effort)
-                                      ? validEfforts.includes('medium')
-                                        ? 'medium'
-                                        : validEfforts[0]
-                                      : undefined;
+                                  const nextEffort = resolveNextEffort(mod.efforts, thread.effort);
                                   onUpdateThreadConfig(thread.id, {
                                     model: mod.id,
-                                    ...(nextEffort ? { effort: nextEffort } : {}),
+                                    ...(nextEffort !== undefined ? { effort: nextEffort } : {}),
                                   });
                                   setOpenMenu(null);
                                 }}
@@ -2511,12 +2525,122 @@ export function ChatPane({
                     );
                   })()}
 
-                  {/* Permission / Guard Pill */}
+                  {/* Fast Account Switcher Pill */}
+                  {thread.harness !== 'sakana' && (() => {
+                    const matchingAccounts = harnessAccounts.filter((a) => a.harness === thread.harness);
+                    const activeAcc =
+                      matchingAccounts.find((a) => a.id === thread.account) ||
+                      matchingAccounts.find((a) => a.isDefault) ||
+                      matchingAccounts[0];
+                    const shortLabel = activeAcc
+                      ? activeAcc.label?.trim() ||
+                        (activeAcc.email ? activeAcc.email.split('@')[0] : 'Account')
+                      : 'Account';
+                    return (
+                      <div className="relative shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setOpenMenu((m) => (m === 'account' ? null : 'account'))}
+                          className="h-7 px-1.5 rounded-[7px] text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer hover:bg-[var(--bg-hover)] max-w-[130px]"
+                          style={{ color: 'var(--text-body)' }}
+                          title={
+                            activeAcc
+                              ? `Account: ${activeAcc.label}${activeAcc.email ? ` (${activeAcc.email})` : ''} · ${activeAcc.authenticated ? 'Signed in' : 'Not signed in'}`
+                              : 'Switch account'
+                          }
+                          aria-label="Switch account"
+                        >
+                          <span
+                            className="w-1.5 h-1.5 rounded-full shrink-0"
+                            style={{
+                              backgroundColor: activeAcc?.authenticated
+                                ? 'var(--accent-green)'
+                                : 'var(--accent-yellow)',
+                            }}
+                          />
+                          <User size={11} className="shrink-0" style={{ color: 'var(--text-muted)' }} />
+                          <span className="truncate">{shortLabel}</span>
+                          <CaretDown size={9} className="shrink-0" style={{ color: 'var(--text-muted)' }} />
+                        </button>
+                        {openMenu === 'account' && (
+                          <div className="sakana-popover pop-enter absolute bottom-full left-0 mb-1.5 w-60 rounded-[10px] p-1 z-50 space-y-0.5">
+                            <div className="px-2.5 py-1 text-[10px] font-mono-tech flex items-center justify-between" style={{ color: 'var(--text-muted)' }}>
+                              <span>{HARNESS_META[thread.harness].name} Accounts</span>
+                              <span>{matchingAccounts.length}</span>
+                            </div>
+                            {matchingAccounts.length === 0 ? (
+                              <div className="px-2.5 py-2 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                                No accounts configured.
+                              </div>
+                            ) : (
+                              matchingAccounts.map((acc) => {
+                                const isSelected = activeAcc?.id === acc.id;
+                                return (
+                                  <button
+                                    key={acc.id}
+                                    type="button"
+                                    onClick={() => {
+                                      onUpdateThreadConfig(thread.id, { account: acc.id });
+                                      setOpenMenu(null);
+                                      onToast(
+                                        `Switched to ${acc.email || acc.label}`,
+                                      );
+                                    }}
+                                    className="w-full px-2.5 py-1.5 rounded-[6px] text-left flex items-center justify-between gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+                                    style={{ color: 'var(--text-main)' }}
+                                  >
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center gap-1.5 text-[11.5px] font-medium truncate">
+                                        <span
+                                          className="w-1.5 h-1.5 rounded-full shrink-0"
+                                          style={{
+                                            backgroundColor: acc.authenticated
+                                              ? 'var(--accent-green)'
+                                              : 'var(--accent-yellow)',
+                                          }}
+                                        />
+                                        <span className="truncate">{acc.label}</span>
+                                      </div>
+                                      {acc.email && (
+                                        <div className="text-[10px] font-mono-tech truncate pl-3" style={{ color: 'var(--text-muted)' }}>
+                                          {acc.email}
+                                        </div>
+                                      )}
+                                    </div>
+                                    {isSelected && <Check size={12} weight="bold" className="shrink-0" />}
+                                  </button>
+                                );
+                              })
+                            )}
+                            {onOpenHarnessAccounts && (
+                              <>
+                                <div className="my-0.5 border-t" style={{ borderColor: 'var(--border-line)' }} />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setOpenMenu(null);
+                                    onOpenHarnessAccounts();
+                                  }}
+                                  className="w-full px-2.5 py-1.5 rounded-[6px] text-[11px] font-medium flex items-center gap-1.5 cursor-pointer hover:bg-[var(--bg-hover)]"
+                                  style={{ color: 'var(--accent-blue)' }}
+                                >
+                                  <Plus size={11} weight="bold" />
+                                  <span>Manage / Sign in accounts…</span>
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {/* Permission / Guard Pill (Icon-only) */}
                   <div className="relative shrink-0">
                     <button
                       type="button"
                       onClick={() => setOpenMenu((m) => (m === 'perm' ? null : 'perm'))}
-                      className="h-7 px-1.5 rounded-[7px] text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer hover:bg-[var(--bg-hover)] whitespace-nowrap"
+                      className="w-7 h-7 rounded-[7px] inline-flex items-center justify-center cursor-pointer hover:bg-[var(--bg-hover)]"
                       style={{
                         color:
                           thread.permissionMode === 'yolo'
@@ -2528,8 +2652,7 @@ export function ChatPane({
                       title={`Permission: ${permLabel[thread.permissionMode]}`}
                       aria-label={`Permission mode: ${permLabel[thread.permissionMode]}`}
                     >
-                      <ShieldCheck size={13} />
-                      <span className="hidden xl:inline">{permLabel[thread.permissionMode]}</span>
+                      <ShieldCheck size={14} weight={thread.permissionMode === 'supervised' ? 'regular' : 'fill'} />
                     </button>
                     {openMenu === 'perm' && (
                       <div className="sakana-popover pop-enter absolute bottom-full left-0 mb-1.5 w-44 rounded-[10px] p-1 z-50 space-y-0.5">

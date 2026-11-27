@@ -8,15 +8,19 @@ import type {
   DiscordStatus,
   DiscordUserRule,
   EnvSecret,
+  HarnessAuthAccount,
   HarnessId,
   HarnessModelOption,
   InspectorTab,
   McpServer,
+  Office,
+  OfficeDelegationEdge,
   PendingApproval,
   PrimarySection,
   Project,
   QueuedPrompt,
   QuotaAccount,
+  ReasoningEffort,
   RemoteHost,
   RemoteStatus,
   SkillItem,
@@ -31,12 +35,14 @@ import { Sidebar } from './components/Sidebar';
 import { ChatPane } from './components/ChatPane';
 import { RightInspector } from './components/RightInspector';
 import { DashboardView } from './components/DashboardView';
+import { OfficeView } from './components/OfficeView';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { CommandPalette } from './components/CommandPalette';
 import { CreatePrModal } from './components/CreatePrModal';
+import { GitHubCloneModal } from './components/GitHubCloneModal';
 import { NewWorktreeModal } from './components/NewWorktreeModal';
 import { HARNESS_META } from './components/HarnessBadge';
-import { isTauriRuntime, setActiveHost, tauriApi } from './lib/tauriApi';
+import { getActiveHost, isTauriRuntime, setActiveHost, tauriApi } from './lib/tauriApi';
 
 function formatNowTime(): string {
   const d = new Date();
@@ -145,6 +151,7 @@ export default function App() {
   const [selectedThreadId, setSelectedThreadId] = useState<string>('');
   const [secondaryThreadId, setSecondaryThreadId] = useState<string>('');
   const [harnessModels, setHarnessModels] = useState<Record<string, HarnessModelOption[]>>({});
+  const [harnessAccounts, setHarnessAccounts] = useState<HarnessAuthAccount[]>([]);
   const [refreshingModels, setRefreshingModels] = useState(false);
   const [disabledHarnesses, setDisabledHarnesses] = useState<HarnessId[]>(() => {
     if (typeof window === 'undefined') return [];
@@ -183,10 +190,17 @@ export default function App() {
   const [remoteHosts, setRemoteHosts] = useState<RemoteHost[]>([]);
   const [activeHostId, setActiveHostId] = useState<string>('local');
 
+  // Office state
+  const [offices, setOffices] = useState<Office[]>([]);
+  const [selectedOfficeId, setSelectedOfficeId] = useState<string>('');
+  const [officeDelegations, setOfficeDelegations] = useState<OfficeDelegationEdge[]>([]);
+  const [createOfficeOpen, setCreateOfficeOpen] = useState(false);
+
   // Modals & Toast
   const [cmdOpen, setCmdOpen] = useState(false);
   const [prOpen, setPrOpen] = useState(false);
   const [newWtOpen, setNewWtOpen] = useState(false);
+  const [ghCloneOpen, setGhCloneOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [availableUpdate, setAvailableUpdate] = useState<{
     currentVersion: string;
@@ -275,6 +289,22 @@ export default function App() {
     }
   }, []);
 
+  const refreshHarnessAccounts = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const accs = await tauriApi.listHarnessAccounts();
+      setHarnessAccounts(accs);
+    } catch (err) {
+      console.error('list_harness_accounts failed:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (primarySection === 'chat') {
+      void refreshHarnessAccounts();
+    }
+  }, [primarySection, refreshHarnessAccounts]);
+
   const refreshRemoteHosts = useCallback(async () => {
     if (!isTauriRuntime()) return;
     try {
@@ -285,6 +315,23 @@ export default function App() {
     }
   }, []);
 
+  const refreshOffices = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const list = await tauriApi.listOffices();
+      setOffices(list);
+      setSelectedOfficeId((prev) =>
+        list.some((o) => o.id === prev) ? prev : list[0]?.id || '',
+      );
+    } catch (err) {
+      console.error('list_offices failed:', err);
+      setOffices([]);
+      if (getActiveHost() !== 'local') {
+        showToast(`Failed to load remote offices: ${String(err)}`);
+      }
+    }
+  }, []);
+
   const handleSwitchHost = useCallback(
     async (nextHostId: string) => {
       const target = nextHostId || 'local';
@@ -292,6 +339,9 @@ export default function App() {
       setActiveHostId(target);
       setDiffs([]);
       setFiles([]);
+      setOffices([]);
+      setSelectedOfficeId('');
+      setOfficeDelegations([]);
       if (isTauriRuntime()) {
         try {
           if (target === 'local') {
@@ -304,6 +354,8 @@ export default function App() {
         }
       }
       await bootstrapActiveHost();
+      await refreshOffices();
+      void refreshQuotasRef.current(true);
       try {
         const models = await tauriApi.listHarnessModels();
         if (models && Object.keys(models).length > 0) {
@@ -318,14 +370,39 @@ export default function App() {
           : remoteHosts.find((h) => h.id === target)?.name || 'Remote Host';
       showToast(`Switched host: ${label}`);
     },
-    [bootstrapActiveHost, remoteHosts],
+    [bootstrapActiveHost, refreshOffices, remoteHosts],
   );
 
   // Bootstrap from Tauri SQLite backend when running inside Tauri v2
   useEffect(() => {
     void bootstrapActiveHost();
     void refreshRemoteHosts();
-  }, [bootstrapActiveHost, refreshRemoteHosts]);
+    void refreshOffices();
+    void refreshQuotasRef.current(true);
+  }, [bootstrapActiveHost, refreshRemoteHosts, refreshOffices]);
+
+  // Auto-poll usage limits periodically and when window regains focus
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshQuotasRef.current(true);
+      }
+    }, 60_000);
+    const onFocus = () => void refreshQuotasRef.current(false);
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshQuotasRef.current(false);
+      }
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
 
   const refreshHarnessModels = useCallback(async (refresh = false) => {
     setRefreshingModels(true);
@@ -474,7 +551,7 @@ export default function App() {
         const nextDiffs =
           scope && scope !== 'all'
             ? await tauriApi.getCheckpointDiff(activeThread.id, scope)
-            : await tauriApi.getGitDiffs(effectiveCwd);
+            : await tauriApi.getGitDiffs(effectiveCwd, undefined, activeProject?.wslDistro);
         if (nextDiffs) {
           setDiffs(nextDiffs);
         }
@@ -482,7 +559,7 @@ export default function App() {
         console.error('Failed to load git diffs:', err);
       }
     },
-    [activeThread.id, effectiveCwd, turnScopeFilter],
+    [activeThread.id, effectiveCwd, turnScopeFilter, activeProject?.wslDistro],
   );
 
   const refreshTelemetry = useCallback(async () => {
@@ -495,8 +572,12 @@ export default function App() {
     }
   }, []);
 
-  const refreshQuotas = useCallback(async () => {
+  const lastQuotaRefreshRef = useRef<number>(0);
+  const refreshQuotas = useCallback(async (force = false) => {
     if (!isTauriRuntime()) return;
+    const now = Date.now();
+    if (!force && now - lastQuotaRefreshRef.current < 8000) return;
+    lastQuotaRefreshRef.current = now;
     try {
       const next = await tauriApi.listQuotaAccounts();
       if (next) setQuotas(next);
@@ -504,6 +585,9 @@ export default function App() {
       console.error('list_quota_accounts failed:', err);
     }
   }, []);
+
+  const refreshQuotasRef = useRef(refreshQuotas);
+  refreshQuotasRef.current = refreshQuotas;
 
   const refreshMcp = useCallback(async () => {
     if (!isTauriRuntime()) return;
@@ -913,6 +997,9 @@ export default function App() {
               .catch(() => {});
           }
 
+          // Refresh usage limits automatically after a turn finishes
+          window.setTimeout(() => void refreshQuotasRef.current(true), 1500);
+
           // Auto-dispatch next queued prompt for this thread
           setQueues((prevQ) => {
             const q = prevQ[sessionId] || [];
@@ -992,6 +1079,30 @@ export default function App() {
               };
             }),
           );
+        }),
+        tauriApi.onOfficeUpdated((updated) => {
+          setOffices((prev) => {
+            const exists = prev.some((o) => o.id === updated.id);
+            return exists
+              ? prev.map((o) => (o.id === updated.id ? updated : o))
+              : [updated, ...prev];
+          });
+          setSelectedOfficeId((prev) => prev || updated.id);
+        }),
+        tauriApi.onOfficeEvent((evt) => {
+          setOffices((prev) =>
+            prev.map((o) => {
+              if (o.id !== evt.officeId) return o;
+              const exists = o.events.some((e) => e.id === evt.id);
+              return exists ? o : { ...o, events: [...o.events, evt] };
+            }),
+          );
+        }),
+        tauriApi.onOfficeDelegation(({ officeId, edges }) => {
+          setOfficeDelegations((prev) => [
+            ...prev.filter((e) => e.officeId !== officeId),
+            ...edges,
+          ]);
         }),
       ]);
 
@@ -1088,13 +1199,28 @@ export default function App() {
     branch: string;
     harness: HarnessId;
     model?: string;
+    effort?: ReasoningEffort;
     sharedDeps: string[];
   }) => {
     const defaultModel =
       opts.model ||
       harnessModels[opts.harness]?.[0]?.id ||
       HARNESS_META[opts.harness]?.models[0] ||
-      'gemini-4-argon';
+      'gemini-4-hydrogen';
+    const modelEntry = harnessModels[opts.harness]?.find((m) => m.id === defaultModel);
+    const validEfforts = modelEntry
+      ? modelEntry.efforts.filter((e): e is ReasoningEffort =>
+          ['low', 'medium', 'high', 'xhigh'].includes(e),
+        )
+      : (['low', 'medium', 'high', 'xhigh'] as ReasoningEffort[]);
+    const defaultEffort: ReasoningEffort =
+      opts.effort !== undefined
+        ? opts.effort
+        : validEfforts.length === 0
+          ? ''
+          : validEfforts.includes('medium')
+            ? 'medium'
+            : validEfforts[0];
     const fallbackWtPath = `.sakana/worktrees/${opts.branch.replace(/[^a-z0-9-]/gi, '-')}`;
     const project = projects.find((p) => p.id === opts.projectId);
 
@@ -1104,7 +1230,7 @@ export default function App() {
       branch: opts.branch,
       harness: opts.harness,
       model: defaultModel,
-      effort: 'medium',
+      effort: defaultEffort,
       account: 'default',
       permissionMode: 'auto-edit',
       worktreePath: fallbackWtPath,
@@ -1137,7 +1263,7 @@ export default function App() {
           status: 'IDLE',
           harness: opts.harness,
           model: defaultModel,
-          effort: 'medium',
+          effort: defaultEffort,
           account: 'default',
           permissionMode: 'auto-edit',
           worktreePath: actualWorktreePath,
@@ -1168,7 +1294,21 @@ export default function App() {
       (activeThread.id !== 'empty' && activeThread.model) ||
       harnessModels[harness]?.[0]?.id ||
       HARNESS_META[harness]?.models[0] ||
-      'gemini-4-argon';
+      'gemini-4-hydrogen';
+    const modelEntry = harnessModels[harness]?.find((m) => m.id === defaultModel);
+    const validEfforts = modelEntry
+      ? modelEntry.efforts.filter((e): e is ReasoningEffort =>
+          ['low', 'medium', 'high', 'xhigh'].includes(e),
+        )
+      : (['low', 'medium', 'high', 'xhigh'] as ReasoningEffort[]);
+    const defaultEffort: ReasoningEffort =
+      activeThread.id !== 'empty'
+        ? activeThread.effort
+        : validEfforts.length === 0
+          ? ''
+          : validEfforts.includes('medium')
+            ? 'medium'
+            : validEfforts[0];
     const branch = activeThread.id !== 'empty' && activeThread.branch ? activeThread.branch : 'main';
     const title = `New thread`;
 
@@ -1179,7 +1319,7 @@ export default function App() {
         branch,
         harness,
         model: defaultModel,
-        effort: activeThread.id !== 'empty' ? activeThread.effort : 'medium',
+        effort: defaultEffort,
         account: 'default',
         permissionMode: activeThread.id !== 'empty' ? activeThread.permissionMode : 'auto-edit',
         worktreePath: targetProject.cwd,
@@ -1193,7 +1333,7 @@ export default function App() {
         status: 'IDLE',
         harness,
         model: defaultModel,
-        effort: 'medium',
+        effort: defaultEffort,
         account: 'default',
         permissionMode: 'auto-edit',
         worktreePath: targetProject.cwd,
@@ -1246,12 +1386,98 @@ export default function App() {
 
   const handleUpdateThreadConfig = (
     id: string,
-    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'permissionMode'>>,
+    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'permissionMode' | 'account'>>,
   ) => {
     setThreads((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
     void tauriApi.updateSession({ id, ...patch }).catch((err) => {
       console.error('update_session failed:', err);
     });
+  };
+
+  const handleRenameThread = async (id: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    setThreads((prev) => prev.map((t) => (t.id === id ? { ...t, title: trimmed } : t)));
+    try {
+      await tauriApi.updateSession({ id, title: trimmed });
+      showToast('Renamed thread');
+    } catch (err) {
+      showToast(`Failed to rename thread: ${String(err)}`);
+    }
+  };
+
+  const handleMoveThread = async (id: string, projectId: string) => {
+    const targetProject = projects.find((p) => p.id === projectId);
+    setThreads((prev) => prev.map((t) => (t.id === id ? { ...t, projectId } : t)));
+    try {
+      await tauriApi.updateSession({ id, projectId });
+      showToast(targetProject ? `Moved thread to ${targetProject.name}` : 'Moved thread');
+    } catch (err) {
+      showToast(`Failed to move thread: ${String(err)}`);
+    }
+  };
+
+  const handleRenameProject = async (id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, name: trimmed } : p)));
+    try {
+      await tauriApi.renameProject(id, trimmed);
+      showToast(`Renamed project to "${trimmed}"`);
+    } catch (err) {
+      showToast(`Failed to rename project: ${String(err)}`);
+    }
+  };
+
+  const handleReorderProjects = async (orderedIds: string[]) => {
+    setProjects((prev) => {
+      const byId = new Map(prev.map((p) => [p.id, p]));
+      const next: Project[] = [];
+      for (const id of orderedIds) {
+        const p = byId.get(id);
+        if (p) {
+          next.push(p);
+          byId.delete(id);
+        }
+      }
+      for (const p of byId.values()) next.push(p);
+      return next;
+    });
+    try {
+      await tauriApi.reorderProjects(orderedIds);
+    } catch (err) {
+      showToast(`Failed to reorder projects: ${String(err)}`);
+    }
+  };
+
+  const handleReorderThreads = async (
+    orderedIds: string[],
+    moved?: { id: string; projectId: string },
+  ) => {
+    setThreads((prev) => {
+      const updated = moved
+        ? prev.map((t) => (t.id === moved.id ? { ...t, projectId: moved.projectId } : t))
+        : prev;
+      const byId = new Map(updated.map((t) => [t.id, t]));
+      const next: Thread[] = [];
+      for (const id of orderedIds) {
+        const t = byId.get(id);
+        if (t) {
+          next.push(t);
+          byId.delete(id);
+        }
+      }
+      for (const t of byId.values()) next.push(t);
+      return next;
+    });
+    try {
+      if (moved) {
+        await tauriApi.updateSession({ id: moved.id, projectId: moved.projectId });
+      }
+      await tauriApi.reorderSessions(orderedIds);
+    } catch (err) {
+      showToast(`Failed to reorder threads: ${String(err)}`);
+    }
   };
 
   return (
@@ -1275,14 +1501,20 @@ export default function App() {
         onNewWorktreeThread={() => setNewWtOpen(true)}
         onCreateProject={handleCreateProject}
         onDeleteProject={handleDeleteProject}
+        onRenameProject={handleRenameProject}
+        onReorderProjects={handleReorderProjects}
         onDeleteThread={handleDeleteThread}
+        onRenameThread={handleRenameThread}
+        onMoveThread={handleMoveThread}
+        onReorderThreads={handleReorderThreads}
+        onOpenGitHubClone={() => setGhCloneOpen(true)}
         dashSubtab={dashSubtab}
         onSelectDashSubtab={(tab) => {
           setDashSubtab(tab);
           setPrimarySection('dashboard');
         }}
         quotas={quotas}
-        onRefreshQuotas={() => void refreshQuotas()}
+        onRefreshQuotas={() => void refreshQuotas(true)}
         pendingApprovalCount={pendingApprovalCount}
         remoteHosts={remoteHosts}
         activeHostId={activeHostId}
@@ -1290,6 +1522,34 @@ export default function App() {
         onManageHosts={() => {
           setDashSubtab('remote');
           setPrimarySection('dashboard');
+        }}
+        offices={offices}
+        selectedOfficeId={selectedOfficeId}
+        onSelectOffice={(id) => {
+          setSelectedOfficeId(id);
+          setPrimarySection('office');
+        }}
+        onNewOffice={() => {
+          setPrimarySection('office');
+          setCreateOfficeOpen(true);
+        }}
+        onDeleteOffice={async (id) => {
+          try {
+            if (isTauriRuntime()) {
+              await tauriApi.deleteOffice(id);
+            }
+            setOffices((prev) => {
+              const remaining = prev.filter((o) => o.id !== id);
+              if (selectedOfficeId === id) {
+                setSelectedOfficeId(remaining[0]?.id || '');
+              }
+              return remaining;
+            });
+            setOfficeDelegations((prev) => prev.filter((d) => d.officeId !== id));
+            showToast('Deleted office');
+          } catch (err) {
+            showToast(`Failed to delete office: ${String(err)}`);
+          }
         }}
       />
       </ErrorBoundary>
@@ -1499,6 +1759,11 @@ export default function App() {
             }
             onOpenCommandPalette={() => setCmdOpen(true)}
             harnessModels={harnessModels}
+            harnessAccounts={harnessAccounts}
+            onOpenHarnessAccounts={() => {
+              setDashSubtab('harnesses');
+              setPrimarySection('dashboard');
+            }}
             disabledHarnesses={disabledHarnesses}
             onToast={showToast}
           />
@@ -1553,7 +1818,7 @@ export default function App() {
             onToggleStageHunk={async (filePath, hunkId, hunkHeader, nextStaged) => {
               if (isTauriRuntime()) {
                 try {
-                  await tauriApi.stageHunk(effectiveCwd, filePath, hunkHeader, nextStaged);
+                  await tauriApi.stageHunk(effectiveCwd, filePath, hunkHeader, nextStaged, activeProject?.wslDistro);
                   await refreshDiffs(turnScopeFilter);
                   return;
                 } catch (err) {
@@ -1577,7 +1842,7 @@ export default function App() {
             onDiscardHunk={async (filePath, hunkId, hunkHeader) => {
               if (isTauriRuntime()) {
                 try {
-                  await tauriApi.discardHunk(effectiveCwd, filePath, hunkHeader);
+                  await tauriApi.discardHunk(effectiveCwd, filePath, hunkHeader, activeProject?.wslDistro);
                   await refreshDiffs(turnScopeFilter);
                   showToast(`Discarded hunk in ${filePath}`);
                   return;
@@ -1613,7 +1878,7 @@ export default function App() {
             files={files}
             onSaveFile={async (path, content) => {
               if (isTauriRuntime()) {
-                await tauriApi.writeWorkspaceFile(effectiveCwd, path, content);
+                await tauriApi.writeWorkspaceFile(effectiveCwd, path, content, activeProject?.wslDistro);
               } else {
                 setFiles((prev) =>
                   prev.map((f) => (f.path === path ? { ...f, lines: content.split('\n') } : f)),
@@ -1630,10 +1895,36 @@ export default function App() {
           />
           </ErrorBoundary>
         </>
+      ) : primarySection === 'office' ? (
+        <ErrorBoundary paneName="Office">
+          <OfficeView
+            offices={offices}
+            selectedOffice={
+              offices.find((o) => o.id === selectedOfficeId) ?? offices[0] ?? null
+            }
+            projects={projects}
+            harnessModels={harnessModels}
+            delegations={officeDelegations.filter(
+              (d) =>
+                d.officeId ===
+                (offices.find((o) => o.id === selectedOfficeId)?.id ??
+                  offices[0]?.id ??
+                  ''),
+            )}
+            onSelectOffice={(id: string) => setSelectedOfficeId(id)}
+            onRefreshOffices={refreshOffices}
+            onToast={showToast}
+            createModalOpen={createOfficeOpen}
+            onSetCreateModalOpen={setCreateOfficeOpen}
+            sidebarOpen={leftOpen}
+            onToggleSidebar={() => setLeftOpen((v) => !v)}
+          />
+        </ErrorBoundary>
       ) : (
         <ErrorBoundary paneName="Dashboard">
           <DashboardView
             subtab={dashSubtab}
+            harnessModels={harnessModels}
           theme={theme}
           onSetTheme={handleSetTheme}
           leftSidebarOpen={leftOpen}
@@ -1665,7 +1956,7 @@ export default function App() {
             showToast(`OS auto-start ${enabled ? 'enabled' : 'disabled'}`);
           }}
           quotas={quotas}
-          onRefreshQuotas={() => void refreshQuotas()}
+          onRefreshQuotas={() => void refreshQuotas(true)}
           mcpServers={mcpServers}
           onRefreshMcp={() => void refreshMcp()}
           onAddMcp={async (name, transport, endpoint) => {
@@ -2022,6 +2313,7 @@ export default function App() {
           onToggleHarness={handleToggleHarness}
           onRefreshModels={() => refreshHarnessModels(true)}
           refreshingModels={refreshingModels}
+          onOpenGitHubClone={() => setGhCloneOpen(true)}
         />
         </ErrorBoundary>
       )}
@@ -2066,7 +2358,7 @@ export default function App() {
         thread={activeThread}
         onSubmit={async ({ title, body, baseBranch }) => {
           if (isTauriRuntime()) {
-            const url = await tauriApi.createPr(effectiveCwd, title, body, baseBranch);
+            const url = await tauriApi.createPr(effectiveCwd, title, body, baseBranch, activeProject?.wslDistro);
             showToast(url ? `PR created: ${url}` : `Opened PR: ${title}`);
           } else {
             showToast(`Opened PR: ${title}`);
@@ -2080,6 +2372,13 @@ export default function App() {
         projects={projects}
         harnessModels={harnessModels}
         onCreate={handleCreateWorktree}
+      />
+
+      <GitHubCloneModal
+        open={ghCloneOpen}
+        onClose={() => setGhCloneOpen(false)}
+        onClonedProject={handleCreateProject}
+        onToast={showToast}
       />
 
       {/* Auto-Update Banner */}

@@ -264,7 +264,7 @@ async fn run_automation_prompt(
 
 pub async fn trigger_webhook_by_path(
     db: Arc<Mutex<Database>>,
-    app: AppHandle,
+    app: Option<AppHandle>,
     path: &str,
     payload: Option<String>,
 ) -> Result<Vec<String>, String> {
@@ -313,7 +313,7 @@ pub async fn trigger_webhook_by_path(
                 .map_err(|e| e.to_string())?
         };
         if let Some(item) = updated {
-            let _ = app.emit("automation-run", &item);
+            crate::platform::emit_app_and_remote(app.as_ref(), "automation-run", &item);
         }
         triggered.push(auto.id);
     }

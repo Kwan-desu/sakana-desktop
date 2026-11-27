@@ -1,7 +1,8 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
 use tauri::{AppHandle, State};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -175,10 +176,9 @@ pub fn evaluate_command(config: &GuardConfig, command: &str) -> GuardDecision {
     }
 }
 
-#[tauri::command]
-pub async fn request_approval(
-    app: AppHandle,
-    state: State<'_, DbState>,
+pub async fn request_approval_inner(
+    app: Option<&AppHandle>,
+    db: &Arc<Mutex<Database>>,
     session_id: String,
     command: String,
     cwd: String,
@@ -196,7 +196,7 @@ pub async fn request_approval(
     };
 
     {
-        let db = state.0.lock().await;
+        let db = db.lock().await;
         db.insert_approval(&session_id, &approval)
             .map_err(|e| e.to_string())?;
         db.update_session_status(&session_id, "AWAITING_APPROVAL", None)
@@ -204,7 +204,7 @@ pub async fn request_approval(
     }
 
     crate::platform::emit_app_and_remote(
-        Some(&app),
+        app,
         "guard:approval",
         GuardApprovalEvent {
             session_id,
@@ -213,6 +213,30 @@ pub async fn request_approval(
     );
 
     Ok(approval)
+}
+
+#[tauri::command]
+pub async fn request_approval(
+    app: AppHandle,
+    state: State<'_, DbState>,
+    session_id: String,
+    command: String,
+    cwd: String,
+    reason: String,
+    risk: String,
+    requested_by: String,
+) -> Result<PendingApproval, String> {
+    request_approval_inner(
+        Some(&app),
+        &state.0,
+        session_id,
+        command,
+        cwd,
+        reason,
+        risk,
+        requested_by,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -245,14 +269,21 @@ pub async fn resolve_approval(
     Ok(())
 }
 
+pub async fn list_approvals_inner(
+    db: &Arc<Mutex<Database>>,
+    session_id: Option<String>,
+) -> Result<Vec<PendingApproval>, String> {
+    let db = db.lock().await;
+    db.list_approvals(session_id.as_deref())
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn list_approvals(
     state: State<'_, DbState>,
     session_id: Option<String>,
 ) -> Result<Vec<PendingApproval>, String> {
-    let db = state.0.lock().await;
-    db.list_approvals(session_id.as_deref())
-        .map_err(|e| e.to_string())
+    list_approvals_inner(&state.0, session_id).await
 }
 
 #[tauri::command]
@@ -268,16 +299,15 @@ pub async fn set_guard_mode(state: State<'_, DbState>, mode: String) -> Result<(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub async fn add_allowlist_prefix(
-    state: State<'_, DbState>,
+pub async fn add_allowlist_prefix_inner(
+    db: &Arc<Mutex<Database>>,
     prefix: String,
 ) -> Result<(), String> {
     let trimmed = prefix.trim().to_string();
     if trimmed.is_empty() {
         return Err("Allowlist prefix cannot be empty".to_string());
     }
-    let db = state.0.lock().await;
+    let db = db.lock().await;
     let mut config = load_guard_config(&db).map_err(|e| e.to_string())?;
     if !config.allowlist_prefixes.iter().any(|p| p == &trimmed) {
         config.allowlist_prefixes.push(trimmed);
@@ -287,6 +317,14 @@ pub async fn add_allowlist_prefix(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn add_allowlist_prefix(
+    state: State<'_, DbState>,
+    prefix: String,
+) -> Result<(), String> {
+    add_allowlist_prefix_inner(&state.0, prefix).await
 }
 
 #[tauri::command]

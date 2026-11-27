@@ -2,16 +2,52 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::State;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::db::Database;
 use crate::models::{DiffFile, DiffHunk, DiffLine, TraceSpan, TurnCheckpoint, WorkspaceFile};
 use crate::DbState;
 
 const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+async fn resolve_effective_cwd(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: &str,
+    wsl_distro: Option<&str>,
+) -> String {
+    if let Some(distro) = wsl_distro.map(str::trim).filter(|s| !s.is_empty()) {
+        return crate::platform::encode_wsl_path(Some(distro), cwd);
+    }
+    if crate::platform::parse_wsl_path(cwd).is_some() {
+        return cwd.to_string();
+    }
+    let db = db_arc.lock().await;
+    if let Ok(projects) = db.list_projects() {
+        if let Some(proj) = projects.into_iter().find(|p| p.cwd == cwd) {
+            return crate::platform::encode_wsl_path(proj.wsl_distro.as_deref(), cwd);
+        }
+    }
+    cwd.to_string()
+}
+
+async fn resolve_session_wsl_distro(
+    db_arc: &Arc<Mutex<Database>>,
+    session_id: &str,
+) -> Option<String> {
+    let db = db_arc.lock().await;
+    db.get_session(session_id)
+        .ok()
+        .flatten()
+        .and_then(|s| db.get_project(&s.project_id).ok().flatten())
+        .and_then(|p| p.wsl_distro)
+}
 
 fn resolve_fs_root(cwd: &str) -> PathBuf {
     if let Some((distro, linux_path)) = crate::platform::parse_wsl_path(cwd) {
@@ -131,28 +167,40 @@ fn link_shared_dep(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn create_worktree(
+pub async fn create_worktree_inner(
+    db_arc: &Arc<Mutex<Database>>,
     session_id: String,
     project_cwd: String,
     branch: String,
     shared_deps: Vec<String>,
 ) -> Result<String, String> {
-    let wt_dir = Path::new(&project_cwd)
-        .join(".sakana")
-        .join("worktrees")
-        .join(&session_id);
+    let wsl_distro = resolve_session_wsl_distro(db_arc, &session_id).await;
+    let effective_cwd = resolve_effective_cwd(db_arc, &project_cwd, wsl_distro.as_deref()).await;
+    let fs_root = resolve_fs_root(&effective_cwd);
+    let wt_dir = fs_root.join(".sakana").join("worktrees").join(&session_id);
 
     if let Some(parent) = wt_dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create worktree directory: {}", e))?;
     }
 
-    let wt_str = wt_dir.to_string_lossy().to_string();
+    let git_wt_arg = if let Some((_, linux_path)) = crate::platform::parse_wsl_path(&effective_cwd) {
+        format!(
+            "{}/.sakana/worktrees/{}",
+            linux_path.trim_end_matches('/'),
+            session_id
+        )
+    } else {
+        wt_dir.to_string_lossy().to_string()
+    };
+
     if !wt_dir.exists() {
-        let add_existing = run_git(&project_cwd, &["worktree", "add", &wt_str, &branch]);
+        let add_existing = run_git(&effective_cwd, &["worktree", "add", &git_wt_arg, &branch]);
         if add_existing.is_err() {
-            run_git(&project_cwd, &["worktree", "add", "-b", &branch, &wt_str])?;
+            run_git(
+                &effective_cwd,
+                &["worktree", "add", "-b", &branch, &git_wt_arg],
+            )?;
         }
     }
 
@@ -161,30 +209,66 @@ pub async fn create_worktree(
         if trimmed.is_empty() {
             continue;
         }
-        let src = Path::new(&project_cwd).join(trimmed);
+        let src = fs_root.join(trimmed);
         let dst = wt_dir.join(trimmed);
         link_shared_dep(&src, &dst)?;
     }
 
-    Ok(wt_str)
+    Ok(git_wt_arg)
 }
 
 #[tauri::command]
-pub async fn remove_worktree(session_id: String, project_cwd: String) -> Result<(), String> {
-    let wt_dir = Path::new(&project_cwd)
-        .join(".sakana")
-        .join("worktrees")
-        .join(&session_id);
-    let wt_str = wt_dir.to_string_lossy().to_string();
+pub async fn create_worktree(
+    state: State<'_, DbState>,
+    session_id: String,
+    project_cwd: String,
+    branch: String,
+    shared_deps: Vec<String>,
+) -> Result<String, String> {
+    create_worktree_inner(&state.0, session_id, project_cwd, branch, shared_deps).await
+}
 
-    let _ = run_git(&project_cwd, &["worktree", "remove", "--force", &wt_str]);
-    let _ = run_git(&project_cwd, &["worktree", "prune"]);
+pub async fn remove_worktree_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    session_id: String,
+    project_cwd: String,
+) -> Result<(), String> {
+    let wsl_distro = resolve_session_wsl_distro(db_arc, &session_id).await;
+    let effective_cwd = resolve_effective_cwd(db_arc, &project_cwd, wsl_distro.as_deref()).await;
+    let fs_root = resolve_fs_root(&effective_cwd);
+    let wt_dir = fs_root.join(".sakana").join("worktrees").join(&session_id);
+    let git_wt_arg = if let Some((_, linux_path)) = crate::platform::parse_wsl_path(&effective_cwd) {
+        format!(
+            "{}/.sakana/worktrees/{}",
+            linux_path.trim_end_matches('/'),
+            session_id
+        )
+    } else {
+        wt_dir.to_string_lossy().to_string()
+    };
+
+    let _ = run_git(&effective_cwd, &["worktree", "remove", "--force", &git_wt_arg]);
+    let _ = run_git(&effective_cwd, &["worktree", "prune"]);
 
     if wt_dir.exists() {
-        std::fs::remove_dir_all(&wt_dir)
-            .map_err(|e| format!("Failed to remove worktree directory {}: {}", wt_str, e))?;
+        std::fs::remove_dir_all(&wt_dir).map_err(|e| {
+            format!(
+                "Failed to remove worktree directory {}: {}",
+                wt_dir.display(),
+                e
+            )
+        })?;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_worktree(
+    state: State<'_, DbState>,
+    session_id: String,
+    project_cwd: String,
+) -> Result<(), String> {
+    remove_worktree_inner(&state.0, session_id, project_cwd).await
 }
 
 fn is_git_repo(cwd: &str) -> bool {
@@ -201,8 +285,12 @@ fn ensure_git_repo(cwd: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn list_branches(cwd: String) -> Result<Vec<String>, String> {
+pub async fn list_branches_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<Vec<String>, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     let out = run_git(&cwd, &["branch", "--format=%(refname:short)"])?;
     let branches: Vec<String> = out
@@ -215,25 +303,75 @@ pub async fn list_branches(cwd: String) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-pub async fn checkout_branch(cwd: String, branch: String) -> Result<(), String> {
+pub async fn list_branches(
+    state: State<'_, DbState>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<Vec<String>, String> {
+    list_branches_inner(&state.0, cwd, wsl_distro).await
+}
+
+pub async fn checkout_branch_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    branch: String,
+    wsl_distro: Option<String>,
+) -> Result<(), String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     run_git(&cwd, &["checkout", &branch])?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn git_pull(cwd: String) -> Result<String, String> {
+pub async fn checkout_branch(
+    state: State<'_, DbState>,
+    cwd: String,
+    branch: String,
+    wsl_distro: Option<String>,
+) -> Result<(), String> {
+    checkout_branch_inner(&state.0, cwd, branch, wsl_distro).await
+}
+
+pub async fn git_pull_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     run_git(&cwd, &["pull"])
 }
 
 #[tauri::command]
-pub async fn git_push(cwd: String) -> Result<String, String> {
+pub async fn git_pull(
+    state: State<'_, DbState>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    git_pull_inner(&state.0, cwd, wsl_distro).await
+}
+
+pub async fn git_push_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     match run_git(&cwd, &["push"]) {
         Ok(out) => Ok(out),
         Err(_) => run_git(&cwd, &["push", "-u", "origin", "HEAD"]),
     }
+}
+
+#[tauri::command]
+pub async fn git_push(
+    state: State<'_, DbState>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    git_push_inner(&state.0, cwd, wsl_distro).await
 }
 
 fn resolve_git_dir(cwd: &str) -> Result<PathBuf, String> {
@@ -452,14 +590,15 @@ fn extract_single_hunk_patch(raw_diff: &str, file_path: &str, hunk_header: &str)
     Some(patch)
 }
 
-#[tauri::command]
-pub async fn create_checkpoint(
-    state: State<'_, DbState>,
+pub async fn create_checkpoint_inner(
+    db_arc: &Arc<Mutex<Database>>,
     session_id: String,
     turn_number: i64,
     label: String,
     cwd: String,
 ) -> Result<Option<TurnCheckpoint>, String> {
+    let wsl_distro = resolve_session_wsl_distro(db_arc, &session_id).await;
+    let cwd = crate::platform::encode_wsl_path(wsl_distro.as_deref(), &cwd);
     let git_dir = resolve_git_dir(&cwd)?;
     let orig_index = git_dir.join("index");
     let temp_index = std::env::temp_dir().join(format!("sakana-idx-{}", Uuid::new_v4()));
@@ -529,7 +668,7 @@ pub async fn create_checkpoint(
         deletions,
     };
 
-    let db = state.0.lock().await;
+    let db = db_arc.lock().await;
     db.insert_checkpoint(&session_id, &checkpoint)
         .map_err(|e| e.to_string())?;
 
@@ -537,23 +676,39 @@ pub async fn create_checkpoint(
 }
 
 #[tauri::command]
-pub async fn get_checkpoint_diff(
+pub async fn create_checkpoint(
     state: State<'_, DbState>,
+    session_id: String,
+    turn_number: i64,
+    label: String,
+    cwd: String,
+) -> Result<Option<TurnCheckpoint>, String> {
+    create_checkpoint_inner(&state.0, session_id, turn_number, label, cwd).await
+}
+
+pub async fn get_checkpoint_diff_inner(
+    db_arc: &Arc<Mutex<Database>>,
     session_id: String,
     checkpoint_id: String,
 ) -> Result<Vec<DiffFile>, String> {
     let (cwd, cp, all_cps) = {
-        let db = state.0.lock().await;
+        let db = db_arc.lock().await;
         let session = db
             .get_session(&session_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Session {} not found", session_id))?;
+        let wsl_distro = db
+            .get_project(&session.project_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|p| p.wsl_distro);
         let cp = db
             .get_checkpoint(&session_id, &checkpoint_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Checkpoint {} not found", checkpoint_id))?;
         let all_cps = db.list_checkpoints(&session_id).map_err(|e| e.to_string())?;
-        (session.worktree_path, cp, all_cps)
+        let effective_cwd =
+            crate::platform::encode_wsl_path(wsl_distro.as_deref(), &session.worktree_path);
+        (effective_cwd, cp, all_cps)
     };
 
     let prev_tree = all_cps
@@ -573,27 +728,41 @@ pub async fn get_checkpoint_diff(
 }
 
 #[tauri::command]
-pub async fn revert_to_checkpoint(
+pub async fn get_checkpoint_diff(
     state: State<'_, DbState>,
+    session_id: String,
+    checkpoint_id: String,
+) -> Result<Vec<DiffFile>, String> {
+    get_checkpoint_diff_inner(&state.0, session_id, checkpoint_id).await
+}
+
+pub async fn revert_to_checkpoint_inner(
+    db_arc: &Arc<Mutex<Database>>,
     session_id: String,
     checkpoint_id: String,
 ) -> Result<(), String> {
     let (cwd, cp) = {
-        let db = state.0.lock().await;
+        let db = db_arc.lock().await;
         let session = db
             .get_session(&session_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Session {} not found", session_id))?;
+        let wsl_distro = db
+            .get_project(&session.project_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|p| p.wsl_distro);
         let cp = db
             .get_checkpoint(&session_id, &checkpoint_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Checkpoint {} not found", checkpoint_id))?;
-        (session.worktree_path, cp)
+        let effective_cwd =
+            crate::platform::encode_wsl_path(wsl_distro.as_deref(), &session.worktree_path);
+        (effective_cwd, cp)
     };
 
     run_git(&cwd, &["read-tree", "--reset", "-u", &cp.commit_hash])?;
 
-    let db = state.0.lock().await;
+    let db = db_arc.lock().await;
     db.truncate_after_checkpoint(&session_id, &checkpoint_id, cp.turn_number)
         .map_err(|e| e.to_string())?;
 
@@ -601,10 +770,21 @@ pub async fn revert_to_checkpoint(
 }
 
 #[tauri::command]
-pub async fn get_git_diffs(
+pub async fn revert_to_checkpoint(
+    state: State<'_, DbState>,
+    session_id: String,
+    checkpoint_id: String,
+) -> Result<(), String> {
+    revert_to_checkpoint_inner(&state.0, session_id, checkpoint_id).await
+}
+
+pub async fn get_git_diffs_inner(
+    db_arc: &Arc<Mutex<Database>>,
     cwd: String,
     turn_id: Option<String>,
+    wsl_distro: Option<String>,
 ) -> Result<Vec<DiffFile>, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     if !is_git_repo(&cwd) {
         return Ok(vec![]);
     }
@@ -683,12 +863,24 @@ pub async fn get_git_diffs(
 }
 
 #[tauri::command]
-pub async fn stage_hunk(
+pub async fn get_git_diffs(
+    state: State<'_, DbState>,
+    cwd: String,
+    turn_id: Option<String>,
+    wsl_distro: Option<String>,
+) -> Result<Vec<DiffFile>, String> {
+    get_git_diffs_inner(&state.0, cwd, turn_id, wsl_distro).await
+}
+
+pub async fn stage_hunk_inner(
+    db_arc: &Arc<Mutex<Database>>,
     cwd: String,
     file_path: String,
     hunk_header: String,
     stage: bool,
+    wsl_distro: Option<String>,
 ) -> Result<(), String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     let raw = if stage {
         run_git(&cwd, &["diff", "--no-color", "--", &file_path])?
@@ -732,11 +924,25 @@ pub async fn stage_hunk(
 }
 
 #[tauri::command]
-pub async fn discard_hunk(
+pub async fn stage_hunk(
+    state: State<'_, DbState>,
     cwd: String,
     file_path: String,
     hunk_header: String,
+    stage: bool,
+    wsl_distro: Option<String>,
 ) -> Result<(), String> {
+    stage_hunk_inner(&state.0, cwd, file_path, hunk_header, stage, wsl_distro).await
+}
+
+pub async fn discard_hunk_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    file_path: String,
+    hunk_header: String,
+    wsl_distro: Option<String>,
+) -> Result<(), String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     let raw = run_git(&cwd, &["diff", "--no-color", "--", &file_path])?;
     if raw.trim().is_empty() {
@@ -761,7 +967,22 @@ pub async fn discard_hunk(
 }
 
 #[tauri::command]
-pub async fn draft_commit_message(cwd: String) -> Result<String, String> {
+pub async fn discard_hunk(
+    state: State<'_, DbState>,
+    cwd: String,
+    file_path: String,
+    hunk_header: String,
+    wsl_distro: Option<String>,
+) -> Result<(), String> {
+    discard_hunk_inner(&state.0, cwd, file_path, hunk_header, wsl_distro).await
+}
+
+pub async fn draft_commit_message_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     let staged_stat = run_git(&cwd, &["diff", "--cached", "--stat"]).unwrap_or_default();
     let stat = if staged_stat.trim().is_empty() {
@@ -811,13 +1032,37 @@ pub async fn draft_commit_message(cwd: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn git_commit(cwd: String, message: String) -> Result<String, String> {
+pub async fn draft_commit_message(
+    state: State<'_, DbState>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    draft_commit_message_inner(&state.0, cwd, wsl_distro).await
+}
+
+pub async fn git_commit_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    message: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     let staged = run_git(&cwd, &["diff", "--cached", "--name-only"]).unwrap_or_default();
     if staged.trim().is_empty() {
         run_git(&cwd, &["add", "-A"])?;
     }
     run_git(&cwd, &["commit", "-m", &message])
+}
+
+#[tauri::command]
+pub async fn git_commit(
+    state: State<'_, DbState>,
+    cwd: String,
+    message: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    git_commit_inner(&state.0, cwd, message, wsl_distro).await
 }
 
 fn parse_github_owner_repo(remote_url: &str) -> Option<(String, String)> {
@@ -834,13 +1079,15 @@ fn parse_github_owner_repo(remote_url: &str) -> Option<(String, String)> {
     None
 }
 
-#[tauri::command]
-pub async fn create_pr(
+pub async fn create_pr_inner(
+    db_arc: &Arc<Mutex<Database>>,
     cwd: String,
     title: String,
     body: String,
     base_branch: String,
+    wsl_distro: Option<String>,
 ) -> Result<String, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     let mut gh_cmd = Command::new("gh");
     gh_cmd
@@ -899,8 +1146,20 @@ pub async fn create_pr(
 
     Ok(json_body["html_url"]
         .as_str()
-        .unwrap_or("PR created")
+        .unwrap_or_default()
         .to_string())
+}
+
+#[tauri::command]
+pub async fn create_pr(
+    state: State<'_, DbState>,
+    cwd: String,
+    title: String,
+    body: String,
+    base_branch: String,
+    wsl_distro: Option<String>,
+) -> Result<String, String> {
+    create_pr_inner(&state.0, cwd, title, body, base_branch, wsl_distro).await
 }
 
 fn collect_workspace_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
@@ -927,8 +1186,12 @@ fn collect_workspace_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-#[tauri::command]
-pub async fn list_workspace_files(cwd: String) -> Result<Vec<String>, String> {
+pub async fn list_workspace_files_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<Vec<String>, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     let root_buf = resolve_fs_root(&cwd);
     let root = root_buf.as_path();
     if !root.exists() {
@@ -938,6 +1201,15 @@ pub async fn list_workspace_files(cwd: String) -> Result<Vec<String>, String> {
     collect_workspace_files(root, root, &mut files);
     files.sort();
     Ok(files)
+}
+
+#[tauri::command]
+pub async fn list_workspace_files(
+    state: State<'_, DbState>,
+    cwd: String,
+    wsl_distro: Option<String>,
+) -> Result<Vec<String>, String> {
+    list_workspace_files_inner(&state.0, cwd, wsl_distro).await
 }
 
 fn detect_language(rel_path: &str) -> &'static str {
@@ -989,8 +1261,13 @@ fn safe_resolve_path(cwd: &str, rel_path: &str) -> Result<PathBuf, String> {
     }
 }
 
-#[tauri::command]
-pub async fn read_workspace_file(cwd: String, rel_path: String) -> Result<WorkspaceFile, String> {
+pub async fn read_workspace_file_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    rel_path: String,
+    wsl_distro: Option<String>,
+) -> Result<WorkspaceFile, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     let full = safe_resolve_path(&cwd, &rel_path)?;
     let bytes = std::fs::read(&full)
         .map_err(|e| format!("Failed to read {}: {}", rel_path, e))?;
@@ -1004,11 +1281,23 @@ pub async fn read_workspace_file(cwd: String, rel_path: String) -> Result<Worksp
 }
 
 #[tauri::command]
-pub async fn write_workspace_file(
+pub async fn read_workspace_file(
+    state: State<'_, DbState>,
+    cwd: String,
+    rel_path: String,
+    wsl_distro: Option<String>,
+) -> Result<WorkspaceFile, String> {
+    read_workspace_file_inner(&state.0, cwd, rel_path, wsl_distro).await
+}
+
+pub async fn write_workspace_file_inner(
+    db_arc: &Arc<Mutex<Database>>,
     cwd: String,
     rel_path: String,
     content: String,
+    wsl_distro: Option<String>,
 ) -> Result<(), String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     let full = safe_resolve_path(&cwd, &rel_path)?;
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)
@@ -1020,10 +1309,355 @@ pub async fn write_workspace_file(
 }
 
 #[tauri::command]
+pub async fn write_workspace_file(
+    state: State<'_, DbState>,
+    cwd: String,
+    rel_path: String,
+    content: String,
+    wsl_distro: Option<String>,
+) -> Result<(), String> {
+    write_workspace_file_inner(&state.0, cwd, rel_path, content, wsl_distro).await
+}
+
+pub async fn list_trace_spans_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    session_id: String,
+) -> Result<Vec<TraceSpan>, String> {
+    let db = db_arc.lock().await;
+    db.list_trace_spans(&session_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn list_trace_spans(
     state: State<'_, DbState>,
     session_id: String,
 ) -> Result<Vec<TraceSpan>, String> {
-    let db = state.0.lock().await;
-    db.list_trace_spans(&session_id).map_err(|e| e.to_string())
+    list_trace_spans_inner(&state.0, session_id).await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubAuthStatus {
+    pub authenticated: bool,
+    pub login: String,
+    pub name: String,
+    pub avatar_url: String,
+    pub source: String,
+    pub gh_installed: bool,
+    pub default_clone_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubRepo {
+    pub id: u64,
+    pub name: String,
+    pub full_name: String,
+    pub description: String,
+    pub clone_url: String,
+    pub html_url: String,
+    pub private: bool,
+    pub default_branch: String,
+    pub language: String,
+    pub updated_at: String,
+    pub stargazers_count: u64,
+}
+
+fn default_github_clone_dir() -> String {
+    let base = dirs::home_dir()
+        .map(|h| h.join("Projects"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.to_string_lossy().to_string()
+}
+
+fn is_gh_cli_installed() -> bool {
+    let mut cmd = Command::new("gh");
+    cmd.arg("--version");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+fn read_gh_cli_token() -> Option<String> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["auth", "token"]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if tok.is_empty() { None } else { Some(tok) }
+}
+
+fn resolve_github_token() -> Option<(String, &'static str)> {
+    if let Some(tok) = crate::platform::get_env_or_dotenv("GITHUB_TOKEN") {
+        let t = tok.trim().to_string();
+        if !t.is_empty() {
+            return Some((t, "token"));
+        }
+    }
+    if let Some(tok) = read_gh_cli_token() {
+        return Some((tok, "gh-cli"));
+    }
+    None
+}
+
+fn base64_encode_bytes(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i < input.len() {
+        let b0 = input[i];
+        let b1 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+        let b2 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < input.len() {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < input.len() {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
+}
+
+async fn fetch_github_user_with_token(token: &str, source: &str) -> Result<GitHubAuthStatus, String> {
+    let client = Client::new();
+    let resp = client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "sakana-desktop")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("GitHub authentication failed ({status}): {body}"));
+    }
+
+    let val: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse GitHub user response: {e}"))?;
+    let login = val["login"].as_str().unwrap_or_default().to_string();
+    let name = val["name"].as_str().unwrap_or(&login).to_string();
+    let avatar_url = val["avatar_url"].as_str().unwrap_or_default().to_string();
+
+    Ok(GitHubAuthStatus {
+        authenticated: !login.is_empty(),
+        login,
+        name,
+        avatar_url,
+        source: source.to_string(),
+        gh_installed: is_gh_cli_installed(),
+        default_clone_dir: default_github_clone_dir(),
+    })
+}
+
+#[tauri::command]
+pub async fn github_auth_status() -> Result<GitHubAuthStatus, String> {
+    let gh_installed = is_gh_cli_installed();
+    let default_clone_dir = default_github_clone_dir();
+    let Some((token, source)) = resolve_github_token() else {
+        return Ok(GitHubAuthStatus {
+            authenticated: false,
+            login: String::new(),
+            name: String::new(),
+            avatar_url: String::new(),
+            source: "none".to_string(),
+            gh_installed,
+            default_clone_dir,
+        });
+    };
+    match fetch_github_user_with_token(&token, source).await {
+        Ok(status) => Ok(status),
+        Err(_) => Ok(GitHubAuthStatus {
+            authenticated: false,
+            login: String::new(),
+            name: String::new(),
+            avatar_url: String::new(),
+            source: "none".to_string(),
+            gh_installed,
+            default_clone_dir,
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn github_save_token(token: String) -> Result<GitHubAuthStatus, String> {
+    let trimmed = token.trim().to_string();
+    if trimmed.is_empty() {
+        let _ = crate::telemetry::delete_env_secret_inner("GITHUB_TOKEN".to_string()).await;
+        std::env::remove_var("GITHUB_TOKEN");
+        return github_auth_status().await;
+    }
+    let status = fetch_github_user_with_token(&trimmed, "token").await?;
+    crate::telemetry::set_env_secret_inner("GITHUB_TOKEN".to_string(), trimmed.clone()).await?;
+    std::env::set_var("GITHUB_TOKEN", trimmed);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn github_list_repos(query: Option<String>) -> Result<Vec<GitHubRepo>, String> {
+    let (token, _) = resolve_github_token()
+        .ok_or_else(|| "Not signed in to GitHub. Connect your GitHub account in Settings first.".to_string())?;
+    let client = Client::new();
+    let resp = client
+        .get("https://api.github.com/user/repos?sort=updated&per_page=100&affiliation=owner,collaborator,organization_member")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "sakana-desktop")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch GitHub repos: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("GitHub API error ({status}): {body}"));
+    }
+
+    let raw: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse GitHub repos: {e}"))?;
+
+    let q = query.unwrap_or_default().trim().to_ascii_lowercase();
+    let mut repos: Vec<GitHubRepo> = raw
+        .into_iter()
+        .map(|v| GitHubRepo {
+            id: v["id"].as_u64().unwrap_or(0),
+            name: v["name"].as_str().unwrap_or_default().to_string(),
+            full_name: v["full_name"].as_str().unwrap_or_default().to_string(),
+            description: v["description"].as_str().unwrap_or_default().to_string(),
+            clone_url: v["clone_url"].as_str().unwrap_or_default().to_string(),
+            html_url: v["html_url"].as_str().unwrap_or_default().to_string(),
+            private: v["private"].as_bool().unwrap_or(false),
+            default_branch: v["default_branch"].as_str().unwrap_or("main").to_string(),
+            language: v["language"].as_str().unwrap_or_default().to_string(),
+            updated_at: v["updated_at"].as_str().unwrap_or_default().to_string(),
+            stargazers_count: v["stargazers_count"].as_u64().unwrap_or(0),
+        })
+        .filter(|r| !r.clone_url.is_empty())
+        .collect();
+
+    if !q.is_empty() {
+        repos.retain(|r| {
+            r.full_name.to_ascii_lowercase().contains(&q)
+                || r.description.to_ascii_lowercase().contains(&q)
+                || r.language.to_ascii_lowercase().contains(&q)
+        });
+    }
+
+    Ok(repos)
+}
+
+#[tauri::command]
+pub async fn github_clone_repo(
+    clone_url: String,
+    repo_name: String,
+    target_parent_dir: Option<String>,
+) -> Result<String, String> {
+    let clean_url = clone_url.trim().to_string();
+    if clean_url.is_empty() {
+        return Err("Repository clone URL is required.".to_string());
+    }
+    let clean_name: String = repo_name
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    if clean_name.is_empty() {
+        return Err("Invalid repository name.".to_string());
+    }
+
+    let parent_str = target_parent_dir
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_github_clone_dir);
+    let parent = PathBuf::from(&parent_str);
+    std::fs::create_dir_all(&parent)
+        .map_err(|e| format!("Failed to create parent directory {}: {e}", parent.display()))?;
+
+    let dest = parent.join(&clean_name);
+    if dest.exists() {
+        if dest.join(".git").exists() {
+            return Ok(dest.to_string_lossy().to_string());
+        }
+        return Err(format!(
+            "Directory '{}' already exists and is not a git repository.",
+            dest.display()
+        ));
+    }
+
+    let token_opt = resolve_github_token().map(|(t, _)| t);
+    let dest_str = dest.to_string_lossy().to_string();
+
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new("git");
+        if let Some(tok) = token_opt {
+            if clean_url.starts_with("https://github.com/") {
+                let basic = base64_encode_bytes(format!("x-access-token:{tok}").as_bytes());
+                cmd.args([
+                    "-c",
+                    &format!("http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"),
+                ]);
+            }
+        }
+        cmd.args(["clone", &clean_url, &dest_str])
+            .env("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        cmd.output()
+    })
+    .await
+    .map_err(|e| format!("Clone task failed: {e}"))?
+    .map_err(|e| format!("Failed to run git clone: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!("git clone failed: {detail}"));
+    }
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_effective_cwd;
+    use crate::db::Database;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn resolve_effective_cwd_encodes_wsl_distro() {
+        let dir = std::env::temp_dir().join(format!("sakana-git-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Mutex::new(Database::open_in_dir(&dir).unwrap()));
+        let resolved = resolve_effective_cwd(&db, "/home/user/repo", Some("Ubuntu")).await;
+        assert_eq!(resolved, "wsl://Ubuntu/home/user/repo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

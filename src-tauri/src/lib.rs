@@ -7,6 +7,7 @@ pub mod guard;
 pub mod harness;
 pub mod mcp;
 pub mod models;
+pub mod office;
 pub mod platform;
 pub mod pty;
 pub mod remote;
@@ -46,6 +47,34 @@ async fn create_project(
 ) -> Result<Project, String> {
     let db = state.0.lock().await;
     db.create_project(input).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn rename_project(
+    state: State<'_, DbState>,
+    id: String,
+    name: String,
+) -> Result<bool, String> {
+    let db = state.0.lock().await;
+    db.rename_project(&id, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn reorder_projects(
+    state: State<'_, DbState>,
+    ordered_ids: Vec<String>,
+) -> Result<(), String> {
+    let db = state.0.lock().await;
+    db.reorder_projects(&ordered_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn reorder_sessions(
+    state: State<'_, DbState>,
+    ordered_ids: Vec<String>,
+) -> Result<(), String> {
+    let db = state.0.lock().await;
+    db.reorder_sessions(&ordered_ids).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -280,17 +309,17 @@ async fn pick_attachment_files(app: tauri::AppHandle) -> Result<Vec<AttachmentIt
     Ok(items)
 }
 
-#[tauri::command]
-async fn save_clipboard_attachment(
+pub fn save_clipboard_attachment_inner(
     name: String,
-    base64_data: String,
+    _mime: String,
+    data_base64: String,
 ) -> Result<AttachmentItem, String> {
-    let raw_b64 = if let Some(rest) = base64_data.strip_prefix("data:") {
+    let raw_b64 = if let Some(rest) = data_base64.strip_prefix("data:") {
         rest.split_once(";base64,")
             .map(|(_, b64)| b64)
-            .unwrap_or(base64_data.as_str())
+            .unwrap_or(data_base64.as_str())
     } else {
-        base64_data.as_str()
+        data_base64.as_str()
     };
     let bytes = decode_base64(raw_b64)?;
     let sanitized_name = sanitize_attachment_name(&name);
@@ -321,6 +350,14 @@ async fn save_clipboard_attachment(
     })
 }
 
+#[tauri::command]
+async fn save_clipboard_attachment(
+    name: String,
+    base64_data: String,
+) -> Result<AttachmentItem, String> {
+    save_clipboard_attachment_inner(name, String::new(), base64_data)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -330,6 +367,7 @@ pub fn run() {
         .manage(automation::AutomationState::default())
         .manage(discord::DiscordState::default())
         .manage(remote::RemoteState::default())
+        .manage(office::OfficeState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -381,6 +419,9 @@ pub fn run() {
             get_bootstrap_state,
             list_projects,
             create_project,
+            rename_project,
+            reorder_projects,
+            reorder_sessions,
             delete_project,
             list_sessions,
             create_session,
@@ -404,6 +445,7 @@ pub fn run() {
             auth::list_harness_accounts,
             auth::create_harness_account,
             auth::set_default_harness_account,
+            auth::rename_harness_account,
             auth::delete_harness_account,
             auth::start_harness_login,
             auth::submit_harness_login_code,
@@ -425,6 +467,10 @@ pub fn run() {
             git::draft_commit_message,
             git::git_commit,
             git::create_pr,
+            git::github_auth_status,
+            git::github_save_token,
+            git::github_list_repos,
+            git::github_clone_repo,
             git::list_workspace_files,
             git::read_workspace_file,
             git::write_workspace_file,
@@ -473,6 +519,18 @@ pub fn run() {
             telemetry::set_autostart,
             telemetry::check_for_updates,
             telemetry::install_update,
+            office::list_offices,
+            office::get_office,
+            office::create_office,
+            office::delete_office,
+            office::update_office_settings,
+            office::hire_office_staff,
+            office::update_office_staff,
+            office::fire_office_staff,
+            office::get_office_staff_messages,
+            office::send_office_message,
+            office::report_staff_to_master,
+            office::stop_office_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Sakana");

@@ -351,37 +351,45 @@ async fn build_status(state: &DiscordState, db: &Arc<Mutex<Database>>) -> Discor
     }
 }
 
+pub async fn get_discord_status_inner(
+    state: &DiscordState,
+    db: &Arc<Mutex<Database>>,
+) -> Result<DiscordStatus, String> {
+    Ok(build_status(state, db).await)
+}
+
 #[tauri::command]
 pub async fn get_discord_status(
     state: State<'_, DiscordState>,
     db_state: State<'_, DbState>,
 ) -> Result<DiscordStatus, String> {
-    Ok(build_status(&state, &db_state.0).await)
+    get_discord_status_inner(&state, &db_state.0).await
 }
 
-#[tauri::command]
-pub async fn start_discord_bot(
-    state: State<'_, DiscordState>,
-    db_state: State<'_, DbState>,
-    app: AppHandle,
+pub async fn start_discord_bot_inner(
+    state: &DiscordState,
+    db: &Arc<Mutex<Database>>,
+    app: Option<AppHandle>,
     token: Option<String>,
 ) -> Result<DiscordStatus, String> {
     if *state.running.lock().await {
-        return Ok(build_status(&state, &db_state.0).await);
+        return Ok(build_status(state, db).await);
     }
+
+    let app = app.ok_or_else(|| "Discord bot requires an AppHandle".to_string())?;
 
     let resolved_token = if let Some(t) = token {
         let trimmed = t.trim().to_string();
         if trimmed.is_empty() {
             return Err("Discord bot token cannot be empty".to_string());
         }
-        let db_lock = db_state.0.lock().await;
+        let db_lock = db.lock().await;
         db_lock
             .set_setting(DISCORD_TOKEN_KEY, &trimmed)
             .map_err(|e| e.to_string())?;
         trimmed
     } else {
-        let db_lock = db_state.0.lock().await;
+        let db_lock = db.lock().await;
         db_lock
             .get_setting(DISCORD_TOKEN_KEY)
             .map_err(|e| e.to_string())?
@@ -393,7 +401,7 @@ pub async fn start_discord_bot(
     *state.last_error.lock().await = None;
 
     let bot_data = BotData {
-        db: Arc::clone(&db_state.0),
+        db: Arc::clone(db),
         app,
         running: Arc::clone(&state.running),
         bot_tag: Arc::clone(&state.bot_tag),
@@ -438,13 +446,22 @@ pub async fn start_discord_bot(
         *shard_slot.lock().await = None;
     });
 
-    Ok(build_status(&state, &db_state.0).await)
+    Ok(build_status(state, db).await)
 }
 
 #[tauri::command]
-pub async fn stop_discord_bot(
+pub async fn start_discord_bot(
     state: State<'_, DiscordState>,
     db_state: State<'_, DbState>,
+    app: AppHandle,
+    token: Option<String>,
+) -> Result<DiscordStatus, String> {
+    start_discord_bot_inner(&state, &db_state.0, Some(app), token).await
+}
+
+pub async fn stop_discord_bot_inner(
+    state: &DiscordState,
+    db: &Arc<Mutex<Database>>,
 ) -> Result<DiscordStatus, String> {
     if let Some(sm) = state.shard_manager.lock().await.take() {
         sm.shutdown_all().await;
@@ -453,12 +470,19 @@ pub async fn stop_discord_bot(
     *state.bot_tag.lock().await = None;
     *state.connected_guilds.lock().await = 0;
 
-    Ok(build_status(&state, &db_state.0).await)
+    Ok(build_status(state, db).await)
 }
 
 #[tauri::command]
-pub async fn upsert_discord_rule(
+pub async fn stop_discord_bot(
+    state: State<'_, DiscordState>,
     db_state: State<'_, DbState>,
+) -> Result<DiscordStatus, String> {
+    stop_discord_bot_inner(&state, &db_state.0).await
+}
+
+pub async fn upsert_discord_rule_inner(
+    db: &Arc<Mutex<Database>>,
     user_id: String,
     label: String,
     role: String,
@@ -474,9 +498,27 @@ pub async fn upsert_discord_rule(
         return Err("Role must be one of: owner, friend, guest, blocked".to_string());
     }
 
-    let db = db_state.0.lock().await;
+    let db = db.lock().await;
     db.upsert_discord_rule(&user_id, &label, &role)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn upsert_discord_rule(
+    db_state: State<'_, DbState>,
+    user_id: String,
+    label: String,
+    role: String,
+) -> Result<DiscordUserRule, String> {
+    upsert_discord_rule_inner(&db_state.0, user_id, label, role).await
+}
+
+pub async fn delete_discord_rule_inner(
+    db: &Arc<Mutex<Database>>,
+    id: String,
+) -> Result<bool, String> {
+    let db = db.lock().await;
+    db.delete_discord_rule(&id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -484,6 +526,5 @@ pub async fn delete_discord_rule(
     db_state: State<'_, DbState>,
     id: String,
 ) -> Result<bool, String> {
-    let db = db_state.0.lock().await;
-    db.delete_discord_rule(&id).map_err(|e| e.to_string())
+    delete_discord_rule_inner(&db_state.0, id).await
 }

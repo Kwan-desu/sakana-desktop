@@ -5,12 +5,16 @@ import type {
   AttachmentItem,
   AutomationItem,
   BootstrapState,
+  ChatMessage,
+  CreateOfficeInput,
   DiffFile,
   DirListing,
   DiscordPromptEvent,
   DiscordStatus,
   DiscordUserRule,
   EnvSecret,
+  GitHubAuthStatus,
+  GitHubRepo,
   GuardApprovalEvent,
   GuardConfig,
   GuardMode,
@@ -19,8 +23,13 @@ import type {
   HarnessId,
   HarnessLoginResponse,
   HarnessModelOption,
+  HireStaffInput,
   HostInfo,
   McpServer,
+  Office,
+  OfficeDelegationEdge,
+  OfficeEvent,
+  OfficeStaff,
   PendingApproval,
   PermissionMode,
   Project,
@@ -44,6 +53,7 @@ import type {
   TurnTokenEvent,
   TurnToolEvent,
   UpdateCheckResult,
+  UpdateStaffInput,
   WorkspaceFile,
   WslDistro,
 } from '../types';
@@ -138,6 +148,7 @@ export interface CreateSessionInput {
 
 export interface UpdateSessionInput {
   id: string;
+  projectId?: string;
   title?: string;
   status?: ThreadStatus;
   harness?: HarnessId;
@@ -177,6 +188,15 @@ export const tauriApi = {
 
   saveClipboardAttachment: (name: string, base64Data: string): Promise<AttachmentItem | null> =>
     tauriInvoke<AttachmentItem>('save_clipboard_attachment', { name, base64Data }),
+
+  renameProject: (id: string, name: string) =>
+    tauriInvoke<boolean>('rename_project', { id, name }),
+
+  reorderProjects: (orderedIds: string[]) =>
+    tauriInvoke<void>('reorder_projects', { orderedIds }),
+
+  reorderSessions: (orderedIds: string[]) =>
+    tauriInvoke<void>('reorder_sessions', { orderedIds }),
 
   deleteProject: (id: string) =>
     tauriInvoke<void>('delete_project', { id }),
@@ -346,10 +366,14 @@ export const tauriApi = {
       checkpointId,
     }),
 
-  getGitDiffs: (cwd: string, turnId?: string) =>
+  getGitDiffs: (cwd: string, turnId?: string, wslDistro?: string) =>
     tauriInvoke<DiffFile[]>(
       'get_git_diffs',
-      turnId && turnId !== 'all' ? { cwd, turnId } : { cwd },
+      {
+        cwd,
+        ...(turnId && turnId !== 'all' ? { turnId } : {}),
+        ...(wslDistro ? { wslDistro } : {}),
+      },
     ),
 
   stageHunk: (
@@ -357,11 +381,23 @@ export const tauriApi = {
     filePath: string,
     hunkHeader: string,
     stage: boolean,
+    wslDistro?: string,
   ) =>
-    tauriInvoke<void>('stage_hunk', { cwd, filePath, hunkHeader, stage }),
+    tauriInvoke<void>('stage_hunk', {
+      cwd,
+      filePath,
+      hunkHeader,
+      stage,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
-  discardHunk: (cwd: string, filePath: string, hunkHeader: string) =>
-    tauriInvoke<void>('discard_hunk', { cwd, filePath, hunkHeader }),
+  discardHunk: (cwd: string, filePath: string, hunkHeader: string, wslDistro?: string) =>
+    tauriInvoke<void>('discard_hunk', {
+      cwd,
+      filePath,
+      hunkHeader,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
   draftCommitMessage: (cwd: string) =>
     tauriInvoke<string>('draft_commit_message', { cwd }),
@@ -374,18 +410,52 @@ export const tauriApi = {
     title: string,
     body: string,
     baseBranch: string = 'main',
+    wslDistro?: string,
   ) =>
-    tauriInvoke<string>('create_pr', { cwd, title, body, baseBranch }),
+    tauriInvoke<string>('create_pr', {
+      cwd,
+      title,
+      body,
+      baseBranch,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
+
+  githubAuthStatus: () => tauriInvoke<GitHubAuthStatus>('github_auth_status'),
+
+  githubSaveToken: (token: string) =>
+    tauriInvoke<GitHubAuthStatus>('github_save_token', { token }),
+
+  githubListRepos: async (query?: string): Promise<GitHubRepo[]> =>
+    (await tauriInvoke<GitHubRepo[]>('github_list_repos', query ? { query } : {})) ?? [],
+
+  githubCloneRepo: (cloneUrl: string, repoName: string, targetParentDir?: string) =>
+    tauriInvoke<string>('github_clone_repo', {
+      cloneUrl,
+      repoName,
+      ...(targetParentDir ? { targetParentDir } : {}),
+    }),
 
   // Phase 3: Workspace files & trace spans
-  listWorkspaceFiles: (cwd: string) =>
-    tauriInvoke<string[]>('list_workspace_files', { cwd }),
+  listWorkspaceFiles: (cwd: string, wslDistro?: string) =>
+    tauriInvoke<string[]>('list_workspace_files', {
+      cwd,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
-  readWorkspaceFile: (cwd: string, relPath: string) =>
-    tauriInvoke<WorkspaceFile>('read_workspace_file', { cwd, relPath }),
+  readWorkspaceFile: (cwd: string, relPath: string, wslDistro?: string) =>
+    tauriInvoke<WorkspaceFile>('read_workspace_file', {
+      cwd,
+      relPath,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
-  writeWorkspaceFile: (cwd: string, relPath: string, content: string) =>
-    tauriInvoke<void>('write_workspace_file', { cwd, relPath, content }),
+  writeWorkspaceFile: (cwd: string, relPath: string, content: string, wslDistro?: string) =>
+    tauriInvoke<void>('write_workspace_file', {
+      cwd,
+      relPath,
+      content,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
   listTraceSpans: (sessionId: string) =>
     tauriInvoke<TraceSpan[]>('list_trace_spans', { sessionId }),
@@ -561,6 +631,15 @@ export const tauriApi = {
       authType: authType ?? null,
     })) ?? [],
 
+  renameHarnessAccount: async (
+    accountId: string,
+    label: string,
+  ): Promise<HarnessAuthAccount[]> =>
+    (await tauriInvoke<HarnessAuthAccount[]>('rename_harness_account', {
+      accountId,
+      label,
+    })) ?? [],
+
   setDefaultHarnessAccount: async (accountId: string): Promise<HarnessAuthAccount[]> =>
     (await tauriInvoke<HarnessAuthAccount[]>('set_default_harness_account', {
       accountId,
@@ -637,4 +716,79 @@ export const tauriApi = {
       path: path ?? null,
       wslDistro: wslDistro ?? null,
     }),
+
+  // Office Multi-Agent Orchestration
+  listOffices: async (): Promise<Office[]> =>
+    (await tauriInvoke<Office[]>('list_offices')) ?? [],
+
+  getOffice: async (officeId: string): Promise<Office | undefined> =>
+    (await tauriInvoke<Office>('get_office', { id: officeId })) ?? undefined,
+
+  createOffice: async (input: CreateOfficeInput): Promise<Office | undefined> =>
+    (await tauriInvoke<Office>('create_office', { input })) ?? undefined,
+
+  deleteOffice: async (officeId: string): Promise<boolean | undefined> =>
+    (await tauriInvoke<boolean>('delete_office', { id: officeId })) ?? undefined,
+
+  updateOfficeSettings: async (
+    officeId: string,
+    maxRounds: number,
+  ): Promise<Office | undefined> =>
+    (await tauriInvoke<Office>('update_office_settings', { officeId, maxRounds })) ??
+    undefined,
+
+  hireOfficeStaff: async (input: HireStaffInput): Promise<OfficeStaff | undefined> =>
+    (await tauriInvoke<OfficeStaff>('hire_office_staff', { input })) ?? undefined,
+
+  updateOfficeStaff: async (input: UpdateStaffInput): Promise<OfficeStaff | undefined> =>
+    (await tauriInvoke<OfficeStaff>('update_office_staff', { input })) ?? undefined,
+
+  fireOfficeStaff: async (staffId: string): Promise<boolean | undefined> =>
+    (await tauriInvoke<boolean>('fire_office_staff', { id: staffId })) ?? undefined,
+
+  getOfficeStaffMessages: async (staffId: string): Promise<ChatMessage[]> =>
+    (await tauriInvoke<ChatMessage[]>('get_office_staff_messages', { staffId })) ?? [],
+
+  sendOfficeMessage: async (
+    officeId: string,
+    targetStaffId: string,
+    prompt: string,
+    attachments: AttachedContextChip[] = [],
+  ): Promise<string | undefined> =>
+    (await tauriInvoke<string>('send_office_message', {
+      officeId,
+      targetStaffId,
+      prompt,
+      attachments,
+    })) ?? undefined,
+
+  reportStaffToMaster: async (
+    officeId: string,
+    staffId: string,
+    note?: string,
+  ): Promise<void> => {
+    await tauriInvoke<void>('report_staff_to_master', {
+      officeId,
+      staffId,
+      note: note ?? null,
+    });
+  },
+
+  stopOfficeRun: async (officeId: string): Promise<void> => {
+    await tauriInvoke<void>('stop_office_run', { officeId });
+  },
+
+  onOfficeUpdated: (handler: (payload: Office) => void) =>
+    tauriListen<Office>('office:updated', handler),
+
+  onOfficeEvent: (handler: (payload: OfficeEvent) => void) =>
+    tauriListen<OfficeEvent>('office:event', handler),
+
+  onOfficeDelegation: (
+    handler: (payload: { officeId: string; edges: OfficeDelegationEdge[] }) => void,
+  ) =>
+    tauriListen<{ officeId: string; edges: OfficeDelegationEdge[] }>(
+      'office:delegation',
+      handler,
+    ),
 };

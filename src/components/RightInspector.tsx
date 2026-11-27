@@ -389,7 +389,7 @@ export function RightInspector({
       return;
     }
     try {
-      const list = await tauriApi.listWorkspaceFiles(effectiveCwd);
+      const list = await tauriApi.listWorkspaceFiles(effectiveCwd, wslDistro);
       if (list) {
         setWorkspacePaths(list);
         if ((!selectedFilePathRef.current || !list.includes(selectedFilePathRef.current)) && list[0]) {
@@ -399,7 +399,7 @@ export function RightInspector({
     } catch (err) {
       onToast(`Failed to list files: ${String(err)}`);
     }
-  }, [effectiveCwd, files, onToast]);
+  }, [effectiveCwd, wslDistro, files, onToast]);
 
   useEffect(() => {
     if (open && (activeTab === 'files' || showLauncher)) {
@@ -418,7 +418,7 @@ export function RightInspector({
     let cancelled = false;
     setLoadingFile(true);
     void tauriApi
-      .readWorkspaceFile(effectiveCwd, selectedFilePath)
+      .readWorkspaceFile(effectiveCwd, selectedFilePath, wslDistro)
       .then((wf) => {
         if (!cancelled && wf) setLoadedFile(wf);
       })

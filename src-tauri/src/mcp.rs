@@ -54,13 +54,12 @@ pub async fn delete_mcp_server(state: State<'_, DbState>, id: String) -> Result<
     db.delete_mcp_server(&id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub async fn ping_mcp_server(
-    state: State<'_, DbState>,
+pub async fn ping_mcp_server_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
     id: String,
 ) -> Result<McpServer, String> {
     let server = {
-        let db = state.0.lock().await;
+        let db = db.lock().await;
         db.get_mcp_server(&id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("MCP server '{id}' not found"))?
@@ -75,10 +74,18 @@ pub async fn ping_mcp_server(
         ping_stdio_endpoint(&server.endpoint).await
     };
 
-    let db = state.0.lock().await;
+    let db = db.lock().await;
     db.update_mcp_server_ping(&id, &status, latency_ms)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("MCP server '{id}' not found"))
+}
+
+#[tauri::command]
+pub async fn ping_mcp_server(
+    state: State<'_, DbState>,
+    id: String,
+) -> Result<McpServer, String> {
+    ping_mcp_server_inner(&state.0, id).await
 }
 
 async fn ping_http_endpoint(endpoint: &str) -> (String, Option<i64>) {
@@ -166,8 +173,9 @@ async fn ping_stdio_endpoint(endpoint: &str) -> (String, Option<i64>) {
     ("error".to_string(), None)
 }
 
-#[tauri::command]
-pub async fn import_agy_mcp_servers(state: State<'_, DbState>) -> Result<Vec<McpServer>, String> {
+pub async fn import_agy_mcp_servers_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
+) -> Result<Vec<McpServer>, String> {
     let agy_bin = resolve_harness_binary("agy-cli")
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "agy".to_string());
@@ -193,13 +201,18 @@ pub async fn import_agy_mcp_servers(state: State<'_, DbState>) -> Result<Vec<Mcp
     }
 
     let parsed = parse_agy_mcp_list(&stdout);
-    let db = state.0.lock().await;
+    let db = db.lock().await;
     for (name, transport, endpoint) in parsed {
         db.upsert_mcp_server_by_name(&name, &transport, &endpoint)
             .map_err(|e| e.to_string())?;
     }
 
     db.list_mcp_servers().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn import_agy_mcp_servers(state: State<'_, DbState>) -> Result<Vec<McpServer>, String> {
+    import_agy_mcp_servers_inner(&state.0).await
 }
 
 fn parse_agy_mcp_list(raw: &str) -> Vec<(String, String, String)> {

@@ -11,6 +11,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::db::Database;
 use crate::harness::resolve_harness_binary;
 use crate::models::{HarnessAccountRow, HarnessAuthAccount, HarnessLoginResponse};
 use crate::platform::{app_data_dir, get_env_or_dotenv, tokio_command};
@@ -21,6 +22,7 @@ const AGY_ACP_APP_DATA_DIR: &str = "antigravity-cli";
 pub struct ActiveLoginProc {
     pub child: Child,
     pub stdin: Option<ChildStdin>,
+    pub output_buf: Arc<Mutex<String>>,
 }
 
 #[derive(Default)]
@@ -63,12 +65,21 @@ pub fn ensure_profile_dir(harness: &str, account_id: &str) -> PathBuf {
     prof
 }
 
-pub fn agy_gemini_dir(acc: &HarnessAccountRow) -> PathBuf {
-    if acc.id != "default" && !acc.profile_dir.trim().is_empty() {
-        PathBuf::from(&acc.profile_dir).join(".gemini")
+pub fn agy_profile_dir(acc: &HarnessAccountRow) -> PathBuf {
+    if !acc.profile_dir.trim().is_empty() {
+        PathBuf::from(&acc.profile_dir)
     } else {
-        home_dir_or_fallback().join(".gemini")
+        let id = if acc.id.trim().is_empty() {
+            "default"
+        } else {
+            acc.id.trim()
+        };
+        ensure_profile_dir("agy-cli", id)
     }
+}
+
+pub fn agy_gemini_dir(acc: &HarnessAccountRow) -> PathBuf {
+    agy_profile_dir(acc).join(".gemini")
 }
 
 fn agy_acp_data_dir(acc: &HarnessAccountRow) -> PathBuf {
@@ -216,6 +227,104 @@ fn extract_email_from_claude_json(acc: &HarnessAccountRow) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn extract_email_from_agy_files(acc: &HarnessAccountRow) -> Option<String> {
+    let gdir = agy_gemini_dir(acc);
+    let reg_path = gdir.join(AGY_ACP_APP_DATA_DIR).join("accounts").join("registry.json");
+    if let Ok(raw) = std::fs::read_to_string(&reg_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(active) = val
+                .get("active")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s.contains('@'))
+            {
+                return Some(active);
+            }
+            if let Some(accounts) = val.get("accounts").and_then(|v| v.as_object()) {
+                for (k, v) in accounts {
+                    if let Some(em) = v
+                        .get("email")
+                        .and_then(|e| e.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && s.contains('@'))
+                    {
+                        return Some(em);
+                    }
+                    if k.contains('@') {
+                        return Some(k.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    for path in [
+        gdir.join(AGY_ACP_APP_DATA_DIR).join("antigravity-oauth-token"),
+        gdir.join("antigravity-acp").join("antigravity-oauth-token"),
+        gdir.join("google_accounts.json"),
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                for candidate in [
+                    val.get("email").and_then(|v| v.as_str()),
+                    val.get("active").and_then(|v| v.as_str()),
+                    val.get("account").and_then(|a| a.get("email")).and_then(|v| v.as_str()),
+                ] {
+                    if let Some(em) = candidate.map(|s| s.trim()).filter(|s| !s.is_empty() && s.contains('@')) {
+                        return Some(em.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn read_agy_file_token(acc: &HarnessAccountRow) -> Option<(String, Option<String>)> {
+    let dir = agy_gemini_dir(acc);
+    let candidates = [
+        dir.join(AGY_ACP_APP_DATA_DIR).join("antigravity-oauth-token"),
+        dir.join("antigravity-acp").join("antigravity-oauth-token"),
+        dir.join(AGY_ACP_APP_DATA_DIR).join("acp_token.json"),
+        dir.join("oauth_creds.json"),
+        dir.join("google_accounts.json"),
+    ];
+    for p in candidates {
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let token_opt = val
+                    .get("token")
+                    .and_then(|t| t.get("access_token"))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| val.get("access_token").and_then(|v| v.as_str()))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                if let Some(token) = token_opt {
+                    let email = val
+                        .get("email")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| val.get("account").and_then(|a| a.get("email")).and_then(|v| v.as_str()))
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| extract_email_from_agy_files(acc));
+                    return Some((token, email));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn resolve_account_email(acc: &HarnessAccountRow) -> String {
+    if !acc.email.trim().is_empty() {
+        return acc.email.trim().to_string();
+    }
+    match acc.harness.as_str() {
+        "claude-code" => extract_email_from_claude_json(acc).unwrap_or_default(),
+        "agy-cli" => extract_email_from_agy_files(acc).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Apply isolated profile environment variables and flags when spawning a CLI harness turn.
 pub fn apply_account_env(
     cmd: &mut tokio::process::Command,
@@ -239,17 +348,26 @@ pub fn apply_account_env(
 
     let Some(account) = acc else {
         if harness == "agy-cli" {
-            cmd.env("AGY_ACP_FORCE_FILE_STORAGE", "1");
+            let prof = ensure_profile_dir("agy-cli", "default");
+            let gdir = prof.join(".gemini");
+            let _ = std::fs::create_dir_all(gdir.join(AGY_ACP_APP_DATA_DIR));
+            cmd.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
+            cmd.env("SAKANA_AGY_GEMINI_DIR", &gdir);
+            cmd.env("HOME", &prof);
+            cmd.env("USERPROFILE", &prof);
         }
         return;
     };
 
     match harness {
         "agy-cli" => {
-            let gdir = agy_gemini_dir(account);
+            let prof = agy_profile_dir(account);
+            let gdir = prof.join(".gemini");
             let _ = std::fs::create_dir_all(gdir.join(AGY_ACP_APP_DATA_DIR));
-            cmd.env("AGY_ACP_FORCE_FILE_STORAGE", "1");
+            cmd.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
             cmd.env("SAKANA_AGY_GEMINI_DIR", &gdir);
+            cmd.env("HOME", &prof);
+            cmd.env("USERPROFILE", &prof);
         }
         "kiro-cli" => {
             if account.id != "kiro_default" && !account.profile_dir.trim().is_empty() {
@@ -315,13 +433,7 @@ fn to_auth_account(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let authenticated = is_account_authenticated(&row);
-    let email = if !row.email.trim().is_empty() {
-        row.email.clone()
-    } else if row.harness == "claude-code" {
-        extract_email_from_claude_json(&row).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let email = resolve_account_email(&row);
     let status = if authenticated {
         "authenticated".to_string()
     } else if row.status == "pending_login" {
@@ -347,18 +459,17 @@ fn to_auth_account(
     }
 }
 
-#[tauri::command]
-pub async fn list_harness_accounts(
-    db_state: State<'_, DbState>,
-    auth_state: State<'_, AuthState>,
+pub async fn list_harness_accounts_inner(
+    db: &Arc<Mutex<Database>>,
+    auth: &AuthState,
     harness: Option<String>,
 ) -> Result<Vec<HarnessAuthAccount>, String> {
     let rows = {
-        let db = db_state.0.lock().await;
+        let db = db.lock().await;
         db.list_harness_accounts(harness.as_deref())
             .map_err(|e| e.to_string())?
     };
-    let outputs = auth_state.last_outputs.lock().await;
+    let outputs = auth.last_outputs.lock().await;
     Ok(rows
         .into_iter()
         .map(|r| to_auth_account(r, &outputs))
@@ -366,9 +477,17 @@ pub async fn list_harness_accounts(
 }
 
 #[tauri::command]
-pub async fn create_harness_account(
+pub async fn list_harness_accounts(
     db_state: State<'_, DbState>,
     auth_state: State<'_, AuthState>,
+    harness: Option<String>,
+) -> Result<Vec<HarnessAuthAccount>, String> {
+    list_harness_accounts_inner(&db_state.0, &auth_state, harness).await
+}
+
+pub async fn create_harness_account_inner(
+    db: &Arc<Mutex<Database>>,
+    auth: &AuthState,
     harness: String,
     label: String,
     email: Option<String>,
@@ -378,7 +497,7 @@ pub async fn create_harness_account(
         let trimmed = label.trim();
         if trimmed.is_empty() {
             let existing_count = {
-                let db = db_state.0.lock().await;
+                let db = db.lock().await;
                 db.list_harness_accounts(Some(&harness))
                     .map(|v| v.len())
                     .unwrap_or(0)
@@ -421,10 +540,39 @@ pub async fn create_harness_account(
         status: "unauthenticated".to_string(),
     };
     {
-        let db = db_state.0.lock().await;
+        let db = db.lock().await;
         db.create_harness_account(&row).map_err(|e| e.to_string())?;
     }
-    list_harness_accounts(db_state, auth_state, None).await
+    list_harness_accounts_inner(db, auth, None).await
+}
+
+#[tauri::command]
+pub async fn create_harness_account(
+    db_state: State<'_, DbState>,
+    auth_state: State<'_, AuthState>,
+    harness: String,
+    label: String,
+    email: Option<String>,
+    auth_type: Option<String>,
+) -> Result<Vec<HarnessAuthAccount>, String> {
+    create_harness_account_inner(&db_state.0, &auth_state, harness, label, email, auth_type).await
+}
+
+pub async fn set_default_harness_account_inner(
+    db: &Arc<Mutex<Database>>,
+    auth: &AuthState,
+    account_id: String,
+) -> Result<Vec<HarnessAuthAccount>, String> {
+    {
+        let db = db.lock().await;
+        let acc = db
+            .get_harness_account(&account_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Account '{account_id}' not found"))?;
+        db.set_default_harness_account(&acc.harness, &account_id)
+            .map_err(|e| e.to_string())?;
+    }
+    list_harness_accounts_inner(db, auth, None).await
 }
 
 #[tauri::command]
@@ -433,16 +581,61 @@ pub async fn set_default_harness_account(
     auth_state: State<'_, AuthState>,
     account_id: String,
 ) -> Result<Vec<HarnessAuthAccount>, String> {
+    set_default_harness_account_inner(&db_state.0, &auth_state, account_id).await
+}
+
+pub async fn delete_harness_account_inner(
+    db: &Arc<Mutex<Database>>,
+    auth: &AuthState,
+    account_id: String,
+) -> Result<Vec<HarnessAuthAccount>, String> {
+    if matches!(account_id.as_str(), "default" | "kiro_default" | "claude_default") {
+        return Err("Primary default accounts cannot be deleted.".to_string());
+    }
     {
-        let db = db_state.0.lock().await;
-        let acc = db
-            .get_harness_account(&account_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Account '{account_id}' not found"))?;
-        db.set_default_harness_account(&acc.harness, &account_id)
+        let mut procs = auth.login_procs.lock().await;
+        if let Some(mut active) = procs.remove(&account_id) {
+            let _ = active.child.kill().await;
+        }
+    }
+    {
+        let db = db.lock().await;
+        db.delete_harness_account(&account_id)
             .map_err(|e| e.to_string())?;
     }
-    list_harness_accounts(db_state, auth_state, None).await
+    list_harness_accounts_inner(db, auth, None).await
+}
+
+pub async fn rename_harness_account_inner(
+    db: &Arc<Mutex<Database>>,
+    auth: &AuthState,
+    account_id: String,
+    label: String,
+) -> Result<Vec<HarnessAuthAccount>, String> {
+    let trimmed = label.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Account name cannot be empty.".to_string());
+    }
+    {
+        let db = db.lock().await;
+        let updated = db
+            .rename_harness_account(&account_id, &trimmed)
+            .map_err(|e| e.to_string())?;
+        if !updated {
+            return Err(format!("Account '{account_id}' not found"));
+        }
+    }
+    list_harness_accounts_inner(db, auth, None).await
+}
+
+#[tauri::command]
+pub async fn rename_harness_account(
+    db_state: State<'_, DbState>,
+    auth_state: State<'_, AuthState>,
+    account_id: String,
+    label: String,
+) -> Result<Vec<HarnessAuthAccount>, String> {
+    rename_harness_account_inner(&db_state.0, &auth_state, account_id, label).await
 }
 
 #[tauri::command]
@@ -451,21 +644,43 @@ pub async fn delete_harness_account(
     auth_state: State<'_, AuthState>,
     account_id: String,
 ) -> Result<Vec<HarnessAuthAccount>, String> {
-    if matches!(account_id.as_str(), "default" | "kiro_default" | "claude_default") {
-        return Err("Primary default accounts cannot be deleted.".to_string());
+    delete_harness_account_inner(&db_state.0, &auth_state, account_id).await
+}
+
+pub async fn start_harness_login_inner(
+    db: &Arc<Mutex<Database>>,
+    auth: &AuthState,
+    account_id: String,
+    auth_type: Option<String>,
+    mode: Option<String>,
+) -> Result<HarnessLoginResponse, String> {
+    let mut acc = {
+        let db = db.lock().await;
+        db.get_harness_account(&account_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Account '{account_id}' not found"))?
+    };
+
+    if let Some(at) = auth_type.filter(|s| !s.trim().is_empty()) {
+        acc.auth_type = at.clone();
+        let db = db.lock().await;
+        let _ = db.update_harness_account(&account_id, None, None, Some(&at));
     }
+
+    // Terminate any previous login process for this account
     {
-        let mut procs = auth_state.login_procs.lock().await;
-        if let Some(mut active) = procs.remove(&account_id) {
-            let _ = active.child.kill().await;
+        let mut procs = auth.login_procs.lock().await;
+        if let Some(mut prev) = procs.remove(&account_id) {
+            let _ = prev.child.kill().await;
         }
     }
-    {
-        let db = db_state.0.lock().await;
-        db.delete_harness_account(&account_id)
-            .map_err(|e| e.to_string())?;
+
+    match acc.harness.as_str() {
+        "agy-cli" => start_agy_login(db, auth, &acc, mode.as_deref()).await,
+        "kiro-cli" => start_kiro_login(db, auth, &acc).await,
+        "claude-code" => start_claude_login(db, auth, &acc).await,
+        other => Err(format!("Unsupported harness '{other}'")),
     }
-    list_harness_accounts(db_state, auth_state, None).await
 }
 
 #[tauri::command]
@@ -476,38 +691,12 @@ pub async fn start_harness_login(
     auth_type: Option<String>,
     mode: Option<String>,
 ) -> Result<HarnessLoginResponse, String> {
-    let mut acc = {
-        let db = db_state.0.lock().await;
-        db.get_harness_account(&account_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Account '{account_id}' not found"))?
-    };
-
-    if let Some(at) = auth_type.filter(|s| !s.trim().is_empty()) {
-        acc.auth_type = at.clone();
-        let db = db_state.0.lock().await;
-        let _ = db.update_harness_account(&account_id, None, None, Some(&at));
-    }
-
-    // Terminate any previous login process for this account
-    {
-        let mut procs = auth_state.login_procs.lock().await;
-        if let Some(mut prev) = procs.remove(&account_id) {
-            let _ = prev.child.kill().await;
-        }
-    }
-
-    match acc.harness.as_str() {
-        "agy-cli" => start_agy_login(&db_state, &auth_state, &acc, mode.as_deref()).await,
-        "kiro-cli" => start_kiro_login(&db_state, &auth_state, &acc).await,
-        "claude-code" => start_claude_login(&db_state, &auth_state, &acc).await,
-        other => Err(format!("Unsupported harness '{other}'")),
-    }
+    start_harness_login_inner(&db_state.0, &auth_state, account_id, auth_type, mode).await
 }
 
 async fn start_agy_login(
-    db_state: &State<'_, DbState>,
-    auth_state: &State<'_, AuthState>,
+    db_state: &Arc<Mutex<Database>>,
+    auth_state: &AuthState,
     acc: &HarnessAccountRow,
     mode: Option<&str>,
 ) -> Result<HarnessLoginResponse, String> {
@@ -521,7 +710,7 @@ async fn start_agy_login(
     if acc.auth_type == "gemini-api-key" {
         let has_key = get_env_or_dotenv("GEMINI_API_KEY").is_some();
         let status = if has_key { "authenticated" } else { "unauthenticated" };
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         let _ = db.update_harness_account(&acc.id, None, Some(status), Some(&acc.auth_type));
         return Ok(HarnessLoginResponse {
             started: true,
@@ -546,7 +735,7 @@ async fn start_agy_login(
     if acc.auth_type == "agent-platform" {
         let has_cfg = is_account_authenticated(acc);
         let status = if has_cfg { "authenticated" } else { "unauthenticated" };
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         let _ = db.update_harness_account(&acc.id, None, Some(status), Some(&acc.auth_type));
         return Ok(HarnessLoginResponse {
             started: true,
@@ -588,6 +777,7 @@ async fn start_agy_login(
     let _ = std::fs::create_dir_all(gdir.join(AGY_ACP_APP_DATA_DIR));
     let bin_str = bin.to_string_lossy().to_string();
     let mut cmd = tokio_command(&bin_str);
+    apply_account_env(&mut cmd, "agy-cli", Some(acc));
     cmd.args([
         "acp",
         "--gemini-dir",
@@ -596,7 +786,6 @@ async fn start_agy_login(
         AGY_ACP_APP_DATA_DIR,
         "--login",
     ])
-    .env("AGY_ACP_FORCE_FILE_STORAGE", "1")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
@@ -615,7 +804,8 @@ async fn start_agy_login(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let text = read_initial_login_output(stdout, stderr, Duration::from_secs(4)).await;
+    let output_buf = spawn_login_output_reader(stdout, stderr);
+    let text = wait_for_initial_login_output(&output_buf, Duration::from_secs(6)).await;
     let (auth_url, device_code) = extract_url_and_code(&text);
 
     auth_state
@@ -627,10 +817,17 @@ async fn start_agy_login(
         .login_procs
         .lock()
         .await
-        .insert(acc.id.clone(), ActiveLoginProc { child, stdin });
+        .insert(
+            acc.id.clone(),
+            ActiveLoginProc {
+                child,
+                stdin,
+                output_buf,
+            },
+        );
 
     {
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         let _ = db.update_harness_account(&acc.id, None, Some("pending_login"), None);
     }
 
@@ -640,7 +837,7 @@ async fn start_agy_login(
         harness: acc.harness.clone(),
         auth_type: acc.auth_type.clone(),
         mode: clean_mode.to_string(),
-        authenticated: is_account_authenticated(acc),
+        authenticated: false,
         needs_code: true,
         auth_url,
         device_code,
@@ -654,8 +851,8 @@ async fn start_agy_login(
 }
 
 async fn start_kiro_login(
-    db_state: &State<'_, DbState>,
-    auth_state: &State<'_, AuthState>,
+    db_state: &Arc<Mutex<Database>>,
+    auth_state: &AuthState,
     acc: &HarnessAccountRow,
 ) -> Result<HarnessLoginResponse, String> {
     let Some(bin) = resolve_harness_binary("kiro-cli") else {
@@ -690,7 +887,8 @@ async fn start_kiro_login(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let text = read_initial_login_output(stdout, stderr, Duration::from_secs(4)).await;
+    let output_buf = spawn_login_output_reader(stdout, stderr);
+    let text = wait_for_initial_login_output(&output_buf, Duration::from_secs(6)).await;
     let (auth_url, device_code) = extract_url_and_code(&text);
 
     auth_state
@@ -702,10 +900,17 @@ async fn start_kiro_login(
         .login_procs
         .lock()
         .await
-        .insert(acc.id.clone(), ActiveLoginProc { child, stdin });
+        .insert(
+            acc.id.clone(),
+            ActiveLoginProc {
+                child,
+                stdin,
+                output_buf,
+            },
+        );
 
     {
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         let _ = db.update_harness_account(&acc.id, None, Some("pending_login"), None);
     }
 
@@ -729,14 +934,14 @@ async fn start_kiro_login(
 }
 
 async fn start_claude_login(
-    db_state: &State<'_, DbState>,
-    auth_state: &State<'_, AuthState>,
+    db_state: &Arc<Mutex<Database>>,
+    auth_state: &AuthState,
     acc: &HarnessAccountRow,
 ) -> Result<HarnessLoginResponse, String> {
     if acc.auth_type == "anthropic-api-key" {
         let has_key = get_env_or_dotenv("ANTHROPIC_API_KEY").is_some();
         let status = if has_key { "authenticated" } else { "unauthenticated" };
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         let _ = db.update_harness_account(&acc.id, None, Some(status), Some(&acc.auth_type));
         return Ok(HarnessLoginResponse {
             started: true,
@@ -790,7 +995,8 @@ async fn start_claude_login(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let text = read_initial_login_output(stdout, stderr, Duration::from_secs(4)).await;
+    let output_buf = spawn_login_output_reader(stdout, stderr);
+    let text = wait_for_initial_login_output(&output_buf, Duration::from_secs(6)).await;
     let (auth_url, device_code) = extract_url_and_code(&text);
 
     auth_state
@@ -802,10 +1008,17 @@ async fn start_claude_login(
         .login_procs
         .lock()
         .await
-        .insert(acc.id.clone(), ActiveLoginProc { child, stdin });
+        .insert(
+            acc.id.clone(),
+            ActiveLoginProc {
+                child,
+                stdin,
+                output_buf,
+            },
+        );
 
     {
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         let _ = db.update_harness_account(&acc.id, None, Some("pending_login"), None);
     }
 
@@ -828,75 +1041,77 @@ async fn start_claude_login(
     })
 }
 
-async fn read_initial_login_output(
+fn spawn_login_output_reader(
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
+) -> Arc<Mutex<String>> {
+    let buf = Arc::new(Mutex::new(String::new()));
+    if let Some(out) = stdout {
+        let buf_clone = buf.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut guard = buf_clone.lock().await;
+                if !guard.is_empty() {
+                    guard.push('\n');
+                }
+                guard.push_str(&line);
+            }
+        });
+    }
+    if let Some(err) = stderr {
+        let buf_clone = buf.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut guard = buf_clone.lock().await;
+                if !guard.is_empty() {
+                    guard.push('\n');
+                }
+                guard.push_str(&line);
+            }
+        });
+    }
+    buf
+}
+
+async fn wait_for_initial_login_output(
+    output_buf: &Arc<Mutex<String>>,
     max_wait: Duration,
 ) -> String {
-    let mut out_lines = stdout.map(|s| BufReader::new(s).lines());
-    let mut err_lines = stderr.map(|s| BufReader::new(s).lines());
-    let mut buf = Vec::new();
     let deadline = tokio::time::Instant::now() + max_wait;
-
-    for _ in 0..24 {
+    let mut last_len = 0usize;
+    let mut quiet_ticks = 0u32;
+    loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
         }
-        let rem = deadline - now;
-        let step = tokio::time::timeout(rem.min(Duration::from_millis(800)), async {
-            tokio::select! {
-                r = async {
-                    match out_lines.as_mut() {
-                        Some(l) => l.next_line().await,
-                        None => std::future::pending().await,
-                    }
-                } => ("out", r),
-                r = async {
-                    match err_lines.as_mut() {
-                        Some(l) => l.next_line().await,
-                        None => std::future::pending().await,
-                    }
-                } => ("err", r),
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let snapshot = output_buf.lock().await.clone();
+        if snapshot.len() != last_len {
+            last_len = snapshot.len();
+            quiet_ticks = 0;
+        } else if !snapshot.is_empty() {
+            quiet_ticks += 1;
+            let (url, code) = extract_url_and_code(&snapshot);
+            // Wait ~480ms of quiet after a URL/device code appears, or ~1.2s of quiet for other text
+            if ((!url.is_empty() || !code.is_empty()) && quiet_ticks >= 4) || quiet_ticks >= 10 {
+                return snapshot.trim().to_string();
             }
-        })
-        .await;
-
-        match step {
-            Ok((src, Ok(Some(line)))) => {
-                let has_url = line.contains("https://") || line.contains("http://");
-                buf.push(line);
-                if has_url && buf.len() >= 2 {
-                    // Give one short beat for device code line right after URL
-                    let _ = src;
-                    continue;
-                }
-            }
-            Ok((src, Ok(None))) => {
-                if src == "out" {
-                    out_lines = None;
-                } else {
-                    err_lines = None;
-                }
-                if out_lines.is_none() && err_lines.is_none() {
-                    break;
-                }
-            }
-            _ => break,
         }
     }
-    buf.join("\n").trim().to_string()
+    output_buf.lock().await.trim().to_string()
 }
 
-#[tauri::command]
-pub async fn submit_harness_login_code(
-    db_state: State<'_, DbState>,
-    auth_state: State<'_, AuthState>,
+pub async fn submit_harness_login_code_inner(
+    db_state: &Arc<Mutex<Database>>,
+    auth_state: &AuthState,
     account_id: String,
     code: String,
 ) -> Result<HarnessLoginResponse, String> {
     let acc = {
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         db.get_harness_account(&account_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Account '{account_id}' not found"))?
@@ -924,7 +1139,7 @@ pub async fn submit_harness_login_code(
         tokio::time::sleep(Duration::from_millis(600)).await;
         let authed = is_account_authenticated(&acc);
         if authed {
-            let db = db_state.0.lock().await;
+            let db = db_state.lock().await;
             let _ = db.update_harness_account(&account_id, None, Some("authenticated"), None);
         }
         return Ok(HarnessLoginResponse {
@@ -961,18 +1176,49 @@ pub async fn submit_harness_login_code(
         });
     };
 
+    let pre_len = active.output_buf.lock().await.len();
+
     if let Some(mut stdin) = active.stdin.take() {
         let _ = stdin.write_all(format!("{raw}\n").as_bytes()).await;
         let _ = stdin.flush().await;
         drop(stdin);
     }
 
-    let wait_res = tokio::time::timeout(Duration::from_secs(15), active.child.wait()).await;
+    let wait_res = tokio::time::timeout(Duration::from_secs(20), active.child.wait()).await;
     let exit_ok = matches!(wait_res, Ok(Ok(status)) if status.success());
-    let authed = is_account_authenticated(&acc) || exit_ok;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let full_output = active.output_buf.lock().await.clone();
+    let post_output = if pre_len <= full_output.len() {
+        full_output[pre_len..].trim().to_string()
+    } else {
+        full_output.trim().to_string()
+    };
+    if !full_output.trim().is_empty() {
+        auth_state
+            .last_outputs
+            .lock()
+            .await
+            .insert(account_id.clone(), full_output.trim().to_string());
+    }
+
+    let authed = exit_ok && is_account_authenticated(&acc);
+    let resolved_email = if authed {
+        resolve_account_email(&acc)
+    } else {
+        acc.email.clone()
+    };
     if authed {
-        let db = db_state.0.lock().await;
-        let _ = db.update_harness_account(&account_id, None, Some("authenticated"), None);
+        let db = db_state.lock().await;
+        let _ = db.update_harness_account(
+            &account_id,
+            if resolved_email.is_empty() {
+                None
+            } else {
+                Some(resolved_email.as_str())
+            },
+            Some("authenticated"),
+            None,
+        );
     }
 
     Ok(HarnessLoginResponse {
@@ -985,23 +1231,36 @@ pub async fn submit_harness_login_code(
         needs_code: !authed,
         auth_url: String::new(),
         device_code: String::new(),
-        email: acc.email,
+        email: resolved_email,
         message: if authed {
             "Signed in successfully.".to_string()
+        } else if !post_output.is_empty() {
+            post_output
+        } else if matches!(wait_res, Err(_)) {
+            "Login process timed out waiting for token exchange. Click Sign In to retry.".to_string()
         } else {
-            "Code submitted. Click Check Status in a moment to verify.".to_string()
+            "Login failed. Click Sign In to generate a fresh link and try again.".to_string()
         },
     })
 }
 
 #[tauri::command]
-pub async fn check_harness_auth(
+pub async fn submit_harness_login_code(
     db_state: State<'_, DbState>,
     auth_state: State<'_, AuthState>,
     account_id: String,
+    code: String,
+) -> Result<HarnessLoginResponse, String> {
+    submit_harness_login_code_inner(&db_state.0, &auth_state, account_id, code).await
+}
+
+pub async fn check_harness_auth_inner(
+    db_state: &Arc<Mutex<Database>>,
+    auth_state: &AuthState,
+    account_id: String,
 ) -> Result<HarnessAuthAccount, String> {
     let mut acc = {
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         db.get_harness_account(&account_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Account '{account_id}' not found"))?
@@ -1011,6 +1270,13 @@ pub async fn check_harness_auth(
     let mut detected_email = acc.email.clone();
 
     match acc.harness.as_str() {
+        "agy-cli" => {
+            if detected_email.is_empty() {
+                if let Some(em) = extract_email_from_agy_files(&acc) {
+                    detected_email = em;
+                }
+            }
+        }
         "kiro-cli" => {
             if let Some(bin) = resolve_harness_binary("kiro-cli") {
                 let bin_str = bin.to_string_lossy().to_string();
@@ -1079,7 +1345,7 @@ pub async fn check_harness_auth(
     acc.email = detected_email.clone();
 
     {
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         let _ = db.update_harness_account(
             &account_id,
             if detected_email.is_empty() { None } else { Some(detected_email.as_str()) },
@@ -1093,13 +1359,21 @@ pub async fn check_harness_auth(
 }
 
 #[tauri::command]
-pub async fn logout_harness_account(
+pub async fn check_harness_auth(
     db_state: State<'_, DbState>,
     auth_state: State<'_, AuthState>,
     account_id: String,
+) -> Result<HarnessAuthAccount, String> {
+    check_harness_auth_inner(&db_state.0, &auth_state, account_id).await
+}
+
+pub async fn logout_harness_account_inner(
+    db_state: &Arc<Mutex<Database>>,
+    auth_state: &AuthState,
+    account_id: String,
 ) -> Result<Vec<HarnessAuthAccount>, String> {
     let acc = {
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         db.get_harness_account(&account_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Account '{account_id}' not found"))?
@@ -1114,12 +1388,18 @@ pub async fn logout_harness_account(
 
     match acc.harness.as_str() {
         "agy-cli" => {
-            let dir = agy_acp_data_dir(&acc);
-            for fname in ["acp_token.json", "antigravity-oauth-token", "oauth_creds.json"] {
-                let p = dir.join(fname);
-                if p.is_file() {
-                    let _ = std::fs::remove_file(p);
+            let gdir = agy_gemini_dir(&acc);
+            for dir in [gdir.join(AGY_ACP_APP_DATA_DIR), gdir.join("antigravity-acp"), gdir.clone()] {
+                for fname in ["acp_token.json", "antigravity-oauth-token", "oauth_creds.json"] {
+                    let p = dir.join(fname);
+                    if p.is_file() {
+                        let _ = std::fs::remove_file(p);
+                    }
                 }
+            }
+            let reg = gdir.join(AGY_ACP_APP_DATA_DIR).join("accounts").join("registry.json");
+            if reg.is_file() {
+                let _ = std::fs::remove_file(reg);
             }
         }
         "kiro-cli" => {
@@ -1154,11 +1434,20 @@ pub async fn logout_harness_account(
     }
 
     {
-        let db = db_state.0.lock().await;
+        let db = db_state.lock().await;
         let _ = db.update_harness_account(&account_id, None, Some("unauthenticated"), None);
     }
     auth_state.last_outputs.lock().await.remove(&account_id);
-    list_harness_accounts(db_state, auth_state, None).await
+    list_harness_accounts_inner(db_state, auth_state, None).await
+}
+
+#[tauri::command]
+pub async fn logout_harness_account(
+    db_state: State<'_, DbState>,
+    auth_state: State<'_, AuthState>,
+    account_id: String,
+) -> Result<Vec<HarnessAuthAccount>, String> {
+    logout_harness_account_inner(&db_state.0, &auth_state, account_id).await
 }
 
 #[tauri::command]

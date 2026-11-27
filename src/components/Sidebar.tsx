@@ -61,9 +61,11 @@ interface SidebarProps {
   onDeleteProject: (id: string) => Promise<void> | void;
   onRenameProject?: (id: string, name: string) => Promise<void> | void;
   onReorderProjects?: (orderedIds: string[]) => Promise<void> | void;
+  onSetProjectDiscordChannel?: (projectId: string, channel?: string) => Promise<void> | void;
   onDeleteThread: (id: string) => Promise<void> | void;
   onRenameThread?: (id: string, title: string) => Promise<void> | void;
   onMoveThread?: (id: string, projectId: string) => Promise<void> | void;
+  onSetThreadDiscordChannel?: (threadId: string, channel?: string | null) => Promise<void> | void;
   onReorderThreads?: (
     orderedIds: string[],
     moved?: { id: string; projectId: string },
@@ -73,7 +75,6 @@ interface SidebarProps {
   onSelectDashSubtab: (tab: DashboardSubtab) => void;
   quotas: QuotaAccount[];
   onRefreshQuotas?: () => void;
-  pendingApprovalCount: number;
   remoteHosts: RemoteHost[];
   activeHostId: string;
   onSwitchHost: (hostId: string) => void;
@@ -101,16 +102,17 @@ export function Sidebar({
   onDeleteProject,
   onRenameProject,
   onReorderProjects,
+  onSetProjectDiscordChannel,
   onDeleteThread,
   onRenameThread,
   onMoveThread,
+  onSetThreadDiscordChannel,
   onReorderThreads,
   onOpenGitHubClone,
   dashSubtab,
   onSelectDashSubtab,
   quotas,
   onRefreshQuotas,
-  pendingApprovalCount,
   remoteHosts,
   activeHostId,
   onSwitchHost,
@@ -140,6 +142,15 @@ export function Sidebar({
     x: number;
     y: number;
     showMoveList: boolean;
+    showDiscordInput: boolean;
+    discordDraft: string;
+  } | null>(null);
+  const [projectCtxMenu, setProjectCtxMenu] = useState<{
+    project: Project;
+    x: number;
+    y: number;
+    showDiscordInput: boolean;
+    discordDraft: string;
   } | null>(null);
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
@@ -182,17 +193,33 @@ export function Sidebar({
   dragItemRef.current = dragItem;
   dropTargetRef.current = dropTarget;
 
+  const slugifyChannel = (raw: string) => {
+    const slug = raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9-_]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    return `#${slug || 'sakana'}`;
+  };
+
   useEffect(() => {
-    if (!threadCtxMenu) return;
+    if (!threadCtxMenu && !projectCtxMenu) return;
     const onDown = (e: MouseEvent) => {
       if (ctxMenuRef.current && !ctxMenuRef.current.contains(e.target as Node)) {
         setThreadCtxMenu(null);
+        setProjectCtxMenu(null);
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setThreadCtxMenu(null);
+      if (e.key === 'Escape') {
+        setThreadCtxMenu(null);
+        setProjectCtxMenu(null);
+      }
     };
-    const onScroll = () => setThreadCtxMenu(null);
+    const onScroll = () => {
+      setThreadCtxMenu(null);
+      setProjectCtxMenu(null);
+    };
     document.addEventListener('mousedown', onDown);
     window.addEventListener('keydown', onKey);
     window.addEventListener('scroll', onScroll, true);
@@ -201,7 +228,7 @@ export function Sidebar({
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('scroll', onScroll, true);
     };
-  }, [threadCtxMenu]);
+  }, [threadCtxMenu, projectCtxMenu]);
 
   const commitRename = async (threadId: string) => {
     const next = renameDraft.trim();
@@ -474,15 +501,6 @@ export function Sidebar({
           className="h-2 w-2 rounded-full pulse-dot shrink-0"
           style={{ backgroundColor: 'var(--accent-blue)' }}
           title="Working"
-        />
-      );
-    }
-    if (t.status === 'AWAITING_APPROVAL') {
-      return (
-        <span
-          className="h-2 w-2 rounded-full shrink-0"
-          style={{ backgroundColor: 'var(--accent-yellow)' }}
-          title="Waiting for Terminal Guard approval"
         />
       );
     }
@@ -1005,6 +1023,22 @@ export function Sidebar({
                     )}
                     <div
                       className="group flex items-center gap-1"
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setThreadCtxMenu(null);
+                        const menuW = 228;
+                        const menuH = 220;
+                        const x = Math.min(e.clientX, window.innerWidth - menuW - 8);
+                        const y = Math.min(e.clientY, window.innerHeight - menuH - 8);
+                        setProjectCtxMenu({
+                          project: proj,
+                          x: Math.max(8, x),
+                          y: Math.max(8, y),
+                          showDiscordInput: false,
+                          discordDraft: proj.discordChannel || slugifyChannel(proj.name),
+                        });
+                      }}
                       onPointerDown={(e) => {
                         if (e.button !== 0 || isRenamingProj) return;
                         const targetEl = e.target as HTMLElement;
@@ -1168,11 +1202,18 @@ export function Sidebar({
                                   const menuH = 220;
                                   const x = Math.min(e.clientX, window.innerWidth - menuW - 8);
                                   const y = Math.min(e.clientY, window.innerHeight - menuH - 8);
+                                  setProjectCtxMenu(null);
+                                  const parentProj = projects.find((p) => p.id === t.projectId);
                                   setThreadCtxMenu({
                                     thread: t,
                                     x: Math.max(8, x),
                                     y: Math.max(8, y),
                                     showMoveList: false,
+                                    showDiscordInput: false,
+                                    discordDraft:
+                                      t.discordChannel ||
+                                      parentProj?.discordChannel ||
+                                      slugifyChannel(t.title || parentProj?.name || 'discord'),
                                   });
                                 }}
                               >
@@ -1458,14 +1499,6 @@ export function Sidebar({
                   {item.icon}
                   <span>{item.label}</span>
                 </span>
-                {item.id === 'overview' && pendingApprovalCount > 0 && (
-                  <span
-                    className="font-mono-tech text-[10px] px-1.5 rounded-full"
-                    style={{ backgroundColor: 'var(--accent-yellow-bg)', color: 'var(--accent-yellow)' }}
-                  >
-                    {pendingApprovalCount}
-                  </span>
-                )}
               </button>
             );
           })}
@@ -1523,14 +1556,6 @@ export function Sidebar({
           >
             <ListChecks size={13} weight={primarySection === 'dashboard' ? 'fill' : 'regular'} />
             <span>Dashboard</span>
-            {pendingApprovalCount > 0 && (
-              <span
-                className="font-mono-tech text-[9.5px] px-1 rounded-full"
-                style={{ backgroundColor: 'var(--accent-yellow-bg)', color: 'var(--accent-yellow)' }}
-              >
-                {pendingApprovalCount}
-              </span>
-            )}
           </button>
         </div>
 
@@ -1816,6 +1841,79 @@ export function Sidebar({
               )}
             </div>
           )}
+          {onSetThreadDiscordChannel && (
+            <div>
+              <button
+                type="button"
+                onClick={() =>
+                  setThreadCtxMenu((prev) =>
+                    prev ? { ...prev, showDiscordInput: !prev.showDiscordInput } : null,
+                  )
+                }
+                className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center justify-between gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+                style={{ color: 'var(--text-main)' }}
+              >
+                <span className="inline-flex items-center gap-2 truncate">
+                  <DiscordIcon size={13} style={{ color: 'var(--accent-discord)' }} />
+                  <span className="truncate">
+                    {threadCtxMenu.thread.isDiscord
+                      ? `Discord (${threadCtxMenu.thread.discordChannel || 'linked'})`
+                      : 'Make Discord Chat…'}
+                  </span>
+                </span>
+              </button>
+              {threadCtxMenu.showDiscordInput && (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const ch = threadCtxMenu.discordDraft.trim();
+                    if (!ch) return;
+                    void onSetThreadDiscordChannel(threadCtxMenu.thread.id, ch);
+                    setThreadCtxMenu(null);
+                  }}
+                  className="px-2 py-1.5 space-y-1.5"
+                >
+                  <input
+                    autoFocus
+                    value={threadCtxMenu.discordDraft}
+                    onChange={(e) =>
+                      setThreadCtxMenu((prev) =>
+                        prev ? { ...prev, discordDraft: e.target.value } : null,
+                      )
+                    }
+                    placeholder="#channel-name"
+                    className="w-full rounded-[5px] border px-2 py-1 font-mono-tech text-[11px] focus:outline-none"
+                    style={{
+                      backgroundColor: 'var(--bg-app)',
+                      borderColor: 'var(--border-line)',
+                      color: 'var(--text-main)',
+                    }}
+                  />
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="submit"
+                      className="btn-solid flex-1 py-1 text-[11px] font-medium cursor-pointer"
+                    >
+                      Link
+                    </button>
+                    {threadCtxMenu.thread.isDiscord && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void onSetThreadDiscordChannel(threadCtxMenu.thread.id, null);
+                          setThreadCtxMenu(null);
+                        }}
+                        className="btn-ghost px-2 py-1 text-[11px] cursor-pointer"
+                        style={{ color: 'var(--accent-red)' }}
+                      >
+                        Unlink
+                      </button>
+                    )}
+                  </div>
+                </form>
+              )}
+            </div>
+          )}
           <div className="my-0.5 border-t" style={{ borderColor: 'var(--border-line)' }} />
           <button
             type="button"
@@ -1830,6 +1928,136 @@ export function Sidebar({
             <Trash size={13} />
             <span>Delete thread</span>
           </button>
+        </div>
+      )}
+
+      {projectCtxMenu && (
+        <div
+          ref={ctxMenuRef}
+          className="sakana-popover pop-enter fixed z-50 w-56 rounded-[10px] p-1 space-y-0.5"
+          style={{ left: projectCtxMenu.x, top: projectCtxMenu.y }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const id = projectCtxMenu.project.id;
+              setProjectCtxMenu(null);
+              void onQuickNewThread(id);
+            }}
+            className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+            style={{ color: 'var(--text-main)' }}
+          >
+            <Plus size={13} style={{ color: 'var(--text-muted)' }} />
+            <span>New thread</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setRenamingProjectId(projectCtxMenu.project.id);
+              setRenameProjectDraft(projectCtxMenu.project.name);
+              setProjectCtxMenu(null);
+            }}
+            className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+            style={{ color: 'var(--text-main)' }}
+          >
+            <PencilSimple size={13} style={{ color: 'var(--text-muted)' }} />
+            <span>Rename project</span>
+          </button>
+          {onSetProjectDiscordChannel && (
+            <div>
+              <button
+                type="button"
+                onClick={() =>
+                  setProjectCtxMenu((prev) =>
+                    prev ? { ...prev, showDiscordInput: !prev.showDiscordInput } : null,
+                  )
+                }
+                className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center justify-between gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+                style={{ color: 'var(--text-main)' }}
+              >
+                <span className="inline-flex items-center gap-2 truncate">
+                  <DiscordIcon size={13} style={{ color: 'var(--accent-discord)' }} />
+                  <span className="truncate">
+                    {projectCtxMenu.project.discordChannel
+                      ? `Discord (${projectCtxMenu.project.discordChannel})`
+                      : 'Make Discord Chat…'}
+                  </span>
+                </span>
+              </button>
+              {projectCtxMenu.showDiscordInput && (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const ch = projectCtxMenu.discordDraft.trim();
+                    if (!ch) return;
+                    void onSetProjectDiscordChannel(projectCtxMenu.project.id, ch);
+                    setProjectCtxMenu(null);
+                  }}
+                  className="px-2 py-1.5 space-y-1.5"
+                >
+                  <input
+                    autoFocus
+                    value={projectCtxMenu.discordDraft}
+                    onChange={(e) =>
+                      setProjectCtxMenu((prev) =>
+                        prev ? { ...prev, discordDraft: e.target.value } : null,
+                      )
+                    }
+                    placeholder="#channel-name"
+                    className="w-full rounded-[5px] border px-2 py-1 font-mono-tech text-[11px] focus:outline-none"
+                    style={{
+                      backgroundColor: 'var(--bg-app)',
+                      borderColor: 'var(--border-line)',
+                      color: 'var(--text-main)',
+                    }}
+                  />
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="submit"
+                      className="btn-solid flex-1 py-1 text-[11px] font-medium cursor-pointer"
+                    >
+                      Bind
+                    </button>
+                    {projectCtxMenu.project.discordChannel && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void onSetProjectDiscordChannel(projectCtxMenu.project.id, '');
+                          setProjectCtxMenu(null);
+                        }}
+                        className="btn-ghost px-2 py-1 text-[11px] cursor-pointer"
+                        style={{ color: 'var(--accent-red)' }}
+                      >
+                        Unbind
+                      </button>
+                    )}
+                  </div>
+                </form>
+              )}
+            </div>
+          )}
+          {projects.length > 1 && (
+            <>
+              <div className="my-0.5 border-t" style={{ borderColor: 'var(--border-line)' }} />
+              <button
+                type="button"
+                onClick={() => {
+                  const id = projectCtxMenu.project.id;
+                  setProjectCtxMenu(null);
+                  void onDeleteProject(id);
+                }}
+                className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+                style={{ color: 'var(--accent-red)' }}
+              >
+                <Trash size={13} />
+                <span>Delete project</span>
+              </button>
+            </>
+          )}
         </div>
       )}
 

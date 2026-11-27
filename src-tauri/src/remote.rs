@@ -356,6 +356,16 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
                 .map_err(|e| e.to_string())?;
             Ok(json!(ok))
         }
+        "set_session_discord_channel" => {
+            let id = get_str(&args, "id")?;
+            let channel = get_opt_str(&args, "discordChannel")
+                .or_else(|| get_opt_str(&args, "discord_channel"));
+            let db = ctx.db.lock().await;
+            let ok = db
+                .set_session_discord_channel(&id, channel.as_deref())
+                .map_err(|e| e.to_string())?;
+            Ok(json!(ok))
+        }
         "delete_project" => {
             let id = get_str(&args, "id")?;
             let db = ctx.db.lock().await;
@@ -899,31 +909,6 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             };
             serde_json::to_value(tel).map_err(|e| e.to_string())
         }
-        "get_guard_config" => {
-            let db = ctx.db.lock().await;
-            let cfg = crate::guard::load_guard_config(&db).map_err(|e| e.to_string())?;
-            serde_json::to_value(cfg).map_err(|e| e.to_string())
-        }
-        "set_guard_mode" => {
-            let mode = get_str(&args, "mode")?;
-            if !matches!(mode.as_str(), "yolo" | "guarded" | "strict" | "readonly") {
-                return Err(format!(
-                    "Invalid guard mode '{}'. Expected one of: yolo, guarded, strict, readonly",
-                    mode
-                ));
-            }
-            let db = ctx.db.lock().await;
-            db.set_setting("guard_mode", &mode)
-                .map_err(|e| e.to_string())?;
-            Ok(Value::Null)
-        }
-        "resolve_approval" => {
-            let approval_id = get_str(&args, "approvalId").or_else(|_| get_str(&args, "approval_id"))?;
-            let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
-            let db = ctx.db.lock().await;
-            db.resolve_approval(&approval_id, approved).map_err(|e| e.to_string())?;
-            Ok(Value::Null)
-        }
         "list_offices" => {
             let db = ctx.db.lock().await;
             let items = db.list_offices().map_err(|e| e.to_string())?;
@@ -1204,36 +1189,6 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             let id = get_str(&args, "id")?;
             let accounts = crate::telemetry::delete_quota_account_inner(&ctx.db, id).await?;
             serde_json::to_value(accounts).map_err(|e| e.to_string())
-        }
-        "list_approvals" => {
-            let session_id = get_opt_str(&args, "sessionId").or_else(|| get_opt_str(&args, "session_id"));
-            let approvals = crate::guard::list_approvals_inner(&ctx.db, session_id).await?;
-            serde_json::to_value(approvals).map_err(|e| e.to_string())
-        }
-        "request_approval" => {
-            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
-            let command = get_str(&args, "command")?;
-            let cwd = get_str(&args, "cwd")?;
-            let reason = get_str(&args, "reason")?;
-            let risk = get_str(&args, "risk")?;
-            let requested_by = get_str(&args, "requestedBy").or_else(|_| get_str(&args, "requested_by"))?;
-            let approval = crate::guard::request_approval_inner(
-                ctx.app.as_ref(),
-                &ctx.db,
-                session_id,
-                command,
-                cwd,
-                reason,
-                risk,
-                requested_by,
-            )
-            .await?;
-            serde_json::to_value(approval).map_err(|e| e.to_string())
-        }
-        "add_allowlist_prefix" => {
-            let prefix = get_str(&args, "prefix")?;
-            crate::guard::add_allowlist_prefix_inner(&ctx.db, prefix).await?;
-            Ok(Value::Null)
         }
         "ping_mcp_server" => {
             let id = get_str(&args, "id")?;
@@ -2193,30 +2148,6 @@ mod tests {
         .await
         .unwrap();
         assert!(cp.is_null() || cp.is_object());
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[tokio::test]
-    async fn dispatch_rpc_guard_allowlist_and_approvals_headless() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("sakana-remote-guard-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let ctx = make_test_context(&temp_dir);
-
-        let added = dispatch_rpc(
-            &ctx,
-            "add_allowlist_prefix",
-            json!({ "prefix": "git status" }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(added, Value::Null);
-
-        let approvals = dispatch_rpc(&ctx, "list_approvals", json!({}))
-            .await
-            .unwrap();
-        assert!(approvals.as_array().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

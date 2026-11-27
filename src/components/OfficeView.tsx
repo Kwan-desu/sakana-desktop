@@ -61,11 +61,6 @@ const EFFORT_OPTIONS: { value: ReasoningEffort; label: string }[] = [
   { value: 'xhigh', label: 'XHigh' },
 ];
 
-const PERMISSION_OPTIONS: { value: PermissionMode; label: string }[] = [
-  { value: 'supervised', label: 'Supervised' },
-  { value: 'auto-edit', label: 'Auto Edit' },
-  { value: 'yolo', label: 'Yolo' },
-];
 
 const VALID_EFFORTS: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
 
@@ -535,7 +530,6 @@ function HireStaffModal({
   const [harness, setHarness] = useState<HarnessId>('agy-cli');
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState<ReasoningEffort>('medium');
-  const [permissionMode, setPermissionMode] = useState<PermissionMode>('auto-edit');
   const [systemPrompt, setSystemPrompt] = useState('');
   const [isolatedWorktree, setIsolatedWorktree] = useState(false);
   const [avatarColor, setAvatarColor] = useState(AVATAR_COLORS[0]);
@@ -549,7 +543,6 @@ function HireStaffModal({
       setHarness(editingStaff.harness);
       setModel(editingStaff.model);
       setEffort(editingStaff.effort);
-      setPermissionMode(editingStaff.permissionMode);
       setSystemPrompt(editingStaff.systemPrompt || '');
       setIsolatedWorktree(editingStaff.isolatedWorktree);
       setAvatarColor(editingStaff.avatarColor || AVATAR_COLORS[0]);
@@ -563,7 +556,6 @@ function HireStaffModal({
       setHarness(defaultHarness);
       setModel(initialModel);
       setEffort(valid.length === 0 ? '' : valid.includes('medium') ? 'medium' : valid[0]);
-      setPermissionMode('auto-edit');
       setSystemPrompt('');
       setIsolatedWorktree(false);
       setAvatarColor(AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)]);
@@ -621,7 +613,7 @@ function HireStaffModal({
           harness,
           model,
           effort,
-          permissionMode,
+          permissionMode: 'yolo',
           systemPrompt: systemPrompt.trim(),
           isolatedWorktree: editingStaff.isMaster ? false : isolatedWorktree,
         });
@@ -634,7 +626,7 @@ function HireStaffModal({
           harness,
           model,
           effort,
-          permissionMode,
+          permissionMode: 'yolo',
           systemPrompt: systemPrompt.trim() || undefined,
           isolatedWorktree,
           avatarColor,
@@ -812,30 +804,6 @@ function HireStaffModal({
               </div>
             )}
 
-            <div>
-              <label
-                className="block text-[11.5px] font-medium mb-1"
-                style={{ color: 'var(--text-body)' }}
-              >
-                Permission Mode
-              </label>
-              <select
-                value={permissionMode}
-                onChange={(e) => setPermissionMode(e.target.value as PermissionMode)}
-                className="w-full rounded-[7px] border px-2.5 py-1.5 text-[12px]"
-                style={{
-                  backgroundColor: 'var(--bg-app)',
-                  borderColor: 'var(--border-line)',
-                  color: 'var(--text-main)',
-                }}
-              >
-                {PERMISSION_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
-            </div>
           </div>
 
           {!editingStaff && (

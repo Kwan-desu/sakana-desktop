@@ -19,8 +19,6 @@ import {
   PencilSimple,
   Plus,
   Robot,
-  ShieldCheck,
-  ShieldWarning,
   SidebarSimple,
   Stop,
   Trash,
@@ -34,7 +32,6 @@ import type {
   HarnessAuthAccount,
   HarnessId,
   InlineWidgetData,
-  PermissionMode,
   Project,
   QueuedPrompt,
   ReasoningEffort,
@@ -63,11 +60,7 @@ interface ChatPaneProps {
   onStopStreaming: (threadId: string) => void;
   onUpdateThreadConfig: (
     threadId: string,
-    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'permissionMode' | 'account'>>,
-  ) => void;
-  onResolveApproval: (
-    threadId: string,
-    decision: 'approve_once' | 'always_allow' | 'enable_yolo' | 'deny',
+    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'account'>>,
   ) => void;
   onRevertToCheckpoint: (threadId: string, checkpointId: string) => void;
   onViewCheckpointDiff: (checkpointId: string) => void;
@@ -1255,83 +1248,6 @@ const MessageRow = memo(function MessageRow({
   );
 });
 
-function ApprovalCard({
-  approval,
-  threadId,
-  onResolveApproval,
-}: {
-  approval: NonNullable<Thread['pendingApproval']>;
-  threadId: string;
-  onResolveApproval: ChatPaneProps['onResolveApproval'];
-}) {
-  return (
-    <div
-      className="sakana-card rounded-[12px] p-4 space-y-3 pop-enter"
-      style={{ borderColor: 'var(--accent-yellow)' }}
-    >
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <ShieldWarning size={16} weight="fill" style={{ color: 'var(--accent-yellow)' }} />
-          <div>
-            <div className="text-[13px] font-semibold" style={{ color: 'var(--text-main)' }}>
-              Terminal Guard Approval Required
-            </div>
-            <div className="text-[11.5px]" style={{ color: 'var(--text-muted)' }}>
-              {approval.reason}
-            </div>
-          </div>
-        </div>
-        <span
-          className="font-mono-tech text-[10px] px-2 py-0.5 rounded-[5px] uppercase"
-          style={{ backgroundColor: 'var(--accent-yellow-bg)', color: 'var(--accent-yellow)' }}
-        >
-          {approval.risk} risk
-        </span>
-      </div>
-
-      <pre
-        className="p-2.5 rounded-[8px] font-mono-tech text-[12px] overflow-x-auto m-0"
-        style={{ backgroundColor: 'var(--bg-elevated)', color: 'var(--text-main)' }}
-      >
-        <code>$ {approval.command}</code>
-      </pre>
-
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={() => onResolveApproval(threadId, 'approve_once')}
-          className="btn-solid px-3 py-1.5 text-[11.5px] font-medium cursor-pointer"
-        >
-          Approve Once
-        </button>
-        <button
-          type="button"
-          onClick={() => onResolveApproval(threadId, 'always_allow')}
-          className="btn-ghost px-3 py-1.5 text-[11.5px] font-medium cursor-pointer"
-        >
-          Approve + Allowlist
-        </button>
-        <button
-          type="button"
-          onClick={() => onResolveApproval(threadId, 'enable_yolo')}
-          className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-medium cursor-pointer"
-          style={{ backgroundColor: 'var(--accent-red-bg)', color: 'var(--accent-red)' }}
-        >
-          Approve &amp; YOLO
-        </button>
-        <button
-          type="button"
-          onClick={() => onResolveApproval(threadId, 'deny')}
-          className="btn-ghost px-3 py-1.5 text-[11.5px] font-medium cursor-pointer ml-auto"
-          style={{ color: 'var(--accent-red)' }}
-        >
-          Deny
-        </button>
-      </div>
-    </div>
-  );
-}
-
 export function ChatPane({
   thread,
   secondaryThread,
@@ -1350,7 +1266,6 @@ export function ChatPane({
   onSendPrompt,
   onStopStreaming,
   onUpdateThreadConfig,
-  onResolveApproval,
   onRevertToCheckpoint,
   onViewCheckpointDiff,
   onForkAtMessage,
@@ -1375,7 +1290,11 @@ export function ChatPane({
 }: ChatPaneProps) {
   const [input, setInput] = useState('');
   const [secondaryInput, setSecondaryInput] = useState('');
-  const [openMenu, setOpenMenu] = useState<'harness' | 'model' | 'effort' | 'perm' | 'account' | null>(null);
+  const [historyIdx, setHistoryIdx] = useState<number | null>(null);
+  const historyDraftRef = useRef('');
+  const [secondaryHistoryIdx, setSecondaryHistoryIdx] = useState<number | null>(null);
+  const secondaryHistoryDraftRef = useRef('');
+  const [openMenu, setOpenMenu] = useState<'harness' | 'model' | 'effort' | 'account' | null>(null);
   const composerToolbarRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -1572,9 +1491,25 @@ export function ChatPane({
       : [];
   const showSkillMenu = filteredSkills.length > 0;
 
-  const activeFleet = allThreads.filter(
-    (t) => t.status === 'RUNNING' || t.status === 'AWAITING_APPROVAL',
-  );
+  const activeFleet = allThreads.filter((t) => t.status === 'RUNNING');
+
+  const sentPrompts = (thread?.messages ?? [])
+    .filter((m) => m.role === 'user' && m.text.trim().length > 0)
+    .map((m) => m.text);
+
+  const secondarySentPrompts = (secondaryThread?.messages ?? [])
+    .filter((m) => m.role === 'user' && m.text.trim().length > 0)
+    .map((m) => m.text);
+
+  useEffect(() => {
+    setHistoryIdx(null);
+    historyDraftRef.current = '';
+  }, [thread?.id]);
+
+  useEffect(() => {
+    setSecondaryHistoryIdx(null);
+    secondaryHistoryDraftRef.current = '';
+  }, [secondaryThread?.id]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1582,6 +1517,8 @@ export function ChatPane({
     if (!trimmed || !thread || thread.id === 'empty') return;
     onSendPrompt(thread.id, trimmed);
     setInput('');
+    setHistoryIdx(null);
+    historyDraftRef.current = '';
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
@@ -1597,15 +1534,11 @@ export function ChatPane({
     if (!trimmed || !secondaryThread) return;
     onSendPrompt(secondaryThread.id, trimmed);
     setSecondaryInput('');
+    setSecondaryHistoryIdx(null);
+    secondaryHistoryDraftRef.current = '';
     if (secondaryTextareaRef.current) {
       secondaryTextareaRef.current.style.height = 'auto';
     }
-  };
-
-  const permLabel: Record<PermissionMode, string> = {
-    supervised: 'Supervised',
-    'auto-edit': 'Auto-Edit',
-    yolo: 'YOLO',
   };
 
   const availableModels: { id: string; label: string; family: string; efforts?: string[] }[] =
@@ -1838,14 +1771,6 @@ export function ChatPane({
                 />
               ))}
 
-              {/* Inline Terminal Guard Approval */}
-              {thread.pendingApproval && (
-                <ApprovalCard
-                  approval={thread.pendingApproval}
-                  threadId={thread.id}
-                  onResolveApproval={onResolveApproval}
-                />
-              )}
 
               {thread.status === 'RUNNING' && (
                 <div className="flex items-center gap-2 text-[12px] font-mono-tech" style={{ color: 'var(--text-muted)' }}>
@@ -2103,13 +2028,6 @@ export function ChatPane({
                       onOpenFile={onOpenFile}
                     />
                   ))}
-                  {secondaryThread.pendingApproval && (
-                    <ApprovalCard
-                      approval={secondaryThread.pendingApproval}
-                      threadId={secondaryThread.id}
-                      onResolveApproval={onResolveApproval}
-                    />
-                  )}
                   {secondaryThread.status === 'RUNNING' && (
                     <div className="flex items-center gap-2 text-[12px] font-mono-tech" style={{ color: 'var(--text-muted)' }}>
                       <span className="w-2 h-2 rounded-full pulse-dot" style={{ backgroundColor: 'var(--accent-blue)' }} />
@@ -2128,9 +2046,49 @@ export function ChatPane({
                     value={secondaryInput}
                     onChange={(e) => {
                       setSecondaryInput(e.target.value);
+                      setSecondaryHistoryIdx(null);
                       autoGrowComposer(e.target);
                     }}
                     onKeyDown={(e) => {
+                      if (e.key === 'ArrowUp' && secondarySentPrompts.length > 0) {
+                        const el = e.currentTarget;
+                        const onFirstLine = !el.value.slice(0, el.selectionStart).includes('\n');
+                        if (onFirstLine) {
+                          e.preventDefault();
+                          const nextIdx =
+                            secondaryHistoryIdx === null
+                              ? secondarySentPrompts.length - 1
+                              : Math.max(0, secondaryHistoryIdx - 1);
+                          if (secondaryHistoryIdx === null) {
+                            secondaryHistoryDraftRef.current = secondaryInput;
+                          }
+                          setSecondaryHistoryIdx(nextIdx);
+                          setSecondaryInput(secondarySentPrompts[nextIdx]);
+                          requestAnimationFrame(() => {
+                            autoGrowComposer(secondaryTextareaRef.current);
+                          });
+                          return;
+                        }
+                      }
+                      if (e.key === 'ArrowDown' && secondaryHistoryIdx !== null) {
+                        const el = e.currentTarget;
+                        const onLastLine = !el.value.slice(el.selectionEnd).includes('\n');
+                        if (onLastLine) {
+                          e.preventDefault();
+                          if (secondaryHistoryIdx < secondarySentPrompts.length - 1) {
+                            const nextIdx = secondaryHistoryIdx + 1;
+                            setSecondaryHistoryIdx(nextIdx);
+                            setSecondaryInput(secondarySentPrompts[nextIdx]);
+                          } else {
+                            setSecondaryHistoryIdx(null);
+                            setSecondaryInput(secondaryHistoryDraftRef.current);
+                          }
+                          requestAnimationFrame(() => {
+                            autoGrowComposer(secondaryTextareaRef.current);
+                          });
+                          return;
+                        }
+                      }
                       if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
                         handleSecondarySubmit(e);
@@ -2417,6 +2375,7 @@ export function ChatPane({
                 value={input}
                 onChange={(e) => {
                   setInput(e.target.value);
+                  setHistoryIdx(null);
                   setSkillIdx(0);
                   setSlashDismissed(false);
                   autoGrowComposer(e.target);
@@ -2466,6 +2425,45 @@ export function ChatPane({
                     e.preventDefault();
                     setOpenMenu(null);
                     return;
+                  }
+                  if (e.key === 'ArrowUp' && !showSkillMenu && sentPrompts.length > 0) {
+                    const el = e.currentTarget;
+                    const onFirstLine = !el.value.slice(0, el.selectionStart).includes('\n');
+                    if (onFirstLine) {
+                      e.preventDefault();
+                      const nextIdx =
+                        historyIdx === null
+                          ? sentPrompts.length - 1
+                          : Math.max(0, historyIdx - 1);
+                      if (historyIdx === null) {
+                        historyDraftRef.current = input;
+                      }
+                      setHistoryIdx(nextIdx);
+                      setInput(sentPrompts[nextIdx]);
+                      requestAnimationFrame(() => {
+                        autoGrowComposer(textareaRef.current);
+                      });
+                      return;
+                    }
+                  }
+                  if (e.key === 'ArrowDown' && !showSkillMenu && historyIdx !== null) {
+                    const el = e.currentTarget;
+                    const onLastLine = !el.value.slice(el.selectionEnd).includes('\n');
+                    if (onLastLine) {
+                      e.preventDefault();
+                      if (historyIdx < sentPrompts.length - 1) {
+                        const nextIdx = historyIdx + 1;
+                        setHistoryIdx(nextIdx);
+                        setInput(sentPrompts[nextIdx]);
+                      } else {
+                        setHistoryIdx(null);
+                        setInput(historyDraftRef.current);
+                      }
+                      requestAnimationFrame(() => {
+                        autoGrowComposer(textareaRef.current);
+                      });
+                      return;
+                    }
                   }
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault();
@@ -2785,45 +2783,6 @@ export function ChatPane({
                     );
                   })()}
 
-                  {/* Permission / Guard Pill (Icon-only) */}
-                  <div className="relative shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setOpenMenu((m) => (m === 'perm' ? null : 'perm'))}
-                      className="w-7 h-7 rounded-[7px] inline-flex items-center justify-center cursor-pointer hover:bg-[var(--bg-hover)]"
-                      style={{
-                        color:
-                          thread.permissionMode === 'yolo'
-                            ? 'var(--accent-red)'
-                            : thread.permissionMode === 'auto-edit'
-                              ? 'var(--accent-blue)'
-                              : 'var(--text-muted)',
-                      }}
-                      title={`Permission: ${permLabel[thread.permissionMode]}`}
-                      aria-label={`Permission mode: ${permLabel[thread.permissionMode]}`}
-                    >
-                      <ShieldCheck size={14} weight={thread.permissionMode === 'supervised' ? 'regular' : 'fill'} />
-                    </button>
-                    {openMenu === 'perm' && (
-                      <div className="sakana-popover pop-enter absolute bottom-full left-0 mb-1.5 w-44 rounded-[10px] p-1 z-50 space-y-0.5">
-                        {(['supervised', 'auto-edit', 'yolo'] as PermissionMode[]).map((pm) => (
-                          <button
-                            key={pm}
-                            type="button"
-                            onClick={() => {
-                              onUpdateThreadConfig(thread.id, { permissionMode: pm });
-                              setOpenMenu(null);
-                            }}
-                            className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center justify-between cursor-pointer hover:bg-[var(--bg-hover)]"
-                            style={{ color: 'var(--text-main)' }}
-                          >
-                            <span>{permLabel[pm]}</span>
-                            {thread.permissionMode === pm && <Check size={12} weight="bold" />}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
                 </div>
 
                 <div className="flex items-center gap-1 shrink-0">

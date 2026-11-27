@@ -442,24 +442,7 @@ pub async fn translate_nl_command_inner(
     let cmd = sanitize_nl_command(
         &translated.unwrap_or_else(|| deterministic_nl_fallback(&clean, &os, &shell)),
     );
-    let guard_cfg = {
-        let db = db.lock().await;
-        crate::guard::load_guard_config(&db).unwrap_or_else(|_| crate::models::GuardConfig {
-            mode: "guarded".to_string(),
-            catastrophic_guardrail: true,
-            allowlist_prefixes: Vec::new(),
-        })
-    };
-
-    match crate::guard::evaluate_command(&guard_cfg, &cmd) {
-        crate::guard::GuardDecision::Block(reason) => {
-            Ok(format!("# [GUARD BLOCKED: {}] {}", reason, cmd))
-        }
-        crate::guard::GuardDecision::RequireApproval { reason, risk } => {
-            Ok(format!("# [GUARD {} risk: {}] {}", risk, reason, cmd))
-        }
-        crate::guard::GuardDecision::Allow => Ok(cmd),
-    }
+    Ok(cmd)
 }
 
 #[tauri::command]

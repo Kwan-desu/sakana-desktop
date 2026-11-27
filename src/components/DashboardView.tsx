@@ -33,8 +33,6 @@ import type {
   DiscordUserRule,
   EnvSecret,
   GitHubAuthStatus,
-  GuardConfig,
-  GuardMode,
   HarnessAuthAccount,
   HarnessId,
   HarnessLoginResponse,
@@ -118,6 +116,7 @@ interface DashboardViewProps {
   onOpenGitHubClone?: () => void;
   projects?: Project[];
   onSetProjectDiscordChannel?: (projectId: string, channel?: string) => Promise<void> | void;
+  onSetThreadDiscordChannel?: (threadId: string, channel?: string | null) => Promise<void> | void;
   customization?: AppCustomization | null;
   onUpdateCustomization?: (next: AppCustomization) => Promise<void> | void;
   onResetCustomization?: () => Promise<void> | void;
@@ -191,6 +190,7 @@ export function DashboardView({
   onOpenGitHubClone,
   projects = [],
   onSetProjectDiscordChannel,
+  onSetThreadDiscordChannel,
   customization,
   onUpdateCustomization,
   onResetCustomization,
@@ -228,13 +228,6 @@ export function DashboardView({
   const [pairingInput, setPairingInput] = useState('');
   const [testingHostId, setTestingHostId] = useState<string | null>(null);
 
-  // Terminal Guard config state
-  const [guardConfig, setGuardConfig] = useState<GuardConfig>({
-    mode: 'guarded',
-    catastrophicGuardrail: true,
-    allowlistPrefixes: [],
-  });
-  const [newAllowPrefix, setNewAllowPrefix] = useState('');
 
   // Desktop App Updater state
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -455,59 +448,6 @@ export function DashboardView({
     }
   };
 
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let cancelled = false;
-    void tauriApi
-      .getGuardConfig()
-      .then((cfg) => {
-        if (!cancelled && cfg) setGuardConfig(cfg);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const handleGuardModeChange = async (mode: GuardMode) => {
-    setGuardConfig((prev) => ({ ...prev, mode }));
-    if (isTauriRuntime()) {
-      try {
-        await tauriApi.setGuardMode(mode);
-        const refreshed = await tauriApi.getGuardConfig();
-        if (refreshed) setGuardConfig(refreshed);
-        onToast(`Terminal Guard mode set to ${mode}`);
-      } catch (err) {
-        onToast(`Failed to set guard mode: ${String(err)}`);
-      }
-    } else {
-      onToast(`Terminal Guard mode set to ${mode}`);
-    }
-  };
-
-  const handleAddAllowlistPrefix = async () => {
-    const prefix = newAllowPrefix.trim();
-    if (!prefix) return;
-    setNewAllowPrefix('');
-    if (isTauriRuntime()) {
-      try {
-        await tauriApi.addAllowlistPrefix(prefix);
-        const refreshed = await tauriApi.getGuardConfig();
-        if (refreshed) setGuardConfig(refreshed);
-        onToast(`Added allowlist prefix: ${prefix}`);
-      } catch (err) {
-        onToast(`Failed to add prefix: ${String(err)}`);
-      }
-    } else {
-      setGuardConfig((prev) => ({
-        ...prev,
-        allowlistPrefixes: prev.allowlistPrefixes.includes(prefix)
-          ? prev.allowlistPrefixes
-          : [...prev.allowlistPrefixes, prefix],
-      }));
-      onToast(`Added allowlist prefix: ${prefix}`);
-    }
-  };
 
   const handleCheckForUpdates = async () => {
     setCheckingUpdate(true);
@@ -562,7 +502,8 @@ export function DashboardView({
     }
   };
 
-  const pendingThreads = threads.filter((t) => t.pendingApproval);
+  const discordThreads = threads.filter((t) => t.isDiscord);
+  const boundProjectsCount = projects.filter((p) => Boolean(p.discordChannel)).length;
   const autostartEnabled = telemetry?.autostartEnabled ?? false;
 
   const safeNum = (v: number | undefined | null): number =>
@@ -631,7 +572,7 @@ export function DashboardView({
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               {[
                 { label: 'Active Worktrees', val: String(threads.length), sub: 'Isolated checkouts' },
-                { label: 'Pending Approvals', val: String(pendingThreads.length), sub: 'Terminal Guard queue' },
+                { label: 'Discord Chats', val: String(discordThreads.length), sub: `${boundProjectsCount} bound projects` },
                 { label: 'MCP Servers', val: String(mcpServers.filter((m) => m.enabled).length), sub: `${mcpServers.length} configured` },
                 {
                   label: 'Host Uptime',
@@ -658,108 +599,51 @@ export function DashboardView({
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-3" style={{ borderColor: 'var(--border-line)' }}>
                   <div>
                     <h2 className="text-[14.5px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
-                      Terminal Guard Approval Queue
+                      Active &amp; Discord Threads
                     </h2>
                     <p className="text-[12px] m-0" style={{ color: 'var(--text-muted)' }}>
-                      Synced across Web UI &amp; Discord
+                      All agents run autonomously in YOLO mode
                     </p>
                   </div>
-                  <div className="flex items-center gap-1">
-                    {(['yolo', 'guarded', 'strict', 'readonly'] as GuardMode[]).map((mode) => {
-                      const active = guardConfig.mode === mode;
-                      return (
-                        <button
-                          key={mode}
-                          type="button"
-                          onClick={() => void handleGuardModeChange(mode)}
-                          className="font-mono-tech text-[10.5px] px-2 py-0.5 rounded-[5px] cursor-pointer capitalize border"
-                          style={
-                            active
-                              ? {
-                                  backgroundColor: 'var(--accent-blue-bg)',
-                                  color: 'var(--accent-blue)',
-                                  borderColor: 'var(--accent-blue)',
-                                }
-                              : {
-                                  backgroundColor: 'var(--bg-app)',
-                                  color: 'var(--text-muted)',
-                                  borderColor: 'var(--border-line)',
-                                }
-                          }
-                        >
-                          {mode}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="space-y-2 pb-2 border-b" style={{ borderColor: 'var(--border-line)' }}>
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      void handleAddAllowlistPrefix();
-                    }}
-                    className="flex items-center gap-2"
+                  <span
+                    className="font-mono-tech text-[10.5px] px-2 py-0.5 rounded-[5px]"
+                    style={{ backgroundColor: 'var(--accent-green-bg)', color: 'var(--accent-green)' }}
                   >
-                    <input
-                      value={newAllowPrefix}
-                      onChange={(e) => setNewAllowPrefix(e.target.value)}
-                      placeholder="Add allowlist prefix (e.g. git status, npm test)"
-                      className="flex-1 rounded-[6px] border px-2.5 py-1 font-mono-tech text-[11px]"
-                      style={{ backgroundColor: 'var(--bg-app)', borderColor: 'var(--border-line)', color: 'var(--text-main)' }}
-                    />
-                    <button
-                      type="submit"
-                      className="btn-ghost px-2.5 py-1 text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer"
-                    >
-                      <Plus size={11} />
-                      <span>Allow</span>
-                    </button>
-                  </form>
-                  {guardConfig.allowlistPrefixes.length > 0 && (
-                    <div className="flex flex-wrap gap-1.5">
-                      {guardConfig.allowlistPrefixes.map((prefix) => (
-                        <span
-                          key={prefix}
-                          className="font-mono-tech text-[10px] px-2 py-0.5 rounded-[4px]"
-                          style={{ backgroundColor: 'var(--bg-elevated)', color: 'var(--text-body)' }}
-                        >
-                          {prefix}
-                        </span>
-                      ))}
-                    </div>
-                  )}
+                    YOLO Always On
+                  </span>
                 </div>
 
-                {pendingThreads.length === 0 ? (
+                {threads.length === 0 ? (
                   <div className="py-6 text-center text-[12.5px]" style={{ color: 'var(--text-muted)' }}>
-                    No pending command approvals.
+                    No active threads yet.
                   </div>
                 ) : (
-                  pendingThreads.map((pt) => (
-                    <div
-                      key={pt.id}
-                      className="rounded-[9px] border p-3.5 space-y-2"
-                      style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[12.5px] font-medium" style={{ color: 'var(--text-main)' }}>
-                          {pt.title}
-                        </span>
+                  <div className="space-y-2">
+                    {threads.slice(0, 6).map((t) => (
+                      <div
+                        key={t.id}
+                        className="rounded-[9px] border px-3.5 py-2.5 flex items-center justify-between gap-2"
+                        style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 text-[12.5px] font-medium truncate" style={{ color: 'var(--text-main)' }}>
+                            {t.isDiscord && <DiscordIcon size={12} style={{ color: 'var(--accent-discord)' }} />}
+                            <span className="truncate">{t.title}</span>
+                          </div>
+                          <div className="font-mono-tech text-[10.5px] truncate" style={{ color: 'var(--text-muted)' }}>
+                            {t.harness} · {t.discordChannel || t.branch || 'main'} · {t.status}
+                          </div>
+                        </div>
                         <button
                           type="button"
-                          onClick={() => onSelectThread(pt.id)}
-                          className="btn-solid px-2.5 py-1 text-[11px] cursor-pointer"
+                          onClick={() => onSelectThread(t.id)}
+                          className="btn-ghost px-2.5 py-1 text-[11px] cursor-pointer shrink-0"
                         >
-                          Review in Thread
+                          Open
                         </button>
                       </div>
-                      <code className="block font-mono-tech text-[11.5px]" style={{ color: 'var(--accent-yellow)' }}>
-                        $ {pt.pendingApproval?.command}
-                      </code>
-                    </div>
-                  ))
+                    ))}
+                  </div>
                 )}
               </div>
 
@@ -2258,7 +2142,7 @@ export function DashboardView({
                       Users &amp; Role Sandbox
                     </h2>
                     <p className="text-[11.5px] m-0" style={{ color: 'var(--text-muted)' }}>
-                      Friends &amp; Guests run in isolated chat-only sandboxes with zero shell access
+                      Owner &amp; Friends get full private DM + channel control · Guests can privately DM the bot in a read-only sandbox
                     </p>
                   </div>
                 </div>
@@ -2421,6 +2305,21 @@ export function DashboardView({
                             >
                               Save
                             </button>
+                            {p.discordChannel && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setProjChannelDrafts((prev) => ({ ...prev, [p.id]: '' }));
+                                  void onSetProjectDiscordChannel(p.id, '');
+                                }}
+                                className="btn-ghost p-1 cursor-pointer"
+                                title="Unbind Discord channel"
+                                aria-label={`Unbind Discord channel for ${p.name}`}
+                                style={{ color: 'var(--text-muted)' }}
+                              >
+                                <Trash size={12} />
+                              </button>
+                            )}
                           </div>
                         </div>
                       );
@@ -2428,6 +2327,66 @@ export function DashboardView({
                   </div>
                 </div>
               )}
+
+              <div className="sakana-card rounded-[12px] p-5 space-y-3 mt-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-[14px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
+                    Discord-Synced Threads &amp; Private DMs
+                  </h3>
+                  <span className="font-mono-tech text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
+                    {discordThreads.length} active
+                  </span>
+                </div>
+                <p className="text-[11.5px] m-0" style={{ color: 'var(--text-muted)' }}>
+                  Right-click any project or thread in the sidebar to turn it into a Discord chat, or DM the bot directly.
+                </p>
+                {discordThreads.length === 0 ? (
+                  <div className="py-3 text-center text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                    No Discord-synced threads yet.
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {discordThreads.map((t) => (
+                      <div
+                        key={t.id}
+                        className="flex items-center justify-between gap-2 p-2.5 rounded-[8px] border"
+                        style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[12.5px] font-medium truncate flex items-center gap-1.5" style={{ color: 'var(--text-main)' }}>
+                            <DiscordIcon size={12} style={{ color: 'var(--accent-discord)' }} />
+                            <span className="truncate">{t.title}</span>
+                          </div>
+                          <div className="font-mono-tech text-[10px] truncate" style={{ color: 'var(--text-muted)' }}>
+                            {t.discordChannel || '#discord'} · {t.messages.length} messages
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => onSelectThread(t.id)}
+                            className="btn-ghost px-2.5 py-1 text-[11px] cursor-pointer"
+                          >
+                            Open
+                          </button>
+                          {onSetThreadDiscordChannel && (
+                            <button
+                              type="button"
+                              onClick={() => void onSetThreadDiscordChannel(t.id, null)}
+                              className="btn-ghost p-1 cursor-pointer"
+                              title="Disconnect thread from Discord"
+                              aria-label={`Disconnect ${t.title} from Discord`}
+                              style={{ color: 'var(--text-muted)' }}
+                            >
+                              <Trash size={12} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="lg:col-span-4 space-y-4">
@@ -2521,6 +2480,20 @@ export function DashboardView({
                   <Copy size={13} />
                   <span>Copy OAuth2 Invite</span>
                 </button>
+              </div>
+
+              <div className="sakana-card rounded-[12px] p-5 space-y-2.5 h-fit">
+                <h3 className="text-[14px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
+                  Commands &amp; Private DMs
+                </h3>
+                <div className="space-y-1.5 text-[11.5px] font-mono-tech" style={{ color: 'var(--text-body)' }}>
+                  <div><strong>Direct Message</strong> — Private chat for Owner, Friend &amp; Guest</div>
+                  <div><strong>!project &lt;name&gt;</strong> — Switch active DM project</div>
+                  <div><strong>/projects</strong> — List projects &amp; channel links</div>
+                  <div><strong>/bind &lt;project&gt;</strong> — Link current channel or DM</div>
+                  <div><strong>/ask &lt;prompt&gt;</strong> — Send prompt to bound project/DM</div>
+                  <div><strong>/status</strong> — Show workspace status</div>
+                </div>
               </div>
             </div>
           </div>

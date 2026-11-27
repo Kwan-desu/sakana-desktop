@@ -19,10 +19,6 @@ import type {
   EnvSecret,
   GitHubAuthStatus,
   GitHubRepo,
-  GuardApprovalEvent,
-  GuardConfig,
-  GuardMode,
-  GuardResolvedEvent,
   HarnessAuthAccount,
   HarnessId,
   HarnessLoginResponse,
@@ -202,6 +198,12 @@ export const tauriApi = {
       discordChannel: discordChannel ?? null,
     }),
 
+  setSessionDiscordChannel: (id: string, discordChannel?: string | null) =>
+    tauriInvoke<boolean>('set_session_discord_channel', {
+      id,
+      discordChannel: discordChannel ?? null,
+    }),
+
   openFileExternal: (cwd: string, relPath: string, wslDistro?: string) =>
     tauriInvoke<void>('open_file_external', {
       cwd,
@@ -240,7 +242,7 @@ export const tauriApi = {
   setTheme: (theme: ThemeId) =>
     tauriInvoke<void>('set_theme', { theme }),
 
-  // Phase 2: Live turns, skills, and Terminal Guard
+  // Phase 2: Live turns and skills
   sendTurn: (
     sessionId: string,
     prompt: string,
@@ -260,47 +262,6 @@ export const tauriApi = {
   listSkills: (projectCwd: string) =>
     tauriInvoke<SkillItem[]>('list_skills', { projectCwd }),
 
-  requestApproval: (
-    sessionId: string,
-    command: string,
-    reason: string,
-    cwd: string = '.',
-    risk: 'medium' | 'high' = 'medium',
-    requestedBy: HarnessId = 'sakana',
-  ) =>
-    tauriInvoke<PendingApproval>('request_approval', {
-      sessionId,
-      command,
-      cwd,
-      reason,
-      risk,
-      requestedBy,
-    }),
-
-  resolveApproval: (
-    approvalId: string,
-    approved: boolean,
-    allowPrefix?: string,
-  ) =>
-    tauriInvoke<void>('resolve_approval', {
-      approvalId,
-      approved,
-      allowPrefix,
-    }),
-
-  listApprovals: (sessionId?: string) =>
-    tauriInvoke<PendingApproval[]>(
-      'list_approvals',
-      sessionId ? { sessionId } : {},
-    ),
-
-  setGuardMode: (mode: GuardMode) =>
-    tauriInvoke<void>('set_guard_mode', { mode }),
-
-  addAllowlistPrefix: (prefix: string) =>
-    tauriInvoke<void>('add_allowlist_prefix', { prefix }),
-
-  getGuardConfig: () => tauriInvoke<GuardConfig>('get_guard_config'),
 
   // Phase 2: Typed Tauri event listeners
   onTurnToken: (handler: (payload: TurnTokenEvent) => void) =>
@@ -321,22 +282,11 @@ export const tauriApi = {
   onTurnError: (handler: (payload: TurnErrorEvent) => void) =>
     tauriListen<TurnErrorEvent>('turn:error', handler),
 
-  onGuardApproval: (
-    handler: (payload: GuardApprovalEvent | PendingApproval) => void,
-  ) =>
-    tauriListen<GuardApprovalEvent | PendingApproval>(
-      'guard:approval',
-      handler,
-    ),
-
   onAutomationRun: (handler: (payload: AutomationItem) => void) =>
     tauriListen<AutomationItem>('automation-run', handler),
 
   onDiscordPrompt: (handler: (payload: DiscordPromptEvent) => void) =>
     tauriListen<DiscordPromptEvent>('discord-prompt', handler),
-
-  onGuardResolved: (handler: (payload: GuardResolvedEvent) => void) =>
-    tauriListen<GuardResolvedEvent>('guard-resolved', handler),
 
   // Phase 3: Git worktrees, branches, checkpoints, diffs, commits, PRs
   createWorktree: (

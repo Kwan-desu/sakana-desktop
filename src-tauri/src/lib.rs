@@ -3,7 +3,6 @@ pub mod automation;
 pub mod db;
 pub mod discord;
 pub mod git;
-pub mod guard;
 pub mod harness;
 pub mod mcp;
 pub mod models;
@@ -87,6 +86,17 @@ async fn set_project_discord_channel(
 ) -> Result<bool, String> {
     let db = state.0.lock().await;
     db.set_project_discord_channel(&id, discord_channel.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_session_discord_channel(
+    state: State<'_, DbState>,
+    id: String,
+    discord_channel: Option<String>,
+) -> Result<bool, String> {
+    let db = state.0.lock().await;
+    db.set_session_discord_channel(&id, discord_channel.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -493,6 +503,7 @@ pub fn run() {
             create_project,
             rename_project,
             set_project_discord_channel,
+            set_session_discord_channel,
             open_file_external,
             reorder_projects,
             reorder_sessions,
@@ -506,12 +517,6 @@ pub fn run() {
             pick_project_folder,
             pick_attachment_files,
             save_clipboard_attachment,
-            guard::request_approval,
-            guard::resolve_approval,
-            guard::list_approvals,
-            guard::set_guard_mode,
-            guard::add_allowlist_prefix,
-            guard::get_guard_config,
             harness::send_turn,
             harness::cancel_turn,
             harness::list_skills,

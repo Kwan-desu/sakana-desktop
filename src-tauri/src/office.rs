@@ -214,7 +214,7 @@ pub async fn hire_staff_internal(
     let staff_id = format!("staff-{}", Uuid::new_v4());
     let effort = input.effort.unwrap_or_else(|| "medium".to_string());
     let account = input.account.unwrap_or_else(|| "default".to_string());
-    let permission_mode = input.permission_mode.unwrap_or_else(|| "auto".to_string());
+    let permission_mode = input.permission_mode.unwrap_or_else(|| "yolo".to_string());
     let want_isolated = input.isolated_worktree.unwrap_or(false);
 
     let session = {
@@ -482,7 +482,7 @@ pub async fn create_office_inner(
         .unwrap_or_else(|| "default".to_string());
     let master_permission_mode = input
         .master_permission_mode
-        .unwrap_or_else(|| "auto".to_string());
+        .unwrap_or_else(|| "yolo".to_string());
     let max_rounds = input.max_rounds.unwrap_or(4).clamp(1, 20);
 
     let (project_id, cwd) = {

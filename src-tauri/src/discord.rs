@@ -1,17 +1,14 @@
 use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
-use serenity::all::{
-    ActionRowComponent, ButtonStyle, CreateActionRow, CreateButton, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, FullEvent, GatewayIntents, Interaction,
-};
+use serenity::all::{FullEvent, GatewayIntents};
 use serenity::gateway::ShardManager;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::models::{ChatMessage, CreateSessionInput, DiscordStatus, DiscordUserRule};
+use crate::models::{ChatMessage, CreateSessionInput, DiscordStatus, DiscordUserRule, Project};
 use crate::DbState;
 
 const DISCORD_TOKEN_KEY: &str = "discord_bot_token";
@@ -58,6 +55,209 @@ async fn resolve_user_role(db: &Arc<Mutex<Database>>, user_id: u64) -> String {
         .unwrap_or_else(|| "blocked".to_string())
 }
 
+fn dm_project_setting_key(user_id: u64) -> String {
+    format!("discord_dm_project:{}", user_id)
+}
+
+fn find_project_by_query<'a>(projects: &'a [Project], query: &str) -> Option<&'a Project> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    projects
+        .iter()
+        .find(|p| p.id.eq_ignore_ascii_case(&q) || p.name.eq_ignore_ascii_case(&q))
+        .or_else(|| projects.iter().find(|p| p.name.to_lowercase().contains(&q)))
+}
+
+fn truncate_discord_reply(reply: &str) -> String {
+    if reply.chars().count() > 1850 {
+        format!("{}…", reply.chars().take(1850).collect::<String>())
+    } else {
+        reply.to_string()
+    }
+}
+
+/// Route a prompt from either a private DM or a bound guild channel/thread into a Sakana session,
+/// persist the user message, emit `discord-prompt`, and execute the turn.
+async fn dispatch_discord_prompt(
+    app: &AppHandle,
+    db: &Arc<Mutex<Database>>,
+    user_id: u64,
+    author_name: &str,
+    role: &str,
+    is_dm: bool,
+    channel_label: &str,
+    prompt: &str,
+) -> Result<(String, String), String> {
+    let (session_id, target_label) = {
+        let db_lock = db.lock().await;
+        let projects = db_lock.list_projects().unwrap_or_default();
+        let all_sessions = db_lock.list_sessions(None).unwrap_or_default();
+
+        let (session, label) = if is_dm {
+            // Private DM: allowed for owner, friend, and guest.
+            // Resolve user's preferred DM project, or fall back to the first project.
+            let saved_pid = db_lock
+                .get_setting(&dm_project_setting_key(user_id))
+                .ok()
+                .flatten();
+            let target_proj = saved_pid
+                .as_deref()
+                .and_then(|pid| projects.iter().find(|p| p.id == pid))
+                .or_else(|| projects.first())
+                .cloned()
+                .ok_or_else(|| {
+                    "No Sakana projects exist yet. Create a project in Sakana first.".to_string()
+                })?;
+
+            let dm_chan = format!("#dm-{}", user_id);
+            let existing_dm = all_sessions.into_iter().find(|s| {
+                s.is_discord.unwrap_or(false)
+                    && s.project_id == target_proj.id
+                    && s.discord_channel
+                        .as_deref()
+                        .map(|c| c.eq_ignore_ascii_case(&dm_chan))
+                        .unwrap_or(false)
+            });
+
+            let sess = match existing_dm {
+                Some(s) => s,
+                None => db_lock
+                    .create_session(CreateSessionInput {
+                        project_id: target_proj.id.clone(),
+                        title: format!("DM · {} ({})", author_name, role),
+                        harness: Some("sakana".to_string()),
+                        model: None,
+                        effort: None,
+                        account: None,
+                        permission_mode: Some("yolo".to_string()),
+                        worktree_path: Some(target_proj.cwd.clone()),
+                        branch: None,
+                        shared_deps: None,
+                        is_discord: Some(true),
+                        discord_channel: Some(dm_chan),
+                    })
+                    .map_err(|e| e.to_string())?,
+            };
+            (sess, format!("{} (DM)", target_proj.name))
+        } else {
+            // Guild channel: first check if a specific thread/session is bound to this channel.
+            if let Some(bound_session) = all_sessions.iter().find(|s| {
+                s.is_discord.unwrap_or(false)
+                    && s.discord_channel
+                        .as_deref()
+                        .map(|c| c.eq_ignore_ascii_case(channel_label))
+                        .unwrap_or(false)
+            }) {
+                let proj_name = projects
+                    .iter()
+                    .find(|p| p.id == bound_session.project_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| bound_session.title.clone());
+                (bound_session.clone(), proj_name)
+            } else {
+                // Otherwise check if a project is bound to this channel.
+                let target_project = projects
+                    .iter()
+                    .find(|p| {
+                        p.discord_channel
+                            .as_deref()
+                            .map(|c| c.eq_ignore_ascii_case(channel_label))
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "No Sakana project or thread is mapped to Discord channel `{}`. Right-click a project or thread in Sakana to link it, or run `/bind <project>` here.",
+                            channel_label
+                        )
+                    })?;
+
+                let existing_discord = all_sessions.into_iter().find(|s| {
+                    s.project_id == target_project.id
+                        && s.is_discord.unwrap_or(false)
+                        && s.discord_channel
+                            .as_deref()
+                            .map(|c| c.eq_ignore_ascii_case(channel_label))
+                            .unwrap_or(false)
+                });
+
+                let sess = match existing_discord {
+                    Some(s) => s,
+                    None => db_lock
+                        .create_session(CreateSessionInput {
+                            project_id: target_project.id.clone(),
+                            title: format!("Discord {}", channel_label),
+                            harness: Some("sakana".to_string()),
+                            model: None,
+                            effort: None,
+                            account: None,
+                            permission_mode: Some("yolo".to_string()),
+                            worktree_path: Some(target_project.cwd.clone()),
+                            branch: None,
+                            shared_deps: None,
+                            is_discord: Some(true),
+                            discord_channel: Some(channel_label.to_string()),
+                        })
+                        .map_err(|e| e.to_string())?,
+                };
+                (sess, target_project.name)
+            }
+        };
+
+        let user_msg = ChatMessage {
+            id: format!("msg-{}", Uuid::new_v4()),
+            role: "user".to_string(),
+            author: Some(author_name.to_string()),
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+            text: prompt.to_string(),
+            thinking: None,
+            thinking_duration: None,
+            tools: None,
+            subagent: None,
+            widget: None,
+            checkpoint: None,
+        };
+        db_lock
+            .append_message(&session.id, &user_msg)
+            .map_err(|e| e.to_string())?;
+
+        (session.id, label)
+    };
+
+    let _ = app.emit(
+        "discord-prompt",
+        serde_json::json!({
+            "sessionId": session_id,
+            "channel": channel_label.trim_start_matches('#'),
+            "author": author_name,
+            "prompt": prompt,
+        }),
+    );
+
+    let read_only = role != "owner" && role != "friend";
+    let effective_prompt = if read_only {
+        format!(
+            "[READ-ONLY DISCORD ROLE ({})]: Answer questions and inspect status/code only. Do NOT modify files, run mutating shell commands, or perform destructive actions.\n\n{}",
+            role, prompt
+        )
+    } else {
+        prompt.to_string()
+    };
+
+    let reply = crate::harness::run_one_shot_prompt_with_opts(
+        app,
+        Arc::clone(db),
+        &session_id,
+        &effective_prompt,
+        read_only,
+    )
+    .await?;
+
+    Ok((target_label, truncate_discord_reply(&reply)))
+}
+
 #[poise::command(slash_command, description_localized("en-US", "Show Sakana workspace status"))]
 async fn status(ctx: BotContext<'_>) -> Result<(), BotError> {
     let role = resolve_user_role(&ctx.data().db, ctx.author().id.get()).await;
@@ -66,23 +266,109 @@ async fn status(ctx: BotContext<'_>) -> Result<(), BotError> {
         return Ok(());
     }
 
-    let (proj_count, sess_count, approval_count) = {
+    let (proj_count, sess_count, discord_bound) = {
         let db_lock = ctx.data().db.lock().await;
         let projects = db_lock.list_projects().unwrap_or_default();
         let sessions = db_lock.list_sessions(None).unwrap_or_default();
-        let approvals = db_lock.list_approvals(None).unwrap_or_default();
-        (projects.len(), sessions.len(), approvals.len())
+        let bound = projects.iter().filter(|p| p.discord_channel.is_some()).count();
+        (projects.len(), sessions.len(), bound)
     };
 
     ctx.say(format!(
-        "Sakana Status (role: `{}`)\n• Projects: {}\n• Sessions: {}\n• Pending Approvals: {}",
-        role, proj_count, sess_count, approval_count
+        "Sakana Status (role: `{}`)\n• Projects: {} ({} linked to Discord)\n• Sessions: {}",
+        role, proj_count, discord_bound, sess_count
     ))
     .await?;
     Ok(())
 }
 
-#[poise::command(slash_command, description_localized("en-US", "Send a prompt to the synced Sakana project thread"))]
+#[poise::command(slash_command, description_localized("en-US", "List Sakana projects and their Discord channels"))]
+async fn projects(ctx: BotContext<'_>) -> Result<(), BotError> {
+    let role = resolve_user_role(&ctx.data().db, ctx.author().id.get()).await;
+    if role == "blocked" {
+        ctx.say("Access denied (blocked by Sakana RBAC).").await?;
+        return Ok(());
+    }
+
+    let lines = {
+        let db_lock = ctx.data().db.lock().await;
+        let projs = db_lock.list_projects().unwrap_or_default();
+        let active_dm_pid = db_lock
+            .get_setting(&dm_project_setting_key(ctx.author().id.get()))
+            .ok()
+            .flatten();
+        if projs.is_empty() {
+            vec!["No projects configured in Sakana yet.".to_string()]
+        } else {
+            projs
+                .iter()
+                .map(|p| {
+                    let ch = p
+                        .discord_channel
+                        .as_deref()
+                        .unwrap_or("unlinked");
+                    let dm_mark = if active_dm_pid.as_deref() == Some(p.id.as_str()) {
+                        " *(active DM)*"
+                    } else {
+                        ""
+                    };
+                    format!("• **{}** — `{}`{}", p.name, ch, dm_mark)
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    ctx.say(format!("**Sakana Projects:**\n{}", lines.join("\n")))
+        .await?;
+    Ok(())
+}
+
+#[poise::command(slash_command, description_localized("en-US", "Bind this channel (or your DM) to a Sakana project"))]
+async fn bind(
+    ctx: BotContext<'_>,
+    #[description = "Project name or ID"] project: String,
+) -> Result<(), BotError> {
+    let role = resolve_user_role(&ctx.data().db, ctx.author().id.get()).await;
+    if role == "blocked" {
+        ctx.say("Access denied (blocked by Sakana RBAC).").await?;
+        return Ok(());
+    }
+
+    let is_dm = ctx.guild_id().is_none();
+    if !is_dm && role != "owner" {
+        ctx.say("Only Owner can bind server channels to projects. In a private DM, any allowed user can switch their active project.").await?;
+        return Ok(());
+    }
+
+    let result = {
+        let db_lock = ctx.data().db.lock().await;
+        let projs = db_lock.list_projects().unwrap_or_default();
+        if let Some(target) = find_project_by_query(&projs, &project) {
+            if is_dm {
+                let _ = db_lock.set_setting(&dm_project_setting_key(ctx.author().id.get()), &target.id);
+                Ok(format!("Private DM is now switched to project **{}** (`{}`).", target.name, target.cwd))
+            } else {
+                let channel_name = ctx
+                    .guild_channel()
+                    .await
+                    .map(|c| format!("#{}", c.name))
+                    .unwrap_or_else(|| format!("#{}", ctx.channel_id()));
+                let _ = db_lock.set_project_discord_channel(&target.id, Some(&channel_name));
+                Ok(format!("Linked Discord channel `{}` to project **{}**.", channel_name, target.name))
+            }
+        } else {
+            Err(format!("Project `{}` not found. Use `/projects` to see available projects.", project))
+        }
+    };
+
+    match result {
+        Ok(msg) => { ctx.say(msg).await?; }
+        Err(msg) => { ctx.say(msg).await?; }
+    }
+    Ok(())
+}
+
+#[poise::command(slash_command, description_localized("en-US", "Send a prompt to the synced Sakana project thread or private DM"))]
 async fn ask(
     ctx: BotContext<'_>,
     #[description = "Prompt for Sakana"] prompt: String,
@@ -93,150 +379,36 @@ async fn ask(
         return Ok(());
     }
 
-    if let Some(reason) = crate::guard::check_catastrophic(&prompt) {
-        ctx.say(format!("Prompt blocked by Sakana Guard: {}", reason)).await?;
-        return Ok(());
-    }
-
-    let channel_name = ctx
-        .guild_channel()
-        .await
-        .map(|c| format!("#{}", c.name))
-        .unwrap_or_else(|| format!("#dm-{}", ctx.channel_id()));
-
-    let (session_id, project_name, pending_approval) = {
-        let db_lock = ctx.data().db.lock().await;
-        let projects = db_lock.list_projects().unwrap_or_default();
-        let target_project = projects
-            .iter()
-            .find(|p| {
-                p.discord_channel
-                    .as_deref()
-                    .map(|c| c.eq_ignore_ascii_case(&channel_name))
-                    .unwrap_or(false)
-            })
-            .cloned();
-
-        let Some(proj) = target_project else {
-            ctx.say(format!(
-                "No Sakana project is mapped to Discord channel `{}`. Map a project's Discord channel in Sakana first.",
-                channel_name
-            ))
-            .await?;
-            return Ok(());
-        };
-
-        let sessions = db_lock.list_sessions(Some(&proj.id)).unwrap_or_default();
-        let existing_discord = sessions.into_iter().find(|s| {
-            s.is_discord.unwrap_or(false)
-                && s.discord_channel
-                    .as_deref()
-                    .map(|c| c.eq_ignore_ascii_case(&channel_name))
-                    .unwrap_or(false)
-        });
-
-        let session = match existing_discord {
-            Some(s) => s,
-            None => db_lock.create_session(CreateSessionInput {
-                project_id: proj.id.clone(),
-                title: format!("Discord {}", channel_name),
-                harness: Some("sakana".to_string()),
-                model: None,
-                effort: None,
-                account: None,
-                permission_mode: None,
-                worktree_path: Some(proj.cwd.clone()),
-                branch: None,
-                shared_deps: None,
-                is_discord: Some(true),
-                discord_channel: Some(channel_name.clone()),
-            })?,
-        };
-
-        let user_msg = ChatMessage {
-            id: format!("msg-{}", Uuid::new_v4()),
-            role: "user".to_string(),
-            author: Some(ctx.author().name.clone()),
-            timestamp: chrono::Local::now().format("%H:%M").to_string(),
-            text: prompt.clone(),
-            thinking: None,
-            thinking_duration: None,
-            tools: None,
-            subagent: None,
-            widget: None,
-            checkpoint: None,
-        };
-        db_lock.append_message(&session.id, &user_msg)?;
-
-        let approval = db_lock
-            .list_approvals(Some(&session.id))
-            .unwrap_or_default()
-            .into_iter()
-            .next();
-
-        (session.id, proj.name, approval)
+    let is_dm = ctx.guild_id().is_none();
+    let channel_label = if is_dm {
+        format!("#dm-{}", ctx.author().id.get())
+    } else {
+        ctx.guild_channel()
+            .await
+            .map(|c| format!("#{}", c.name))
+            .unwrap_or_else(|| format!("#{}", ctx.channel_id()))
     };
 
-    let _ = ctx.data().app.emit("discord-prompt", serde_json::json!({
-        "sessionId": session_id,
-        "channel": channel_name,
-        "author": ctx.author().name,
-        "prompt": prompt,
-    }));
+    ctx.defer().await?;
 
-    if let Some(approval) = pending_approval {
-        let components = vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("guard_approve:{}", approval.id))
-                .label("Approve")
-                .style(ButtonStyle::Success),
-            CreateButton::new(format!("guard_deny:{}", approval.id))
-                .label("Deny")
-                .style(ButtonStyle::Danger),
-        ])];
-        let msg = CreateMessage::new()
-            .content(format!(
-                "Queued in **{}** (`{}`). Pending Terminal Guard approval for `{}`:",
-                project_name, channel_name, approval.command
-            ))
-            .components(components);
-        let _ = ctx.channel_id().send_message(&ctx.serenity_context().http, msg).await;
-        ctx.say("Prompt synced and Terminal Guard prompt posted.").await?;
-    } else {
-        ctx.defer().await?;
-        let read_only = role != "owner" && role != "friend";
-        let effective_prompt = if read_only {
-            format!(
-                "[READ-ONLY DISCORD ROLE ({})]: Answer questions and inspect status/code only. Do NOT modify files, run mutating shell commands, or perform destructive actions.\n\n{}",
-                role, prompt
-            )
-        } else {
-            prompt.clone()
-        };
-        match crate::harness::run_one_shot_prompt_with_opts(
-            &ctx.data().app,
-            Arc::clone(&ctx.data().db),
-            &session_id,
-            &effective_prompt,
-            read_only,
-        )
-        .await
-        {
-            Ok(reply) => {
-                let truncated: String = if reply.chars().count() > 1850 {
-                    format!("{}…", reply.chars().take(1850).collect::<String>())
-                } else {
-                    reply
-                };
-                ctx.say(format!("**{}** (`{}`):\n{}", project_name, channel_name, truncated))
-                    .await?;
-            }
-            Err(err) => {
-                ctx.say(format!(
-                    "Synced to **{}** (`{}`), but execution failed: {}",
-                    project_name, channel_name, err
-                ))
+    match dispatch_discord_prompt(
+        &ctx.data().app,
+        &ctx.data().db,
+        ctx.author().id.get(),
+        &ctx.author().name,
+        &role,
+        is_dm,
+        &channel_label,
+        &prompt,
+    )
+    .await
+    {
+        Ok((target_label, reply)) => {
+            ctx.say(format!("**{}** (`{}`):\n{}", target_label, channel_label, reply))
                 .await?;
-            }
+        }
+        Err(err) => {
+            ctx.say(err).await?;
         }
     }
 
@@ -256,77 +428,134 @@ async fn handle_event(
             *data.connected_guilds.lock().await = data_about_bot.guilds.len();
             *data.last_error.lock().await = None;
         }
-        FullEvent::InteractionCreate { interaction } => {
-            if let Interaction::Component(comp) = interaction {
-                let custom_id = comp.data.custom_id.as_str();
-                let (approved, approval_id) = if let Some(id) = custom_id.strip_prefix("guard_approve:") {
-                    (true, id)
-                } else if let Some(id) = custom_id.strip_prefix("guard_deny:") {
-                    (false, id)
-                } else {
-                    return Ok(());
-                };
+        FullEvent::Message { new_message } => {
+            if new_message.author.bot {
+                return Ok(());
+            }
+            let content = new_message.content.trim();
+            if content.is_empty() {
+                return Ok(());
+            }
 
-                let role = resolve_user_role(&data.db, comp.user.id.get()).await;
-                if role != "owner" && role != "friend" {
-                    let _ = comp
-                        .create_response(
-                            &ctx.http,
-                            CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content("Only Owner or Friend roles can resolve Terminal Guard approvals.")
-                                    .ephemeral(true),
-                            ),
-                        )
+            let user_id = new_message.author.id.get();
+            let is_dm = new_message.guild_id.is_none();
+
+            if is_dm {
+                let role = resolve_user_role(&data.db, user_id).await;
+                if role == "blocked" {
+                    let _ = new_message
+                        .reply(&ctx.http, "Access denied (blocked by Sakana RBAC).")
                         .await;
                     return Ok(());
                 }
 
-                let resolved = {
-                    let db_lock = data.db.lock().await;
-                    db_lock.resolve_approval(approval_id, approved).ok().flatten()
-                };
+                // Quick DM command: !project <name> to switch active project
+                if let Some(rest) = content.strip_prefix("!project") {
+                    let query = rest.trim();
+                    let reply = {
+                        let db_lock = data.db.lock().await;
+                        let projs = db_lock.list_projects().unwrap_or_default();
+                        if query.is_empty() {
+                            let list = projs
+                                .iter()
+                                .map(|p| format!("• **{}**", p.name))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            format!("Available projects (use `!project <name>` to switch):\n{}", list)
+                        } else if let Some(target) = find_project_by_query(&projs, query) {
+                            let _ = db_lock.set_setting(&dm_project_setting_key(user_id), &target.id);
+                            format!("Switched DM to project **{}** (`{}`).", target.name, target.cwd)
+                        } else {
+                            format!("Project `{}` not found.", query)
+                        }
+                    };
+                    let _ = new_message.reply(&ctx.http, reply).await;
+                    return Ok(());
+                }
 
-                let reply_text = if let Some((session_id, command)) = resolved {
-                    let _ = data.app.emit(
-                        "guard-resolved",
-                        serde_json::json!({
-                            "approvalId": approval_id,
-                            "sessionId": session_id,
-                            "approved": approved,
-                            "command": command,
-                            "resolvedBy": format!("discord:{}", comp.user.name),
-                        }),
-                    );
-                    if approved {
-                        format!("Approved `{}`", command)
-                    } else {
-                        format!("Denied `{}`", command)
+                let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                let channel_label = format!("#dm-{}", user_id);
+                match dispatch_discord_prompt(
+                    &data.app,
+                    &data.db,
+                    user_id,
+                    &new_message.author.name,
+                    &role,
+                    true,
+                    &channel_label,
+                    content,
+                )
+                .await
+                {
+                    Ok((target_label, reply)) => {
+                        let _ = new_message
+                            .reply(&ctx.http, format!("**{}**:\n{}", target_label, reply))
+                            .await;
                     }
-                } else {
-                    "Approval request was already resolved or not found.".to_string()
+                    Err(err) => {
+                        let _ = new_message.reply(&ctx.http, err).await;
+                    }
+                }
+            } else {
+                // Guild channel: only respond if the channel is explicitly bound to a Sakana project or thread.
+                let channel_name = match new_message.channel_id.to_channel(&ctx.http).await {
+                    Ok(serenity::Channel::Guild(gc)) => format!("#{}", gc.name),
+                    _ => return Ok(()),
                 };
 
-                let _ = comp
-                    .create_response(
-                        &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(reply_text)
-                                .ephemeral(true),
-                        ),
-                    )
-                    .await;
+                let is_bound = {
+                    let db_lock = data.db.lock().await;
+                    let projects = db_lock.list_projects().unwrap_or_default();
+                    let sessions = db_lock.list_sessions(None).unwrap_or_default();
+                    projects.iter().any(|p| {
+                        p.discord_channel
+                            .as_deref()
+                            .map(|c| c.eq_ignore_ascii_case(&channel_name))
+                            .unwrap_or(false)
+                    }) || sessions.iter().any(|s| {
+                        s.is_discord.unwrap_or(false)
+                            && s.discord_channel
+                                .as_deref()
+                                .map(|c| c.eq_ignore_ascii_case(&channel_name))
+                                .unwrap_or(false)
+                    })
+                };
+
+                if !is_bound {
+                    return Ok(());
+                }
+
+                let role = resolve_user_role(&data.db, user_id).await;
+                if role == "blocked" {
+                    return Ok(());
+                }
+
+                let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                match dispatch_discord_prompt(
+                    &data.app,
+                    &data.db,
+                    user_id,
+                    &new_message.author.name,
+                    &role,
+                    false,
+                    &channel_name,
+                    content,
+                )
+                .await
+                {
+                    Ok((_, reply)) => {
+                        let _ = new_message.reply(&ctx.http, reply).await;
+                    }
+                    Err(err) => {
+                        let _ = new_message.reply(&ctx.http, err).await;
+                    }
+                }
             }
         }
         _ => {}
     }
     Ok(())
 }
-
-/// Ensure unused imports don't warn if poise macro expands differently
-#[allow(dead_code)]
-fn _keep_types(_: ActionRowComponent) {}
 
 async fn build_status(state: &DiscordState, db: &Arc<Mutex<Database>>) -> DiscordStatus {
     let has_token = {
@@ -411,7 +640,7 @@ pub async fn start_discord_bot_inner(
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![status(), ask()],
+            commands: vec![status(), projects(), bind(), ask()],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(handle_event(ctx, event, framework, data))
             },
@@ -425,7 +654,9 @@ pub async fn start_discord_bot_inner(
         })
         .build();
 
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
+    let intents = GatewayIntents::non_privileged()
+        | GatewayIntents::MESSAGE_CONTENT
+        | GatewayIntents::DIRECT_MESSAGES;
     let mut client = serenity::ClientBuilder::new(&resolved_token, intents)
         .framework(framework)
         .await

@@ -605,7 +605,7 @@ export default function App() {
       model: HARNESS_META['agy-cli'].models[0],
       effort: 'medium',
       account: 'default',
-      permissionMode: 'auto-edit',
+      permissionMode: 'yolo',
       worktreePath: '.',
       branch: 'main',
       sharedDeps: [],
@@ -622,7 +622,6 @@ export default function App() {
     activeThread.worktreePath && activeThread.worktreePath !== '.'
       ? activeThread.worktreePath
       : activeProject?.cwd || '';
-  const pendingApprovalCount = threads.filter((t) => t.pendingApproval).length;
 
   const refreshDiffs = useCallback(
     async (turnId?: string) => {
@@ -1132,22 +1131,6 @@ export default function App() {
           );
           showToast(`Turn error: ${error}`);
         }),
-        tauriApi.onGuardApproval((payload) => {
-          const sessionId =
-            'sessionId' in payload && payload.sessionId
-              ? payload.sessionId
-              : selectedThreadIdRef.current;
-          const approval: PendingApproval =
-            'approval' in payload ? payload.approval : payload;
-          setThreads((prev) =>
-            prev.map((t) =>
-              t.id === sessionId
-                ? { ...t, status: 'AWAITING_APPROVAL', pendingApproval: approval }
-                : t,
-            ),
-          );
-          showToast(`Terminal Guard: approval required for "${approval.command}"`);
-        }),
         tauriApi.onAutomationRun((updated) => {
           setAutomations((prev) => {
             const exists = prev.some((a) => a.id === updated.id);
@@ -1172,20 +1155,6 @@ export default function App() {
             })
             .catch(() => {});
           showToast(`Discord prompt from ${payload.author} in #${payload.channel}`);
-        }),
-        tauriApi.onGuardResolved(({ approvalId, sessionId, approved }) => {
-          setThreads((prev) =>
-            prev.map((t) => {
-              if (t.id !== sessionId && t.pendingApproval?.id !== approvalId) {
-                return t;
-              }
-              return {
-                ...t,
-                status: approved ? 'RUNNING' : 'IDLE',
-                pendingApproval: undefined,
-              };
-            }),
-          );
         }),
         tauriApi.onOfficeUpdated((updated) => {
           setOffices((prev) => {
@@ -1394,7 +1363,7 @@ export default function App() {
       model: defaultModel,
       effort: defaultEffort,
       account: 'default',
-      permissionMode: 'auto-edit',
+      permissionMode: 'yolo',
       worktreePath: fallbackWtPath,
       sharedDeps: opts.sharedDeps,
     });
@@ -1427,7 +1396,7 @@ export default function App() {
           model: defaultModel,
           effort: defaultEffort,
           account: 'default',
-          permissionMode: 'auto-edit',
+          permissionMode: 'yolo',
           worktreePath: actualWorktreePath,
           branch: opts.branch,
           sharedDeps: opts.sharedDeps,
@@ -1483,7 +1452,7 @@ export default function App() {
         model: defaultModel,
         effort: defaultEffort,
         account: 'default',
-        permissionMode: activeThread.id !== 'empty' ? activeThread.permissionMode : 'auto-edit',
+        permissionMode: 'yolo',
         worktreePath: targetProject.cwd,
         sharedDeps: [],
       });
@@ -1497,7 +1466,7 @@ export default function App() {
         model: defaultModel,
         effort: defaultEffort,
         account: 'default',
-        permissionMode: 'auto-edit',
+        permissionMode: 'yolo',
         worktreePath: targetProject.cwd,
         branch,
         sharedDeps: [],
@@ -1548,12 +1517,64 @@ export default function App() {
 
   const handleUpdateThreadConfig = (
     id: string,
-    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'permissionMode' | 'account'>>,
+    patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'account'>>,
   ) => {
     setThreads((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
     void tauriApi.updateSession({ id, ...patch }).catch((err) => {
       console.error('update_session failed:', err);
     });
+  };
+
+  const handleSetProjectDiscordChannel = async (projectId: string, channel?: string) => {
+    const normalized = channel?.trim()
+      ? channel.trim().startsWith('#')
+        ? channel.trim()
+        : `#${channel.trim()}`
+      : undefined;
+    if (isTauriRuntime()) {
+      try {
+        await tauriApi.setProjectDiscordChannel(projectId, normalized ?? null);
+      } catch (err) {
+        showToast(`Failed to update Discord channel: ${String(err)}`);
+        return;
+      }
+    }
+    setProjects((prev) =>
+      prev.map((p) => (p.id === projectId ? { ...p, discordChannel: normalized } : p)),
+    );
+    showToast(
+      normalized
+        ? `Bound project to Discord ${normalized}`
+        : 'Cleared project Discord channel',
+    );
+  };
+
+  const handleSetThreadDiscordChannel = async (threadId: string, channel?: string | null) => {
+    const normalized = channel?.trim()
+      ? channel.trim().startsWith('#')
+        ? channel.trim()
+        : `#${channel.trim()}`
+      : undefined;
+    if (isTauriRuntime()) {
+      try {
+        await tauriApi.setSessionDiscordChannel(threadId, normalized ?? null);
+      } catch (err) {
+        showToast(`Failed to update thread Discord channel: ${String(err)}`);
+        return;
+      }
+    }
+    setThreads((prev) =>
+      prev.map((t) =>
+        t.id === threadId
+          ? { ...t, isDiscord: Boolean(normalized), discordChannel: normalized }
+          : t,
+      ),
+    );
+    showToast(
+      normalized
+        ? `Linked thread to Discord ${normalized}`
+        : 'Disconnected thread from Discord',
+    );
   };
 
   const handleRenameThread = async (id: string, title: string) => {
@@ -1665,9 +1686,11 @@ export default function App() {
         onDeleteProject={handleDeleteProject}
         onRenameProject={handleRenameProject}
         onReorderProjects={handleReorderProjects}
+        onSetProjectDiscordChannel={handleSetProjectDiscordChannel}
         onDeleteThread={handleDeleteThread}
         onRenameThread={handleRenameThread}
         onMoveThread={handleMoveThread}
+        onSetThreadDiscordChannel={handleSetThreadDiscordChannel}
         onReorderThreads={handleReorderThreads}
         onOpenGitHubClone={() => setGhCloneOpen(true)}
         dashSubtab={dashSubtab}
@@ -1677,7 +1700,6 @@ export default function App() {
         }}
         quotas={quotas}
         onRefreshQuotas={() => void refreshQuotas(true)}
-        pendingApprovalCount={pendingApprovalCount}
         remoteHosts={remoteHosts}
         activeHostId={activeHostId}
         onSwitchHost={(hid) => void handleSwitchHost(hid)}
@@ -1769,56 +1791,6 @@ export default function App() {
               showToast('Stopped active turn');
             }}
             onUpdateThreadConfig={handleUpdateThreadConfig}
-            onResolveApproval={(id, decision) => {
-              const target = threads.find((t) => t.id === id);
-              const approval = target?.pendingApproval;
-              if (approval && isTauriRuntime()) {
-                const approved = decision !== 'deny';
-                const allowPrefix =
-                  decision === 'always_allow'
-                    ? approval.command.trim().split(/\s+/).slice(0, 2).join(' ')
-                    : undefined;
-                if (decision === 'enable_yolo') {
-                  void tauriApi.setGuardMode('yolo').catch((err) => {
-                    console.error('set_guard_mode failed:', err);
-                  });
-                }
-                void tauriApi
-                  .resolveApproval(approval.id, approved, allowPrefix)
-                  .catch((err) => {
-                    console.error('resolve_approval failed:', err);
-                    showToast(`Approval error: ${String(err)}`);
-                  });
-              }
-
-              setThreads((prev) =>
-                prev.map((t) =>
-                  t.id === id
-                    ? {
-                        ...t,
-                        status: decision === 'deny' ? 'IDLE' : isTauriRuntime() ? 'RUNNING' : 'DONE',
-                        permissionMode: decision === 'enable_yolo' ? 'yolo' : t.permissionMode,
-                        pendingApproval: undefined,
-                        messages: isTauriRuntime()
-                          ? t.messages
-                          : [
-                              ...t.messages,
-                              {
-                                id: `ap-${Date.now()}`,
-                                role: 'assistant',
-                                timestamp: formatNowTime(),
-                                text:
-                                  decision === 'deny'
-                                    ? 'Command denied by Terminal Guard.'
-                                    : `Command approved (${decision}) and executed cleanly.`,
-                              },
-                            ],
-                      }
-                    : t,
-                ),
-              );
-              showToast(decision === 'deny' ? 'Command denied' : 'Command approved');
-            }}
             skills={skills}
             theme={theme}
             onRevertToCheckpoint={async (threadId, checkpointId) => {
@@ -2488,37 +2460,8 @@ export default function App() {
           refreshingModels={refreshingModels}
           onOpenGitHubClone={() => setGhCloneOpen(true)}
           projects={projects}
-          onSetProjectDiscordChannel={async (projectId, channel) => {
-            const normalized = channel?.trim()
-              ? channel.trim().startsWith('#')
-                ? channel.trim()
-                : `#${channel.trim()}`
-              : undefined;
-            if (isTauriRuntime()) {
-              try {
-                await tauriApi.setProjectDiscordChannel(projectId, normalized ?? null);
-                setProjects((prev) =>
-                  prev.map((p) => (p.id === projectId ? { ...p, discordChannel: normalized } : p)),
-                );
-                showToast(
-                  normalized
-                    ? `Bound project to Discord ${normalized}`
-                    : 'Cleared project Discord channel',
-                );
-              } catch (err) {
-                showToast(`Failed to update Discord channel: ${String(err)}`);
-              }
-              return;
-            }
-            setProjects((prev) =>
-              prev.map((p) => (p.id === projectId ? { ...p, discordChannel: normalized } : p)),
-            );
-            showToast(
-              normalized
-                ? `Bound project to Discord ${normalized}`
-                : 'Cleared project Discord channel',
-            );
-          }}
+          onSetProjectDiscordChannel={handleSetProjectDiscordChannel}
+          onSetThreadDiscordChannel={handleSetThreadDiscordChannel}
           customization={customization}
           onUpdateCustomization={async (next) => {
             setCustomization(next);

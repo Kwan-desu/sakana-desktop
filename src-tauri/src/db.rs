@@ -859,7 +859,7 @@ impl Database {
         let account = input.account.unwrap_or_else(|| "default".to_string());
         let permission_mode = input
             .permission_mode
-            .unwrap_or_else(|| "supervised".to_string());
+            .unwrap_or_else(|| "yolo".to_string());
         let worktree_path = input.worktree_path.unwrap_or_else(|| ".".to_string());
         let branch = input.branch.unwrap_or_else(|| "main".to_string());
         let shared_deps = input.shared_deps.unwrap_or_default();
@@ -984,6 +984,30 @@ impl Database {
         )?;
 
         self.get_session(&input.id)
+    }
+
+    pub fn set_session_discord_channel(
+        &self,
+        id: &str,
+        discord_channel: Option<&str>,
+    ) -> Result<bool> {
+        let normalized = discord_channel
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s.starts_with('#') {
+                    s.to_string()
+                } else {
+                    format!("#{}", s)
+                }
+            });
+        let is_discord = if normalized.is_some() { 1 } else { 0 };
+        let now = Utc::now().to_rfc3339();
+        let changed = self.conn.execute(
+            "UPDATE sessions SET is_discord = ?2, discord_channel = ?3, updated_at = ?4 WHERE id = ?1",
+            params![id, is_discord, normalized, now],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn delete_session(&self, id: &str) -> Result<bool> {

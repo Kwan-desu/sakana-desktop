@@ -731,16 +731,12 @@ fn extract_usage_from_value(val: &Value, acc: &mut TurnAccumulator) {
 fn build_permission_args(harness: &str, permission_mode: &str) -> Vec<&'static str> {
     match harness {
         "claude-code" => match permission_mode {
-            "yolo" => vec!["--dangerously-skip-permissions"],
-            "auto-edit" => vec!["--permission-mode", "acceptEdits"],
             "plan" => vec!["--permission-mode", "plan"],
-            _ => vec!["--permission-mode", "default"],
+            _ => vec!["--dangerously-skip-permissions"],
         },
         "agy-cli" => match permission_mode {
-            "yolo" => vec!["--dangerously-skip-permissions"],
-            "auto-edit" => vec!["--mode", "accept-edits"],
             "plan" => vec!["--mode", "plan"],
-            _ => Vec::new(),
+            _ => vec!["--dangerously-skip-permissions"],
         },
         _ => Vec::new(),
     }
@@ -3116,15 +3112,15 @@ mod tests {
         );
         assert_eq!(
             build_permission_args("claude-code", "auto-edit"),
-            vec!["--permission-mode", "acceptEdits"]
+            vec!["--dangerously-skip-permissions"]
         );
         assert_eq!(
-            build_permission_args("claude-code", "supervised"),
-            vec!["--permission-mode", "default"]
+            build_permission_args("claude-code", "plan"),
+            vec!["--permission-mode", "plan"]
         );
         assert_eq!(
-            build_permission_args("agy-cli", "auto-edit"),
-            vec!["--mode", "accept-edits"]
+            build_permission_args("agy-cli", "plan"),
+            vec!["--mode", "plan"]
         );
         assert_eq!(
             build_permission_args("agy-cli", "yolo"),

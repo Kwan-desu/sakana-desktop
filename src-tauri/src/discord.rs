@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use std::path::PathBuf;
+
 use poise::serenity_prelude as serenity;
-use serenity::all::{FullEvent, GatewayIntents, ReactionType};
+use serenity::all::{CreateAttachment, CreateMessage, FullEvent, GatewayIntents, ReactionType};
 use serenity::gateway::ShardManager;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
@@ -262,6 +264,105 @@ fn truncate_discord_reply(reply: &str) -> String {
     }
 }
 
+const MAX_DISCORD_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+
+async fn download_discord_attachments(
+    attachments: &[serenity::Attachment],
+) -> Vec<(String, String, PathBuf)> {
+    if attachments.is_empty() {
+        return Vec::new();
+    }
+    let dir = crate::platform::app_data_dir().join("discord-attachments");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut saved = Vec::new();
+    for att in attachments.iter().take(5) {
+        if u64::from(att.size) > MAX_DISCORD_ATTACHMENT_BYTES {
+            continue;
+        }
+        let Ok(bytes) = att.download().await else {
+            continue;
+        };
+        let safe_name: String = att
+            .filename
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let short_id = &Uuid::new_v4().to_string()[..8];
+        let dest = dir.join(format!("{}_{}", short_id, safe_name));
+        if std::fs::write(&dest, &bytes).is_ok() {
+            let ctype = att
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            saved.push((att.filename.clone(), ctype, dest));
+        }
+    }
+    saved
+}
+
+fn extract_output_files(reply: &str) -> (String, Vec<PathBuf>) {
+    let mut files = Vec::new();
+    let mut kept_lines = Vec::new();
+    for line in reply.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        let extracted = if upper.starts_with("[SEND_FILE:") && trimmed.ends_with(']') {
+            Some(trimmed[11..trimmed.len() - 1].trim())
+        } else if upper.starts_with("[ATTACH:") && trimmed.ends_with(']') {
+            Some(trimmed[8..trimmed.len() - 1].trim())
+        } else {
+            None
+        };
+        if let Some(raw_path) = extracted {
+            let cleaned = raw_path.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+            let p = PathBuf::from(cleaned);
+            if p.is_file() && files.len() < 5 {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    if meta.len() <= MAX_DISCORD_ATTACHMENT_BYTES {
+                        files.push(p);
+                        continue;
+                    }
+                }
+            }
+        }
+        kept_lines.push(line);
+    }
+    (kept_lines.join("\n").trim().to_string(), files)
+}
+
+async fn send_discord_reply(
+    ctx: &serenity::Context,
+    target_msg: &serenity::Message,
+    raw_reply: &str,
+) {
+    let (cleaned, files) = extract_output_files(raw_reply);
+    let text = if cleaned.is_empty() && !files.is_empty() {
+        String::new()
+    } else {
+        truncate_discord_reply(&cleaned)
+    };
+    if files.is_empty() {
+        let _ = target_msg.reply(&ctx.http, text).await;
+        return;
+    }
+    let mut builder = CreateMessage::new().reference_message(target_msg);
+    if !text.is_empty() {
+        builder = builder.content(text);
+    }
+    for path in &files {
+        if let Ok(att) = CreateAttachment::path(path).await {
+            builder = builder.add_file(att);
+        }
+    }
+    let _ = target_msg.channel_id.send_message(&ctx.http, builder).await;
+}
+
 /// Route a prompt from either a private DM or a bound guild channel/thread into a Sakana session,
 /// persist the user message, emit `discord-prompt`, and execute the turn.
 async fn dispatch_discord_prompt(
@@ -433,13 +534,14 @@ async fn dispatch_discord_prompt(
     );
 
     let read_only = role != "owner" && role != "friend";
+    let discord_file_hint = "[Discord Output Hint: If the user asks you to send an image or file back in Discord, include a line `[SEND_FILE: /absolute/path/to/file]` in your response.]";
     let effective_prompt = if read_only {
         format!(
-            "[READ-ONLY DISCORD ROLE ({})]: Answer questions and inspect status/code only. Do NOT modify files, run mutating shell commands, or perform destructive actions.\n\n{}",
-            role, prompt
+            "[READ-ONLY DISCORD ROLE ({})]: Answer questions and inspect status/code only. Do NOT modify files, run mutating shell commands, or perform destructive actions.\n{}\n\n{}",
+            role, discord_file_hint, prompt
         )
     } else {
-        prompt.to_string()
+        format!("{}\n\n{}", discord_file_hint, prompt)
     };
 
     let reply = crate::harness::run_one_shot_prompt_with_opts(
@@ -451,7 +553,7 @@ async fn dispatch_discord_prompt(
     )
     .await?;
 
-    Ok((target_label, truncate_discord_reply(&reply)))
+    Ok((target_label, reply))
 }
 
 #[poise::command(slash_command, description_localized("en-US", "Show Sakana workspace status"))]
@@ -599,9 +701,18 @@ async fn ask(
     )
     .await
     {
-        Ok((target_label, reply)) => {
-            ctx.say(format!("**{}** (`{}`):\n{}", target_label, channel_label, reply))
-                .await?;
+        Ok((_target_label, raw_reply)) => {
+            let (cleaned, files) = extract_output_files(&raw_reply);
+            let mut reply_builder = poise::CreateReply::default();
+            if !cleaned.is_empty() {
+                reply_builder = reply_builder.content(truncate_discord_reply(&cleaned));
+            }
+            for path in &files {
+                if let Ok(att) = CreateAttachment::path(path).await {
+                    reply_builder = reply_builder.attachment(att);
+                }
+            }
+            ctx.send(reply_builder).await?;
         }
         Err(err) => {
             ctx.say(err).await?;
@@ -659,7 +770,7 @@ async fn handle_event(
                 return Ok(());
             }
             let content = new_message.content.trim();
-            if content.is_empty() {
+            if content.is_empty() && new_message.attachments.is_empty() {
                 return Ok(());
             }
 
@@ -754,6 +865,23 @@ async fn handle_event(
                     let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
                 }
                 let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                let saved_files = download_discord_attachments(&new_message.attachments).await;
+                let full_prompt = if saved_files.is_empty() {
+                    content.to_string()
+                } else {
+                    let list = saved_files
+                        .iter()
+                        .map(|(name, ctype, path)| {
+                            format!("- {} ({}): {}", name, ctype, path.display())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if content.is_empty() {
+                        format!("The user sent the following Discord attachment(s):\n{}", list)
+                    } else {
+                        format!("{}\n\n[Discord Attachments saved locally]:\n{}", content, list)
+                    }
+                };
                 let channel_label = format!("#dm-{}", user_id);
                 match dispatch_discord_prompt(
                     &data.app,
@@ -763,14 +891,12 @@ async fn handle_event(
                     &role,
                     true,
                     &channel_label,
-                    content,
+                    &full_prompt,
                 )
                 .await
                 {
-                    Ok((target_label, reply)) => {
-                        let _ = new_message
-                            .reply(&ctx.http, format!("**{}**:\n{}", target_label, reply))
-                            .await;
+                    Ok((_, reply)) => {
+                        send_discord_reply(ctx, new_message, &reply).await;
                         if react_enabled {
                             let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
                         }
@@ -865,6 +991,23 @@ async fn handle_event(
                     let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
                 }
                 let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                let saved_files = download_discord_attachments(&new_message.attachments).await;
+                let full_prompt = if saved_files.is_empty() {
+                    content.to_string()
+                } else {
+                    let list = saved_files
+                        .iter()
+                        .map(|(name, ctype, path)| {
+                            format!("- {} ({}): {}", name, ctype, path.display())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if content.is_empty() {
+                        format!("The user sent the following Discord attachment(s):\n{}", list)
+                    } else {
+                        format!("{}\n\n[Discord Attachments saved locally]:\n{}", content, list)
+                    }
+                };
                 match dispatch_discord_prompt(
                     &data.app,
                     &data.db,
@@ -873,12 +1016,12 @@ async fn handle_event(
                     &role,
                     false,
                     &channel_name,
-                    content,
+                    &full_prompt,
                 )
                 .await
                 {
                     Ok((_, reply)) => {
-                        let _ = new_message.reply(&ctx.http, reply).await;
+                        send_discord_reply(ctx, new_message, &reply).await;
                         if react_enabled {
                             let _ = new_message.react(&ctx.http, ReactionType::Unicode("✅".to_string())).await;
                         }
@@ -1114,6 +1257,31 @@ pub async fn get_discord_settings(
     get_discord_settings_inner(&db_state.0).await
 }
 
+pub async fn maybe_auto_start_discord_bot(
+    state: &DiscordState,
+    db: &Arc<Mutex<Database>>,
+    app: AppHandle,
+) {
+    let (should_start, has_token) = {
+        let db_lock = db.lock().await;
+        let cfg = load_discord_settings(&db_lock);
+        let tok = db_lock
+            .get_setting(DISCORD_TOKEN_KEY)
+            .ok()
+            .flatten()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| crate::platform::get_env_or_dotenv("DISCORD_BOT_TOKEN"))
+            .is_some();
+        (cfg.auto_start, tok)
+    };
+    if !should_start || !has_token {
+        return;
+    }
+    if let Err(err) = start_discord_bot_inner(state, db, Some(app), None).await {
+        *state.last_error.lock().await = Some(format!("Auto-start failed: {err}"));
+    }
+}
+
 pub async fn update_discord_settings_inner(
     db: &Arc<Mutex<Database>>,
     settings: DiscordSettings,
@@ -1127,6 +1295,7 @@ pub async fn update_discord_settings_inner(
         default_model: settings.default_model.trim().to_string(),
         default_effort: settings.default_effort.trim().to_string(),
         react_with_emojis: settings.react_with_emojis,
+        auto_start: settings.auto_start,
     };
     let db_lock = db.lock().await;
     save_discord_settings(&db_lock, &normalized)?;

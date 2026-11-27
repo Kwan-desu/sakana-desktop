@@ -278,6 +278,7 @@ export interface DiscordSettings {
   defaultModel: string;
   defaultEffort: string;
   reactWithEmojis: boolean;
+  autoStart: boolean;
 }
 
 export interface RemoteStatus {

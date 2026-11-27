@@ -492,6 +492,8 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let auto_state = app_handle.state::<automation::AutomationState>();
                 let _ = automation::sync_scheduler(&auto_state, Arc::clone(&db_for_sched), app_handle.clone()).await;
+                let discord_state = app_handle.state::<discord::DiscordState>();
+                discord::maybe_auto_start_discord_bot(&discord_state, &db_for_sched, app_handle.clone()).await;
                 let sync_state = app_handle.state::<sync::SyncState>();
                 sync::restart_auto_sync_loop(&sync_state, db_for_sched, app_handle.clone()).await;
             });

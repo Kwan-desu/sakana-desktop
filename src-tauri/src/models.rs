@@ -404,13 +404,20 @@ pub struct DiscordStatus {
     pub last_error: Option<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscordSettings {
     pub default_harness: String,
     pub default_model: String,
     pub default_effort: String,
+    #[serde(default = "default_true")]
     pub react_with_emojis: bool,
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
 }
 
 impl Default for DiscordSettings {
@@ -420,6 +427,7 @@ impl Default for DiscordSettings {
             default_model: String::new(),
             default_effort: "medium".to_string(),
             react_with_emojis: true,
+            auto_start: true,
         }
     }
 }

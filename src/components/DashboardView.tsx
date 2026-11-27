@@ -220,6 +220,7 @@ export function DashboardView({
     defaultModel: '',
     defaultEffort: 'medium',
     reactWithEmojis: true,
+    autoStart: true,
   });
   const [savingDcSettings, setSavingDcSettings] = useState(false);
 
@@ -2543,6 +2544,17 @@ export function DashboardView({
                       </select>
                     </div>
                   </div>
+                  <label className="flex items-center justify-between gap-2 pt-1 cursor-pointer text-[12px]" style={{ color: 'var(--text-body)' }}>
+                    <span>Auto-start bot on app launch</span>
+                    <input
+                      type="checkbox"
+                      checked={discordSettings.autoStart}
+                      onChange={(e) =>
+                        setDiscordSettings((prev) => ({ ...prev, autoStart: e.target.checked }))
+                      }
+                      className="cursor-pointer"
+                    />
+                  </label>
                   <label className="flex items-center justify-between gap-2 pt-1 cursor-pointer text-[12px]" style={{ color: 'var(--text-body)' }}>
                     <span>React with 👀 (read) → ✅ (done)</span>
                     <input

@@ -1820,17 +1820,29 @@ async fn execute_remote_automation(
                 .map(|bin| ("agy-cli", bin, agy_acc.as_ref()))
         })
     {
+        let enabled_mcp_servers: Vec<crate::models::McpServer> = {
+            let db_lock = db.lock().await;
+            db_lock
+                .list_mcp_servers()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| s.enabled)
+                .collect()
+        };
+        crate::auth::sync_profile_mcp_and_skills(harness_id, acc, &enabled_mcp_servers);
         let bin_str = bin.to_string_lossy().to_string();
         let mut cmd = crate::platform::tokio_command(&bin_str);
         if let Some(ref dir) = cwd.as_deref().filter(|c| std::path::Path::new(c).is_dir()) {
             cmd.current_dir(dir);
         }
         crate::auth::apply_account_env(&mut cmd, harness_id, acc);
-        cmd.args(["-p", trimmed])
+        cmd.args(["-p", trimmed]);
+        cmd.args(crate::harness::build_permission_args(harness_id, "yolo"));
+        cmd.kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        match tokio::time::timeout(Duration::from_secs(45), cmd.output()).await {
+        match tokio::time::timeout(Duration::from_secs(300), cmd.output()).await {
             Ok(Ok(out)) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 let s = if text.is_empty() {
@@ -1850,7 +1862,7 @@ async fn execute_remote_automation(
                 ("ERR".to_string(), s)
             }
             Ok(Err(e)) => ("ERR".to_string(), format!("Failed to spawn harness: {e}")),
-            Err(_) => ("ERR".to_string(), "Automation timed out after 45s".to_string()),
+            Err(_) => ("ERR".to_string(), "Automation timed out after 300s".to_string()),
         }
     } else {
         (

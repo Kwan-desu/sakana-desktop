@@ -336,24 +336,94 @@ fn extract_output_files(reply: &str) -> (String, Vec<PathBuf>) {
     (kept_lines.join("\n").trim().to_string(), files)
 }
 
+fn split_discord_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    if text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+    for line in text.split_inclusive('\n') {
+        let line_len = line.chars().count();
+        if current_len + line_len <= max_chars {
+            current.push_str(line);
+            current_len += line_len;
+        } else {
+            if !current.trim().is_empty() {
+                chunks.push(current.trim_end().to_string());
+                current.clear();
+                current_len = 0;
+            }
+            if line_len <= max_chars {
+                current.push_str(line);
+                current_len = line_len;
+            } else {
+                let mut buf = String::new();
+                let mut buf_len = 0usize;
+                for ch in line.chars() {
+                    buf.push(ch);
+                    buf_len += 1;
+                    if buf_len >= max_chars {
+                        chunks.push(std::mem::take(&mut buf));
+                        buf_len = 0;
+                    }
+                }
+                if !buf.is_empty() {
+                    current = buf;
+                    current_len = buf_len;
+                }
+            }
+        }
+        if chunks.len() >= 5 {
+            break;
+        }
+    }
+    if chunks.len() < 5 && !current.trim().is_empty() {
+        chunks.push(current.trim_end().to_string());
+    }
+    chunks
+}
+
+fn is_harness_error_reply(reply: &str) -> bool {
+    let trimmed = reply.trim();
+    trimmed.starts_with("Harness error (")
+        || trimmed.starts_with("WSL harness error (")
+        || trimmed.starts_with("Harness request timed out")
+        || trimmed.starts_with("WSL harness request timed out")
+        || trimmed.starts_with("Failed to spawn harness:")
+        || trimmed.starts_with("Failed to spawn WSL harness:")
+        || trimmed.starts_with("API error: HTTP ")
+        || trimmed.starts_with("API request failed:")
+}
+
 async fn send_discord_reply(
     ctx: &serenity::Context,
     target_msg: &serenity::Message,
     raw_reply: &str,
 ) {
     let (cleaned, files) = extract_output_files(raw_reply);
-    let text = if cleaned.is_empty() && !files.is_empty() {
-        String::new()
+    let chunks = if cleaned.is_empty() {
+        Vec::new()
     } else {
-        truncate_discord_reply(&cleaned)
+        split_discord_chunks(&cleaned, 1900)
     };
     if files.is_empty() {
-        let _ = target_msg.reply(&ctx.http, text).await;
+        if chunks.is_empty() {
+            let _ = target_msg.reply(&ctx.http, "Done.").await;
+            return;
+        }
+        for (idx, chunk) in chunks.iter().enumerate() {
+            if idx == 0 {
+                let _ = target_msg.reply(&ctx.http, chunk).await;
+            } else {
+                let _ = target_msg.channel_id.say(&ctx.http, chunk).await;
+            }
+        }
         return;
     }
     let mut builder = CreateMessage::new().reference_message(target_msg);
-    if !text.is_empty() {
-        builder = builder.content(text);
+    if let Some(first) = chunks.first() {
+        builder = builder.content(first.clone());
     }
     for path in &files {
         if let Ok(att) = CreateAttachment::path(path).await {
@@ -361,6 +431,9 @@ async fn send_discord_reply(
         }
     }
     let _ = target_msg.channel_id.send_message(&ctx.http, builder).await;
+    for chunk in chunks.iter().skip(1) {
+        let _ = target_msg.channel_id.say(&ctx.http, chunk).await;
+    }
 }
 
 async fn finish_reaction(
@@ -724,6 +797,8 @@ async fn ask(
             let mut reply_builder = poise::CreateReply::default();
             if !cleaned.is_empty() {
                 reply_builder = reply_builder.content(truncate_discord_reply(&cleaned));
+            } else if files.is_empty() {
+                reply_builder = reply_builder.content("Done.");
             }
             for path in &files {
                 if let Ok(att) = CreateAttachment::path(path).await {
@@ -733,7 +808,7 @@ async fn ask(
             ctx.send(reply_builder).await?;
         }
         Err(err) => {
-            ctx.say(err).await?;
+            ctx.say(truncate_discord_reply(&err)).await?;
         }
     }
 
@@ -845,7 +920,7 @@ async fn handle_event(
                     if react_enabled {
                         let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
                     }
-                    let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                    let _typing = new_message.channel_id.start_typing(&ctx.http);
                     let trimmed = rest.trim();
                     let (action, arg_text) = match trimmed.split_once(char::is_whitespace) {
                         Some((a, b)) => (a.trim(), b.trim()),
@@ -876,7 +951,7 @@ async fn handle_event(
                 if react_enabled {
                     let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
                 }
-                let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                let _typing = new_message.channel_id.start_typing(&ctx.http);
                 let saved_files = download_discord_attachments(&new_message.attachments).await;
                 let full_prompt = if saved_files.is_empty() {
                     content.to_string()
@@ -909,10 +984,10 @@ async fn handle_event(
                 {
                     Ok((_, reply)) => {
                         send_discord_reply(ctx, new_message, &reply).await;
-                        finish_reaction(ctx, new_message, react_enabled, true).await;
+                        finish_reaction(ctx, new_message, react_enabled, !is_harness_error_reply(&reply)).await;
                     }
                     Err(err) => {
-                        let _ = new_message.reply(&ctx.http, err).await;
+                        let _ = new_message.reply(&ctx.http, truncate_discord_reply(&err)).await;
                         finish_reaction(ctx, new_message, react_enabled, false).await;
                     }
                 }
@@ -963,7 +1038,7 @@ async fn handle_event(
                     if react_enabled {
                         let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
                     }
-                    let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                    let _typing = new_message.channel_id.start_typing(&ctx.http);
                     let trimmed = rest.trim();
                     let (action, arg_text) = match trimmed.split_once(char::is_whitespace) {
                         Some((a, b)) => (a.trim(), b.trim()),
@@ -994,7 +1069,7 @@ async fn handle_event(
                 if react_enabled {
                     let _ = new_message.react(&ctx.http, ReactionType::Unicode("👀".to_string())).await;
                 }
-                let _ = new_message.channel_id.broadcast_typing(&ctx.http).await;
+                let _typing = new_message.channel_id.start_typing(&ctx.http);
                 let saved_files = download_discord_attachments(&new_message.attachments).await;
                 let full_prompt = if saved_files.is_empty() {
                     content.to_string()
@@ -1026,10 +1101,10 @@ async fn handle_event(
                 {
                     Ok((_, reply)) => {
                         send_discord_reply(ctx, new_message, &reply).await;
-                        finish_reaction(ctx, new_message, react_enabled, true).await;
+                        finish_reaction(ctx, new_message, react_enabled, !is_harness_error_reply(&reply)).await;
                     }
                     Err(err) => {
-                        let _ = new_message.reply(&ctx.http, err).await;
+                        let _ = new_message.reply(&ctx.http, truncate_discord_reply(&err)).await;
                         finish_reaction(ctx, new_message, react_enabled, false).await;
                     }
                 }

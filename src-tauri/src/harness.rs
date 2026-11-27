@@ -728,7 +728,7 @@ fn extract_usage_from_value(val: &Value, acc: &mut TurnAccumulator) {
     }
 }
 
-fn build_permission_args(harness: &str, permission_mode: &str) -> Vec<&'static str> {
+pub fn build_permission_args(harness: &str, permission_mode: &str) -> Vec<&'static str> {
     match harness {
         "claude-code" => match permission_mode {
             "plan" => vec!["--permission-mode", "plan"],
@@ -2796,7 +2796,7 @@ pub async fn run_one_shot_prompt_with_opts(
     prompt: &str,
     read_only: bool,
 ) -> Result<String, String> {
-    let (session, effective_cwd, proj_wsl, effective_harness, effective_model, effective_effort, account) = {
+    let (session, effective_cwd, proj_wsl, effective_harness, effective_model, effective_effort, account, enabled_mcp_servers) = {
         let db_lock = db.lock().await;
         let session = db_lock
             .get_session(session_id)
@@ -2859,8 +2859,20 @@ pub async fn run_one_shot_prompt_with_opts(
             .flatten()
             .filter(|a| a.harness == effective_harness)
             .or_else(|| db_lock.get_default_harness_account(&effective_harness).ok().flatten());
-        (session, effective_cwd, proj_wsl, effective_harness, effective_model, effective_effort, account)
+        let enabled_mcp_servers: Vec<McpServer> = db_lock
+            .list_mcp_servers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.enabled)
+            .collect();
+        (session, effective_cwd, proj_wsl, effective_harness, effective_model, effective_effort, account, enabled_mcp_servers)
     };
+
+    let one_shot_timeout_secs: u64 = std::env::var("SAKANA_ONE_SHOT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s >= 30)
+        .unwrap_or(600);
 
     let permission_mode = if read_only {
         "plan"
@@ -2870,6 +2882,22 @@ pub async fn run_one_shot_prompt_with_opts(
 
     let reply_text = if let Some(ref distro) = proj_wsl.filter(|_| effective_harness != "sakana") {
         let escaped_prompt = crate::platform::shell_escape_single(prompt);
+        let mut wsl_mcp_setup: Option<String> = None;
+        let mut wsl_mcp_path: Option<String> = None;
+        if effective_harness == "claude-code" {
+            if let Some(mcp_cfg) = build_mcp_config_json(&enabled_mcp_servers) {
+                if let Ok(json_str) = serde_json::to_string_pretty(&mcp_cfg) {
+                    let tmp_path = format!("/tmp/sakana-mcp-oneshot-{}.json", Uuid::new_v4());
+                    let escaped_json = crate::platform::shell_escape_single(&json_str);
+                    let escaped_path = crate::platform::shell_escape_single(&tmp_path);
+                    wsl_mcp_setup = Some(format!(
+                        "printf '%s' {} > {} && trap 'rm -f {}' EXIT",
+                        escaped_json, escaped_path, escaped_path
+                    ));
+                    wsl_mcp_path = Some(tmp_path);
+                }
+            }
+        }
         let mut cli_cmd = match effective_harness.as_str() {
             "claude-code" => {
                 let mut parts = vec!["claude".to_string(), "-p".to_string(), escaped_prompt];
@@ -2879,6 +2907,10 @@ pub async fn run_one_shot_prompt_with_opts(
                 }
                 for flag in build_permission_args("claude-code", permission_mode) {
                     parts.push(flag.to_string());
+                }
+                if let Some(ref mcp_path) = wsl_mcp_path {
+                    parts.push("--mcp-config".to_string());
+                    parts.push(crate::platform::shell_escape_single(mcp_path));
                 }
                 parts.join(" ")
             }
@@ -2907,18 +2939,26 @@ pub async fn run_one_shot_prompt_with_opts(
             "kiro-cli" => format!("kiro-cli chat --no-interactive {}", escaped_prompt),
             _ => format!("claude -p {}", escaped_prompt),
         };
-        let env_exports = build_wsl_env_exports(&effective_harness, account.as_ref());
-        if !env_exports.is_empty() {
-            cli_cmd = format!("{}; {}", env_exports.join("; "), cli_cmd);
+        let mut prefix_cmds = build_wsl_env_exports(&effective_harness, account.as_ref());
+        if let Some(setup) = wsl_mcp_setup {
+            prefix_cmds.push(setup);
+        }
+        if !prefix_cmds.is_empty() {
+            cli_cmd = format!("{}; {}", prefix_cmds.join("; "), cli_cmd);
         }
         let posix_cwd = wsl_posix_cwd(&effective_cwd);
         let mut cmd = crate::platform::wsl_tokio_shell(distro, &posix_cwd, &cli_cmd);
-        crate::auth::apply_account_env(&mut cmd, &effective_harness, account.as_ref());
-        cmd.stdin(Stdio::null())
+        cmd.kill_on_drop(true)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        match tokio::time::timeout(std::time::Duration::from_secs(90), cmd.output()).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(one_shot_timeout_secs),
+            cmd.output(),
+        )
+        .await
+        {
             Ok(Ok(out)) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if text.is_empty() {
@@ -2932,7 +2972,7 @@ pub async fn run_one_shot_prompt_with_opts(
                 format!("WSL harness error ({}): {}", out.status, err)
             }
             Ok(Err(e)) => format!("Failed to spawn WSL harness: {}", e),
-            Err(_) => "WSL harness request timed out after 90s.".to_string(),
+            Err(_) => format!("WSL harness request timed out after {}s.", one_shot_timeout_secs),
         }
     } else if let Some((active_harness, bin)) = (effective_harness != "sakana")
         .then(|| {
@@ -2945,11 +2985,17 @@ pub async fn run_one_shot_prompt_with_opts(
         .flatten()
     {
         let bin_str = bin.to_string_lossy().to_string();
+        crate::auth::sync_profile_mcp_and_skills(
+            active_harness,
+            account.as_ref(),
+            &enabled_mcp_servers,
+        );
         let mut cmd = crate::platform::tokio_command(&bin_str);
         crate::auth::apply_account_env(&mut cmd, active_harness, account.as_ref());
         if Path::new(&effective_cwd).is_dir() {
             cmd.current_dir(&effective_cwd);
         }
+        let mut _mcp_guard: Option<TempFileGuard> = None;
         if active_harness == "kiro-cli" {
             cmd.args(["chat", "--no-interactive", prompt]);
         } else if active_harness == "agy-cli" {
@@ -2969,12 +3015,32 @@ pub async fn run_one_shot_prompt_with_opts(
                 cmd.args(["--model", &effective_model]);
             }
             cmd.args(build_permission_args(active_harness, permission_mode));
+            if active_harness == "claude-code" {
+                if let Some(mcp_cfg) = build_mcp_config_json(&enabled_mcp_servers) {
+                    let cfg_path = std::env::temp_dir().join(format!(
+                        "sakana-mcp-oneshot-{}.json",
+                        Uuid::new_v4()
+                    ));
+                    if let Ok(json_str) = serde_json::to_string_pretty(&mcp_cfg) {
+                        if std::fs::write(&cfg_path, json_str).is_ok() {
+                            cmd.args(["--mcp-config", &cfg_path.to_string_lossy()]);
+                            _mcp_guard = Some(TempFileGuard { path: cfg_path });
+                        }
+                    }
+                }
+            }
         }
-        cmd.stdin(Stdio::null())
+        cmd.kill_on_drop(true)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        match tokio::time::timeout(std::time::Duration::from_secs(90), cmd.output()).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(one_shot_timeout_secs),
+            cmd.output(),
+        )
+        .await
+        {
             Ok(Ok(out)) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if text.is_empty() {
@@ -2988,7 +3054,7 @@ pub async fn run_one_shot_prompt_with_opts(
                 format!("Harness error ({}): {}", out.status, err)
             }
             Ok(Err(e)) => format!("Failed to spawn harness: {}", e),
-            Err(_) => "Harness request timed out after 90s.".to_string(),
+            Err(_) => format!("Harness request timed out after {}s.", one_shot_timeout_secs),
         }
     } else if let Some(key) = read_env_or_dotenv("OPENROUTER_API_KEY", &effective_cwd)
         .or_else(|| read_env_or_dotenv("OPENAI_API_KEY", &effective_cwd))

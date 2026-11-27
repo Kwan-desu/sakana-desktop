@@ -149,6 +149,7 @@ pub async fn execute_automation(
 }
 
 async fn run_cli_harness_once(
+    db: &Arc<Mutex<Database>>,
     name: &str,
     prompt: &str,
     project_cwd: Option<&str>,
@@ -167,19 +168,36 @@ async fn run_cli_harness_once(
         ));
     };
 
+    let enabled_mcp_servers: Vec<crate::models::McpServer> = {
+        let db_lock = db.lock().await;
+        db_lock
+            .list_mcp_servers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.enabled)
+            .collect()
+    };
+    crate::auth::sync_profile_mcp_and_skills(harness_id, acc, &enabled_mcp_servers);
+
     let bin_str = bin.to_string_lossy().to_string();
     let mut cmd = crate::platform::tokio_command(&bin_str);
     if let Some(cwd) = project_cwd.filter(|c| std::path::Path::new(c).is_dir()) {
         cmd.current_dir(cwd);
     }
     crate::auth::apply_account_env(&mut cmd, harness_id, acc);
-    cmd.args(["-p", prompt])
+    if harness_id == "kiro-cli" {
+        cmd.args(["chat", "--no-interactive", prompt]);
+    } else {
+        cmd.args(["-p", prompt]);
+        cmd.args(crate::harness::build_permission_args(harness_id, "yolo"));
+    }
+    cmd.kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child_fut = cmd.output();
 
-    match tokio::time::timeout(std::time::Duration::from_secs(60), child_fut).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(300), child_fut).await {
         Ok(Ok(out)) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if text.is_empty() {
@@ -197,7 +215,7 @@ async fn run_cli_harness_once(
             })
         }
         Ok(Err(e)) => Err(format!("Failed to spawn {}: {e}", bin.display())),
-        Err(_) => Err(format!("Automation '{}' timed out after 60s", name)),
+        Err(_) => Err(format!("Automation '{}' timed out after 300s", name)),
     }
 }
 
@@ -323,7 +341,7 @@ async fn run_automation_prompt(
         let Some((url, ai_prompt)) = rest.split_once('|') else {
             return ("ERR".to_string(), "Expected format: discord-ai:webhook:<url>|<prompt>".to_string());
         };
-        return match run_cli_harness_once(name, ai_prompt.trim(), project_cwd, claude_acc, agy_acc).await {
+        return match run_cli_harness_once(db, name, ai_prompt.trim(), project_cwd, claude_acc, agy_acc).await {
             Ok(generated) => match send_discord_webhook(url, &generated).await {
                 Ok(()) => (
                     "OK".to_string(),
@@ -340,7 +358,7 @@ async fn run_automation_prompt(
         let Some((channel_id, ai_prompt)) = rest.split_once('|') else {
             return ("ERR".to_string(), "Expected format: discord-ai:channel:<channel_id>|<prompt>".to_string());
         };
-        return match run_cli_harness_once(name, ai_prompt.trim(), project_cwd, claude_acc, agy_acc).await {
+        return match run_cli_harness_once(db, name, ai_prompt.trim(), project_cwd, claude_acc, agy_acc).await {
             Ok(generated) => match send_discord_bot_channel(db, channel_id, &generated).await {
                 Ok(()) => (
                     "OK".to_string(),
@@ -418,7 +436,7 @@ async fn run_automation_prompt(
         };
     }
 
-    match run_cli_harness_once(name, trimmed, project_cwd, claude_acc, agy_acc).await {
+    match run_cli_harness_once(db, name, trimmed, project_cwd, claude_acc, agy_acc).await {
         Ok(text) => ("OK".to_string(), text.chars().take(240).collect()),
         Err(err) => ("ERR".to_string(), err),
     }

@@ -442,6 +442,10 @@ pub struct RemoteStatus {
     pub magic_link: String,
     pub qr_svg: String,
     pub last_error: Option<String>,
+    pub lan_ip: Option<String>,
+    pub tailscale_ip: Option<String>,
+    pub tailscale_dns: Option<String>,
+    pub tailscale_magic_link: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -94,6 +94,82 @@ pub fn detect_lan_ip() -> String {
     "127.0.0.1".to_string()
 }
 
+fn is_tailscale_ipv4(ip: &str) -> bool {
+    let Ok(addr) = ip.trim().parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let octets = addr.octets();
+    // Tailscale uses CGNAT range 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn run_tailscale_cli(args: &[&str]) -> Option<String> {
+    let mut candidates: Vec<&str> = vec!["tailscale"];
+    #[cfg(target_os = "windows")]
+    {
+        candidates.push(r"C:\Program Files\Tailscale\tailscale.exe");
+        candidates.push(r"C:\Program Files (x86)\Tailscale\tailscale.exe");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push("/Applications/Tailscale.app/Contents/MacOS/Tailscale");
+        candidates.push("/usr/local/bin/tailscale");
+    }
+    for bin in candidates {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Detect Tailscale IPv4 (`100.64.0.0/10`) and MagicDNS hostname (`*.ts.net`).
+pub fn detect_tailscale_info() -> (Option<String>, Option<String>) {
+    let mut ts_ip = run_tailscale_cli(&["ip", "-4"])
+        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+        .filter(|ip| is_tailscale_ipv4(ip));
+
+    // Fallback without CLI: probe route to Tailscale MagicDNS resolver 100.100.100.100
+    if ts_ip.is_none() {
+        if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect("100.100.100.100:53").is_ok() {
+                if let Ok(addr) = sock.local_addr() {
+                    let candidate = addr.ip().to_string();
+                    if is_tailscale_ipv4(&candidate) {
+                        ts_ip = Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    let ts_dns = run_tailscale_cli(&["status", "--json"]).and_then(|raw| {
+        let v: Value = serde_json::from_str(&raw).ok()?;
+        let dns = v
+            .get("Self")
+            .and_then(|s| s.get("DNSName"))
+            .and_then(|d| d.as_str())?
+            .trim()
+            .trim_end_matches('.')
+            .to_string();
+        if dns.is_empty() { None } else { Some(dns) }
+    });
+
+    (ts_ip, ts_dns)
+}
+
 fn detect_hostname() -> String {
     System::host_name().unwrap_or_else(|| "sakana-host".to_string())
 }
@@ -121,8 +197,16 @@ async fn build_remote_status(state: &RemoteState) -> RemoteStatus {
     let bind_addr = state.bind_addr.lock().await.clone();
     let token = state.token.lock().await.clone();
     let last_error = state.last_error.lock().await.clone();
+    let lan_ip = detect_lan_ip();
+    let (tailscale_ip, tailscale_dns) = tokio::task::spawn_blocking(detect_tailscale_info)
+        .await
+        .unwrap_or((None, None));
+    let tailscale_magic_link = tailscale_ip
+        .as_deref()
+        .or(tailscale_dns.as_deref())
+        .map(|ts_host| build_pairing_link(ts_host, port, &token));
     let host_ip = if bind_addr == "0.0.0.0" {
-        detect_lan_ip()
+        tailscale_ip.clone().unwrap_or_else(|| lan_ip.clone())
     } else {
         "127.0.0.1".to_string()
     };
@@ -137,6 +221,10 @@ async fn build_remote_status(state: &RemoteState) -> RemoteStatus {
         magic_link,
         qr_svg,
         last_error,
+        lan_ip: Some(lan_ip),
+        tailscale_ip,
+        tailscale_dns,
+        tailscale_magic_link,
     }
 }
 
@@ -1319,6 +1407,25 @@ async fn api_webhook(
     }
 }
 
+fn is_private_or_tailscale_host(host: &str) -> bool {
+    if host == "localhost" || host == "127.0.0.1" || host.ends_with(".ts.net") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        let [a, b, _, _] = ip.octets();
+        // Loopback, Tailscale CGNAT (100.64.0.0/10), RFC1918 LAN ranges
+        if a == 127
+            || (a == 100 && (64..=127).contains(&b))
+            || a == 10
+            || (a == 192 && b == 168)
+            || (a == 172 && (16..=31).contains(&b))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_allowed_origin(origin: &HeaderValue) -> bool {
     let Ok(s) = origin.to_str() else {
         return false;
@@ -1330,18 +1437,16 @@ fn is_allowed_origin(origin: &HeaderValue) -> bool {
     ) {
         return true;
     }
-    for prefix in [
-        "http://localhost",
-        "https://localhost",
-        "http://127.0.0.1",
-        "https://127.0.0.1",
-    ] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            if rest.is_empty()
-                || (rest.starts_with(':') && rest[1..].chars().all(|c| c.is_ascii_digit()))
-            {
-                return true;
-            }
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"));
+    if let Some(authority) = rest {
+        let (host, port_ok) = match authority.split_once(':') {
+            Some((h, p)) => (h, !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+            None => (authority, true),
+        };
+        if port_ok && is_private_or_tailscale_host(host) {
+            return true;
         }
     }
     false

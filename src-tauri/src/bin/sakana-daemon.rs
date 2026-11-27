@@ -35,7 +35,7 @@ async fn main() {
                     i += 1;
                 }
             }
-            "--lan" => {
+            "--lan" | "--tailscale" => {
                 lan_enabled = true;
             }
             _ => {}
@@ -59,8 +59,9 @@ async fn main() {
     let db_arc = Arc::new(Mutex::new(db));
 
     let bind_host = if lan_enabled { "0.0.0.0" } else { "127.0.0.1" };
+    let (ts_ip, ts_dns) = remote::detect_tailscale_info();
     let ip = if lan_enabled {
-        remote::detect_lan_ip()
+        ts_ip.clone().unwrap_or_else(remote::detect_lan_ip)
     } else {
         "127.0.0.1".to_string()
     };
@@ -69,6 +70,9 @@ async fn main() {
     println!("Sakana Headless Daemon (sakana-rpc-v2)");
     println!("  Data dir : {}", data_dir.display());
     println!("  Listening: http://{}:{}", bind_host, port);
+    if let Some(ref tip) = ts_ip {
+        println!("  Tailscale: {} (MagicDNS: {})", tip, ts_dns.as_deref().unwrap_or("n/a"));
+    }
     println!("  Pairing  : {}", pairing);
     println!("Paste the Pairing URI into Sakana Desktop -> Dashboard -> Remote Access -> Link Instance.");
 

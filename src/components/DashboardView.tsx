@@ -274,7 +274,7 @@ export function DashboardView({
 
   // Remote & Secrets form
   const [remotePort, setRemotePort] = useState('4317');
-  const [lanEnabled, setLanEnabled] = useState(false);
+  const [lanEnabled, setLanEnabled] = useState(true);
   const [secretKey, setSecretKey] = useState('');
   const [secretValue, setSecretValue] = useState('');
 
@@ -3078,7 +3078,7 @@ export function DashboardView({
                   <label
                     className="flex items-center justify-between gap-2 text-[11.5px] px-2.5 py-1.5 rounded-[6px] border cursor-pointer select-none"
                     style={{ borderColor: 'var(--border-line)', color: 'var(--text-body)', backgroundColor: 'var(--bg-app)' }}
-                    title="Bind to 0.0.0.0 for cross-device LAN/QR pairing instead of 127.0.0.1"
+                    title="Bind to 0.0.0.0 for Tailscale, LAN, and QR pairing instead of 127.0.0.1"
                   >
                     <span className="inline-flex items-center gap-2">
                       <input
@@ -3087,12 +3087,26 @@ export function DashboardView({
                         disabled={Boolean(remoteStatus?.running)}
                         onChange={(e) => setLanEnabled(e.target.checked)}
                       />
-                      <span className="font-mono-tech text-[11px]">LAN Access (0.0.0.0)</span>
+                      <span className="font-mono-tech text-[11px]">Tailscale / LAN (0.0.0.0)</span>
                     </span>
                     <span className="text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
-                      Allow LAN / QR pairing
+                      {remoteStatus?.tailscaleIp
+                        ? `Tailscale ${remoteStatus.tailscaleIp}`
+                        : 'Allow Tailscale / LAN'}
                     </span>
                   </label>
+
+                  {(remoteStatus?.tailscaleIp || remoteStatus?.tailscaleDns) && (
+                    <div
+                      className="flex items-center justify-between gap-2 text-[10.5px] px-2.5 py-1.5 rounded-[6px] border font-mono-tech"
+                      style={{ borderColor: 'var(--accent-green)', backgroundColor: 'var(--accent-green-bg)', color: 'var(--accent-green)' }}
+                    >
+                      <span className="truncate">
+                        Tailscale detected: {remoteStatus.tailscaleIp || remoteStatus.tailscaleDns}
+                        {remoteStatus.tailscaleDns && remoteStatus.tailscaleIp ? ` (${remoteStatus.tailscaleDns})` : ''}
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 {(() => {
@@ -3335,11 +3349,11 @@ export function DashboardView({
                   className="rounded-[7px] border px-2.5 py-2 font-mono-tech text-[10.5px] flex items-center justify-between gap-2"
                   style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)', color: 'var(--text-muted)' }}
                 >
-                  <span className="truncate">sakana-daemon --port 4317</span>
+                  <span className="truncate">sakana-daemon --port 4317 --tailscale</span>
                   <button
                     type="button"
                     onClick={() => {
-                      void navigator.clipboard?.writeText('sakana-daemon --port 4317');
+                      void navigator.clipboard?.writeText('sakana-daemon --port 4317 --tailscale');
                       onToast('Copied daemon command');
                     }}
                     className="btn-ghost p-1 shrink-0 cursor-pointer"

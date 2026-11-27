@@ -230,7 +230,7 @@ impl Database {
                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 cwd TEXT NOT NULL,
                 master_staff_id TEXT NOT NULL DEFAULT '',
-                max_rounds INTEGER NOT NULL DEFAULT 6,
+                max_rounds INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'idle',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL

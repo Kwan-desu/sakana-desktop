@@ -119,7 +119,7 @@ function CreateOfficeModal({
     if (valid.length === 0) return '';
     return valid.includes('medium') ? 'medium' : valid[0];
   });
-  const [maxRounds, setMaxRounds] = useState(5);
+  const [maxRounds, setMaxRounds] = useState(0);
   const [wslDistros, setWslDistros] = useState<WslDistro[]>([]);
   const [wslDistro, setWslDistro] = useState('');
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
@@ -382,7 +382,8 @@ function CreateOfficeModal({
                     color: 'var(--text-main)',
                   }}
                 >
-                  {[2, 3, 5, 8, 10, 15].map((r) => (
+                  <option value={0}>Unlimited (recommended)</option>
+                  {[3, 5, 10, 20].map((r) => (
                     <option key={r} value={r}>
                       {r} rounds
                     </option>
@@ -1169,7 +1170,14 @@ export function OfficeView({
                 color: 'var(--text-body)',
               }}
             >
-              {[1, 2, 3, 5, 8, 10, 15].map((n) => (
+              <option value={0}>Rounds: Unlimited</option>
+              {selectedOffice.maxRounds > 0 &&
+                ![3, 5, 10, 20].includes(selectedOffice.maxRounds) && (
+                  <option value={selectedOffice.maxRounds}>
+                    Max Rounds: {selectedOffice.maxRounds}
+                  </option>
+                )}
+              {[3, 5, 10, 20].map((n) => (
                 <option key={n} value={n}>
                   Max Rounds: {n}
                 </option>

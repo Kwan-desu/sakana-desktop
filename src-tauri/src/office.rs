@@ -159,6 +159,12 @@ fn build_master_system_context(office: &Office) -> String {
         roster_lines.join("\n")
     };
 
+    let rounds_label = if office.max_rounds <= 0 {
+        "Unlimited (continue delegating until the task is complete)".to_string()
+    } else {
+        office.max_rounds.to_string()
+    };
+
     format!(
         "You are the Master Orchestrator of Sakana Office \"{}\".\n\
         Project working directory: `{}`\n\
@@ -181,7 +187,7 @@ fn build_master_system_context(office: &Office) -> String {
         {{\"action\":\"fire\",\"staff_id\":\"<id>\",\"staff_name\":\"<name>\"}}\n\
         ```\n\
         When all work is complete or no further delegation is needed, provide a clear final summary to the user without any delegate blocks.",
-        office.name, office.cwd, office.max_rounds, roster_block
+        office.name, office.cwd, rounds_label, roster_block
     )
 }
 
@@ -483,7 +489,7 @@ pub async fn create_office_inner(
     let master_permission_mode = input
         .master_permission_mode
         .unwrap_or_else(|| "yolo".to_string());
-    let max_rounds = input.max_rounds.unwrap_or(4).clamp(1, 20);
+    let max_rounds = input.max_rounds.unwrap_or(0).max(0);
 
     let (project_id, cwd) = {
         let db = db_arc.lock().await;
@@ -723,7 +729,7 @@ pub async fn update_office_settings_inner(
     office_id: String,
     max_rounds: i64,
 ) -> Result<Office, String> {
-    let clamped = max_rounds.clamp(1, 20);
+    let clamped = max_rounds.max(0);
     let office = {
         let db = db_arc.lock().await;
         db.update_office_max_rounds(&office_id, clamped)
@@ -885,7 +891,11 @@ pub async fn send_office_message_inner(
             let mut current_attachments = attachments;
             let mut aborted = false;
 
-            for round in 0..office.max_rounds {
+            let mut round: i64 = 0;
+            loop {
+                if office.max_rounds > 0 && round >= office.max_rounds {
+                    break;
+                }
                 if *abort_rx.borrow() {
                     aborted = true;
                     break;
@@ -1050,7 +1060,9 @@ pub async fn send_office_message_inner(
                     }
                 }
 
-                if delegations.is_empty() || round + 1 >= fresh_office.max_rounds {
+                if delegations.is_empty()
+                    || (fresh_office.max_rounds > 0 && round + 1 >= fresh_office.max_rounds)
+                {
                     break;
                 }
 
@@ -1212,6 +1224,7 @@ pub async fn send_office_message_inner(
                     round + 1,
                     reports_body.join("\n\n")
                 );
+                round += 1;
             }
 
             {

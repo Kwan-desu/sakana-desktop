@@ -289,6 +289,10 @@ export interface RemoteStatus {
   magicLink: string;
   qrSvg: string;
   lastError?: string;
+  lanIp?: string;
+  tailscaleIp?: string;
+  tailscaleDns?: string;
+  tailscaleMagicLink?: string;
 }
 
 export interface SystemTelemetry {

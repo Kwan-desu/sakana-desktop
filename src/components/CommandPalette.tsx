@@ -225,14 +225,14 @@ export function CommandPalette({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[1px] flex items-start justify-center pt-[12vh] p-4"
+      className="modal-backdrop-enter fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px] flex items-start justify-center pt-[12vh] p-4"
       onClick={onClose}
     >
       <div
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
-        className="sakana-popover pop-enter w-full max-w-lg rounded-[14px] overflow-hidden"
+        className="sakana-popover modal-panel-enter w-full max-w-lg rounded-[14px] overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div

@@ -58,6 +58,18 @@ export function RaceModal({
   const [activeRace, setActiveRace] = useState<RaceRun | null>(null);
   const [starting, setStarting] = useState(false);
   const [mergingId, setMergingId] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const hasRunningContestant = Boolean(
+    open && activeRace?.contestants.some((c) => c.status === 'running'),
+  );
+
+  useEffect(() => {
+    if (!hasRunningContestant) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 250);
+    return () => window.clearInterval(id);
+  }, [hasRunningContestant]);
 
   useEffect(() => {
     if (activeProjectId) setProjectId(activeProjectId);
@@ -158,14 +170,14 @@ export function RaceModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-[1px] flex items-center justify-center p-4"
+      className="modal-backdrop-enter fixed inset-0 z-50 bg-black/50 backdrop-blur-[2px] flex items-center justify-center p-4"
       onClick={onClose}
     >
       <div
         role="dialog"
         aria-modal="true"
         aria-label="Multi-Harness Parallel Race"
-        className="sakana-popover pop-enter w-full max-w-4xl max-h-[86vh] rounded-[14px] flex flex-col overflow-hidden"
+        className="sakana-popover modal-panel-enter w-full max-w-4xl max-h-[86vh] rounded-[14px] flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -293,7 +305,7 @@ export function RaceModal({
                 type="button"
                 disabled={starting}
                 onClick={handleStart}
-                className="btn-primary px-3.5 py-1.5 text-[12px] inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                className="btn-solid px-3.5 py-1.5 text-[12px] font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
               >
                 {starting ? <CircleNotch size={13} className="animate-spin" /> : <Play size={13} weight="fill" />}
                 <span>{starting ? 'Launching...' : 'Start Race'}</span>
@@ -366,7 +378,17 @@ export function RaceModal({
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono-tech" style={{ color: 'var(--text-muted)' }}>
-                        <span>{(c.durationMs / 1000).toFixed(1)}s</span>
+                        <span>
+                          {c.status === 'running' && c.durationMs === 0
+                            ? `${Math.max(0.1, (nowMs - (Date.parse(activeRace.createdAt) || nowMs)) / 1000).toFixed(1)}s`
+                            : `${(c.durationMs / 1000).toFixed(1)}s`}
+                        </span>
+                        {c.status === 'running' && (
+                          <span className="inline-flex items-center gap-1.5" style={{ color: 'var(--accent-blue)' }}>
+                            <span className="thinking-dots"><span /><span /><span /></span>
+                            <span className="thinking-shimmer">Working…</span>
+                          </span>
+                        )}
                         <span>·</span>
                         <span>{c.filesChanged} files</span>
                         <span style={{ color: 'var(--accent-green)' }}>+{c.additions}</span>

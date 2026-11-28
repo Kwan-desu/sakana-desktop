@@ -215,7 +215,7 @@ function CreateOfficeModal({
   return (
     <>
       <div
-        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+        className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-[2px]"
         style={{ backgroundColor: 'rgba(0, 0, 0, 0.45)' }}
         onClick={onClose}
       >
@@ -223,7 +223,7 @@ function CreateOfficeModal({
           role="dialog"
           aria-modal="true"
           aria-label="Create Office"
-          className="sakana-card rounded-[12px] w-full max-w-lg overflow-hidden pop-enter"
+          className="sakana-card modal-panel-enter rounded-[12px] w-full max-w-lg overflow-hidden"
           onClick={(e) => e.stopPropagation()}
         >
           <div
@@ -648,7 +648,7 @@ function HireStaffModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-[2px]"
       style={{ backgroundColor: 'rgba(0, 0, 0, 0.45)' }}
       onClick={onClose}
     >
@@ -656,7 +656,7 @@ function HireStaffModal({
         role="dialog"
         aria-modal="true"
         aria-label={editingStaff ? 'Edit Staff' : 'Hire Staff'}
-        className="sakana-card rounded-[12px] w-full max-w-lg max-h-[85vh] flex flex-col overflow-hidden pop-enter"
+        className="sakana-card modal-panel-enter rounded-[12px] w-full max-w-lg max-h-[85vh] flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div
@@ -1019,10 +1019,39 @@ export function OfficeView({
 
   const [blueprints, setBlueprints] = useState<OfficeBlueprint[]>([]);
   const [blueprintMenuOpen, setBlueprintMenuOpen] = useState(false);
+  const blueprintMenuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     tauriApi.listOfficeBlueprints().then(setBlueprints).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!blueprintMenuOpen) return;
+    const onDown = (ev: MouseEvent) => {
+      if (blueprintMenuRef.current && !blueprintMenuRef.current.contains(ev.target as Node)) {
+        setBlueprintMenuOpen(false);
+      }
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') setBlueprintMenuOpen(false);
+    };
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [blueprintMenuOpen]);
+
+  const handleDeleteBlueprint = async (bp: OfficeBlueprint) => {
+    try {
+      await tauriApi.deleteOfficeBlueprint(bp.id);
+      setBlueprints((prev) => prev.filter((b) => b.id !== bp.id));
+      onToast(`Deleted blueprint "${bp.name}"`);
+    } catch (err) {
+      onToast(`Failed to delete blueprint: ${String(err)}`);
+    }
+  };
 
   const handleSaveBlueprint = async () => {
     if (!selectedOffice) return;
@@ -1261,7 +1290,7 @@ export function OfficeView({
             </button>
           )}
 
-          <div className="relative">
+          <div ref={blueprintMenuRef} className="relative">
             <button
               type="button"
               onClick={() => setBlueprintMenuOpen((v) => !v)}
@@ -1273,7 +1302,7 @@ export function OfficeView({
             </button>
             {blueprintMenuOpen && (
               <div
-                className="sakana-popover pop-enter absolute right-0 top-full mt-1.5 w-64 rounded-[10px] p-1.5 z-50 space-y-1"
+                className="sakana-popover pop-enter absolute right-0 top-full mt-1.5 w-68 rounded-[10px] p-1.5 z-50 space-y-1"
               >
                 <div className="px-2 py-1 text-[10px] font-mono-tech uppercase" style={{ color: 'var(--text-muted)' }}>
                   Office Blueprints ({blueprints.length})
@@ -1284,19 +1313,38 @@ export function OfficeView({
                   </div>
                 ) : (
                   blueprints.map((bp) => (
-                    <button
+                    <div
                       key={bp.id}
-                      type="button"
-                      onClick={() => void handleCreateFromBlueprint(bp)}
-                      className="w-full px-2 py-1.5 rounded-[6px] text-left hover:bg-[var(--bg-hover)] cursor-pointer"
+                      className="flex items-center gap-1 rounded-[6px] hover:bg-[var(--bg-hover)] transition-colors"
                     >
-                      <div className="text-[12px] font-medium truncate" style={{ color: 'var(--text-main)' }}>
-                        {bp.name}
-                      </div>
-                      <div className="text-[10.5px] truncate" style={{ color: 'var(--text-muted)' }}>
-                        {bp.description || `${bp.config.staff.length} staff`}
-                      </div>
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleCreateFromBlueprint(bp)}
+                        className="flex-1 min-w-0 px-2 py-1.5 text-left cursor-pointer"
+                      >
+                        <div className="text-[12px] font-medium truncate" style={{ color: 'var(--text-main)' }}>
+                          {bp.name}
+                        </div>
+                        <div className="text-[10.5px] truncate" style={{ color: 'var(--text-muted)' }}>
+                          {bp.description || `${bp.config.staff.length} staff`}
+                        </div>
+                      </button>
+                      {!bp.isBuiltin && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleDeleteBlueprint(bp);
+                          }}
+                          title="Delete saved blueprint"
+                          aria-label={`Delete blueprint ${bp.name}`}
+                          className="p-1.5 mr-1 rounded hover:bg-[var(--bg-elevated)] cursor-pointer shrink-0"
+                          style={{ color: 'var(--text-muted)' }}
+                        >
+                          <Trash size={12} />
+                        </button>
+                      )}
+                    </div>
                   ))
                 )}
               </div>

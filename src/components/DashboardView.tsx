@@ -643,7 +643,7 @@ export function DashboardView({
 
   return (
     <div
-      className="flex-1 min-w-0 h-full overflow-y-auto px-6 sm:px-10 py-7 space-y-6"
+      className="view-enter flex-1 min-w-0 h-full overflow-y-auto px-6 sm:px-10 py-7 space-y-6"
       style={{ backgroundColor: 'var(--bg-canvas)' }}
     >
       {/* Top Bar */}
@@ -3893,8 +3893,6 @@ export function DashboardView({
                   {autostartEnabled ? 'Enabled' : 'Disabled'}
                 </button>
               </div>
-              <VoiceSettingsCard onToast={onToast} />
-              <AuditLogCard />
             </div>
 
             <div className="lg:col-span-7 sakana-card rounded-[12px] p-5 space-y-3.5 h-fit">
@@ -3990,6 +3988,10 @@ export function DashboardView({
                 )}
               </div>
             </div>
+          </div>
+          <div className="space-y-6">
+            <VoiceSettingsCard onToast={onToast} />
+            <AuditLogCard />
           </div>
           </div>
         )}

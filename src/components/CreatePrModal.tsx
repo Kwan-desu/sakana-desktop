@@ -67,14 +67,14 @@ export function CreatePrModal({ open, onClose, thread, onSubmit }: CreatePrModal
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[1px] flex items-center justify-center p-4"
+      className="modal-backdrop-enter fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px] flex items-center justify-center p-4"
       onClick={onClose}
     >
       <div
         role="dialog"
         aria-modal="true"
         aria-label="Create Pull Request"
-        className="sakana-popover pop-enter w-full max-w-lg rounded-[14px] p-5 space-y-4"
+        className="sakana-popover modal-panel-enter w-full max-w-lg rounded-[14px] p-5 space-y-4"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between border-b pb-3" style={{ borderColor: 'var(--border-line)' }}>

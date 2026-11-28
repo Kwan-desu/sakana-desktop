@@ -65,7 +65,7 @@ export function FolderPickerModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-[2px]"
       style={{ backgroundColor: 'rgba(0,0,0,0.45)' }}
       onClick={onClose}
     >
@@ -73,7 +73,7 @@ export function FolderPickerModal({
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className="sakana-card rounded-[12px] w-full max-w-lg max-h-[75vh] flex flex-col overflow-hidden pop-enter"
+        className="sakana-card modal-panel-enter rounded-[12px] w-full max-w-lg max-h-[75vh] flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div

@@ -6,6 +6,7 @@ import {
   CaretDown,
   CaretRight,
   Check,
+  CircleNotch,
   Code,
   Columns,
   Copy,
@@ -996,12 +997,123 @@ function resolveNextEffort(
   return undefined;
 }
 
+function stripMarkdownForSpeech(raw: string): string {
+  return raw
+    .replace(/```[\s\S]*?```/g, ' code block. ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/[*_~>-]{1,3}/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function LiveThinkingStatus({
+  harness,
+  effort,
+  wslDistro,
+  thinking,
+  runningTool,
+  branch,
+}: {
+  harness: HarnessId;
+  effort?: ReasoningEffort;
+  wslDistro?: string;
+  thinking?: string;
+  runningTool?: { name: string; target?: string };
+  branch?: string;
+}) {
+  const startRef = useRef<number>(Date.now());
+  const [elapsedMs, setElapsedMs] = useState(0);
+
+  useEffect(() => {
+    startRef.current = Date.now();
+    setElapsedMs(0);
+    const id = window.setInterval(() => {
+      setElapsedMs(Date.now() - startRef.current);
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [harness]);
+
+  const elapsedSec = elapsedMs / 1000;
+  const harnessName = HARNESS_META[harness].name;
+
+  let statusLabel: string;
+  if (runningTool) {
+    const shortTarget = runningTool.target
+      ? runningTool.target.split(/[\\/]/).filter(Boolean).pop() || runningTool.target
+      : '';
+    statusLabel = shortTarget
+      ? `Running ${runningTool.name} (${shortTarget})…`
+      : `Running ${runningTool.name}…`;
+  } else if (thinking && thinking.trim()) {
+    statusLabel = 'Thinking…';
+  } else if (elapsedSec < 2.5) {
+    statusLabel = wslDistro
+      ? `Starting ${harnessName} in WSL…`
+      : `Starting ${harnessName}…`;
+  } else if (elapsedSec < 15) {
+    statusLabel =
+      effort === 'high' || effort === 'xhigh'
+        ? `Reasoning (${effort} effort)…`
+        : 'Thinking…';
+  } else {
+    statusLabel = branch
+      ? `Still working in ${branch} — waiting on model response…`
+      : 'Still working — waiting on model response…';
+  }
+
+  const latestThoughtLine = thinking
+    ? thinking
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .pop() || ''
+    : '';
+
+  return (
+    <div
+      className="msg-enter inline-flex flex-col gap-1 py-1"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="flex items-center gap-2 text-[12px] font-mono-tech" style={{ color: 'var(--text-muted)' }}>
+        <span className="thinking-dots" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </span>
+        <span className="thinking-shimmer" style={{ color: 'var(--text-body)' }}>
+          {statusLabel}
+        </span>
+        <span className="text-[10.5px] tabular-nums opacity-75">
+          {elapsedSec.toFixed(1)}s
+        </span>
+      </div>
+      {latestThoughtLine && !runningTool && (
+        <div
+          className="text-[11.5px] truncate max-w-xl pl-5 opacity-75"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          {latestThoughtLine}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface MessageRowProps {
   m: ChatMessage;
   idx: number;
   threadId: string;
   harness: HarnessId;
   isDiscord?: boolean;
+  isStreaming?: boolean;
+  effort?: ReasoningEffort;
+  wslDistro?: string;
+  branch?: string;
   traceOpen: boolean;
   theme: ThemeId;
   onToggleTrace: (msgId: string) => void;
@@ -1020,6 +1132,10 @@ const MessageRow = memo(function MessageRow({
   threadId,
   harness,
   isDiscord,
+  isStreaming,
+  effort,
+  wslDistro,
+  branch,
   traceOpen,
   theme,
   onToggleTrace,
@@ -1031,6 +1147,14 @@ const MessageRow = memo(function MessageRow({
   onToast,
   onOpenFile,
 }: MessageRowProps) {
+  const [confirmRewind, setConfirmRewind] = useState(false);
+
+  useEffect(() => {
+    if (!confirmRewind) return;
+    const t = window.setTimeout(() => setConfirmRewind(false), 5000);
+    return () => window.clearTimeout(t);
+  }, [confirmRewind]);
+
   if (m.role === 'user') {
     return (
       <div className="group flex flex-col items-end gap-1 msg-enter" data-turn-id={m.id}>
@@ -1109,7 +1233,7 @@ const MessageRow = memo(function MessageRow({
 
           {traceOpen && (
             <div
-              className="mt-1.5 ml-1.5 pl-3 border-l space-y-2"
+              className="trace-enter mt-1.5 ml-1.5 pl-3 border-l space-y-2"
               style={{ borderColor: 'var(--border-line)' }}
             >
               {m.thinking && (
@@ -1233,7 +1357,18 @@ const MessageRow = memo(function MessageRow({
         </div>
       )}
 
-      <SimpleMarkdown text={m.text} stripSakanaUi={Boolean(m.widget)} onOpenFile={onOpenFile} />
+      {isStreaming && !m.text.trim() ? (
+        <LiveThinkingStatus
+          harness={harness}
+          effort={effort}
+          wslDistro={wslDistro}
+          thinking={m.thinking}
+          runningTool={runningTools[runningTools.length - 1]}
+          branch={branch}
+        />
+      ) : (
+        <SimpleMarkdown text={m.text} stripSakanaUi={Boolean(m.widget)} onOpenFile={onOpenFile} />
+      )}
 
       {/* Inline sakana-ui Widget */}
       {m.widget && <SakanaUiCard msg={m} theme={theme} />}
@@ -1267,15 +1402,44 @@ const MessageRow = memo(function MessageRow({
               View Diff
             </button>
             {onRewindCheckpoint && (
-              <button
-                type="button"
-                onClick={() => onRewindCheckpoint(threadId, m.checkpoint!.id)}
-                className="btn-ghost px-2 py-0.5 text-[10.5px] font-mono-tech inline-flex items-center gap-1 cursor-pointer"
-                title="Auto-stash dirty changes, reset git & rewind conversation to this turn"
-              >
-                <ArrowCounterClockwise size={11} />
-                <span>Rewind</span>
-              </button>
+              confirmRewind ? (
+                <div className="pop-enter inline-flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirmRewind(false);
+                      onRewindCheckpoint(threadId, m.checkpoint!.id);
+                    }}
+                    className="px-2 py-0.5 rounded-[6px] border text-[10.5px] font-mono-tech inline-flex items-center gap-1 cursor-pointer"
+                    style={{
+                      borderColor: 'var(--accent-red)',
+                      backgroundColor: 'rgba(239, 68, 68, 0.14)',
+                      color: 'var(--accent-red)',
+                    }}
+                    title="Confirm auto-stash, git reset & delete later messages"
+                  >
+                    <ArrowCounterClockwise size={11} />
+                    <span>Confirm Rewind</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmRewind(false)}
+                    className="btn-ghost px-1.5 py-0.5 text-[10.5px] font-mono-tech cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmRewind(true)}
+                  className="btn-ghost px-2 py-0.5 text-[10.5px] font-mono-tech inline-flex items-center gap-1 cursor-pointer"
+                  title="Auto-stash dirty changes, reset git & rewind conversation to this turn"
+                >
+                  <ArrowCounterClockwise size={11} />
+                  <span>Rewind</span>
+                </button>
+              )
             )}
             {onForkFromCheckpoint && (
               <button
@@ -1400,9 +1564,14 @@ export function ChatPane({
 
   // Voice Mode (STT + TTS)
   const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [interimTranscript, setInterimTranscript] = useState('');
+  const [isSpeaking, setIsSpeaking] = useState(false);
   const [ttsEnabled, setTtsEnabled] = useState(false);
   const [voiceEngine, setVoiceEngine] = useState<string>('auto');
   const [voiceLang, setVoiceLang] = useState<string>('en-US');
+  const [voiceAutoSend, setVoiceAutoSend] = useState(false);
+  const [ttsRate, setTtsRate] = useState(1.05);
   const recognitionRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -1413,6 +1582,10 @@ export function ChatPane({
       setTtsEnabled(Boolean(cfg.ttsEnabled));
       setVoiceEngine(cfg.engine || 'auto');
       setVoiceLang(cfg.language || 'en-US');
+      setVoiceAutoSend(Boolean(cfg.autoSend));
+      if (typeof cfg.ttsRate === 'number' && cfg.ttsRate > 0) {
+        setTtsRate(cfg.ttsRate);
+      }
     }).catch(() => {});
   }, []);
 
@@ -1422,15 +1595,36 @@ export function ChatPane({
     const last = [...thread.messages].reverse().find((m) => m.role === 'assistant' && m.text.trim());
     if (!last || last.id === lastSpokenMsgIdRef.current) return;
     lastSpokenMsgIdRef.current = last.id;
+    const cleanText = stripMarkdownForSpeech(last.text).slice(0, 1400);
+    if (!cleanText) return;
     try {
       window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(last.text.slice(0, 1200));
+      const utter = new SpeechSynthesisUtterance(cleanText);
       utter.lang = voiceLang || 'en-US';
+      utter.rate = ttsRate || 1.05;
+      utter.onstart = () => setIsSpeaking(true);
+      utter.onend = () => setIsSpeaking(false);
+      utter.onerror = () => setIsSpeaking(false);
       window.speechSynthesis.speak(utter);
     } catch {
-      // ignore TTS errors
+      setIsSpeaking(false);
     }
-  }, [thread.messages, thread.status, ttsEnabled, voiceLang]);
+  }, [thread.messages, thread.status, ttsEnabled, ttsRate, voiceLang]);
+
+  const applyFinalTranscript = useCallback(
+    (transcript: string) => {
+      const cleaned = transcript.trim();
+      if (!cleaned) return;
+      if (voiceAutoSend && thread && thread.id !== 'empty') {
+        const combined = input.trim() ? `${input.trim()} ${cleaned}` : cleaned;
+        setInput('');
+        onSendPrompt(thread.id, combined);
+        return;
+      }
+      setInput((prev) => (prev ? `${prev} ${cleaned}` : cleaned));
+    },
+    [input, onSendPrompt, thread, voiceAutoSend],
+  );
 
   const toggleVoiceRecording = useCallback(async () => {
     if (isRecording) {
@@ -1444,6 +1638,7 @@ export function ChatPane({
         mediaRecorderRef.current.stop();
       }
       setIsRecording(false);
+      setInterimTranscript('');
       return;
     }
 
@@ -1452,25 +1647,42 @@ export function ChatPane({
       try {
         const rec = new SpeechRec();
         rec.lang = voiceLang || 'en-US';
-        rec.interimResults = false;
+        rec.interimResults = true;
         rec.continuous = false;
         rec.onresult = (ev: any) => {
-          const transcript = Array.from(ev.results || [])
-            .map((r: any) => r[0]?.transcript || '')
-            .join(' ')
-            .trim();
-          if (transcript) {
-            setInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
+          let finalText = '';
+          let interimText = '';
+          for (let i = ev.resultIndex ?? 0; i < (ev.results?.length ?? 0); i++) {
+            const res = ev.results[i];
+            const chunk = res?.[0]?.transcript || '';
+            if (res?.isFinal) {
+              finalText += `${chunk} `;
+            } else {
+              interimText += chunk;
+            }
+          }
+          setInterimTranscript(interimText.trim());
+          if (finalText.trim()) {
+            setInterimTranscript('');
+            applyFinalTranscript(finalText);
           }
         };
-        rec.onerror = () => setIsRecording(false);
-        rec.onend = () => setIsRecording(false);
+        rec.onerror = () => {
+          setIsRecording(false);
+          setInterimTranscript('');
+        };
+        rec.onend = () => {
+          setIsRecording(false);
+          setInterimTranscript('');
+        };
         recognitionRef.current = rec;
+        setInterimTranscript('');
         setIsRecording(true);
         rec.start();
         return;
       } catch {
         setIsRecording(false);
+        setInterimTranscript('');
       }
     }
 
@@ -1489,20 +1701,27 @@ export function ChatPane({
       mr.onstop = async () => {
         stream.getTracks().forEach((t) => t.stop());
         const blob = new Blob(audioChunksRef.current, { type: mr.mimeType || 'audio/webm' });
+        setIsTranscribing(true);
         const reader = new FileReader();
         reader.onloadend = async () => {
           const dataUrl = String(reader.result || '');
           const b64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-          if (!b64) return;
+          if (!b64) {
+            setIsTranscribing(false);
+            return;
+          }
           try {
             const res = await tauriApi.transcribeAudio(b64, blob.type, voiceLang);
             if (res?.text) {
-              setInput((prev) => (prev ? `${prev} ${res.text}` : res.text));
+              applyFinalTranscript(res.text);
             }
           } catch (e) {
             onToast(`Transcription failed: ${String(e)}`);
+          } finally {
+            setIsTranscribing(false);
           }
         };
+        reader.onerror = () => setIsTranscribing(false);
         reader.readAsDataURL(blob);
       };
       mediaRecorderRef.current = mr;
@@ -1512,7 +1731,7 @@ export function ChatPane({
       onToast(`Mic error: ${String(e)}`);
       setIsRecording(false);
     }
-  }, [isRecording, onToast, voiceEngine, voiceLang]);
+  }, [applyFinalTranscript, isRecording, onToast, voiceEngine, voiceLang]);
 
   const openTimeline = () => {
     if (timelineCloseTimerRef.current !== null) {
@@ -1963,6 +2182,14 @@ export function ChatPane({
                   threadId={thread.id}
                   harness={thread.harness}
                   isDiscord={thread.isDiscord}
+                  isStreaming={
+                    thread.status === 'RUNNING' &&
+                    idx === thread.messages.length - 1 &&
+                    m.role === 'assistant'
+                  }
+                  effort={thread.effort}
+                  wslDistro={project?.wslDistro}
+                  branch={thread.branch}
                   traceOpen={!!expandedTraces[m.id]}
                   theme={theme}
                   onToggleTrace={toggleTrace}
@@ -1976,13 +2203,19 @@ export function ChatPane({
                 />
               ))}
 
-
-              {thread.status === 'RUNNING' && (
-                <div className="flex items-center gap-2 text-[12px] font-mono-tech" style={{ color: 'var(--text-muted)' }}>
-                  <span className="w-2 h-2 rounded-full pulse-dot" style={{ backgroundColor: 'var(--accent-blue)' }} />
-                  <span>{HARNESS_META[thread.harness].name} is working in {thread.branch}...</span>
-                </div>
-              )}
+              {thread.status === 'RUNNING' && (() => {
+                const last = thread.messages[thread.messages.length - 1];
+                const inlineAlreadyShown = last && last.role === 'assistant' && !last.text.trim();
+                if (inlineAlreadyShown) return null;
+                return (
+                  <LiveThinkingStatus
+                    harness={thread.harness}
+                    effort={thread.effort}
+                    wslDistro={project?.wslDistro}
+                    branch={thread.branch}
+                  />
+                );
+              })()}
             </div>
           </div>
 
@@ -2223,24 +2456,39 @@ export function ChatPane({
                       threadId={secondaryThread.id}
                       harness={secondaryThread.harness}
                       isDiscord={secondaryThread.isDiscord}
+                      isStreaming={
+                        secondaryThread.status === 'RUNNING' &&
+                        idx === secondaryThread.messages.length - 1 &&
+                        m.role === 'assistant'
+                      }
+                      effort={secondaryThread.effort}
+                      wslDistro={project?.wslDistro}
+                      branch={secondaryThread.branch}
                       traceOpen={!!expandedTraces[m.id]}
                       theme={theme}
                       onToggleTrace={toggleTrace}
                       onForkAtMessage={onForkAtMessage}
                       onViewCheckpointDiff={onViewCheckpointDiff}
                       onRevertToCheckpoint={onRevertToCheckpoint}
-                  onRewindCheckpoint={onRewindCheckpoint}
-                  onForkFromCheckpoint={onForkFromCheckpoint}
+                      onRewindCheckpoint={onRewindCheckpoint}
+                      onForkFromCheckpoint={onForkFromCheckpoint}
                       onToast={onToast}
                       onOpenFile={onOpenFile}
                     />
                   ))}
-                  {secondaryThread.status === 'RUNNING' && (
-                    <div className="flex items-center gap-2 text-[12px] font-mono-tech" style={{ color: 'var(--text-muted)' }}>
-                      <span className="w-2 h-2 rounded-full pulse-dot" style={{ backgroundColor: 'var(--accent-blue)' }} />
-                      <span>{HARNESS_META[secondaryThread.harness].name} is working in {secondaryThread.branch}...</span>
-                    </div>
-                  )}
+                  {secondaryThread.status === 'RUNNING' && (() => {
+                    const last = secondaryThread.messages[secondaryThread.messages.length - 1];
+                    const inlineAlreadyShown = last && last.role === 'assistant' && !last.text.trim();
+                    if (inlineAlreadyShown) return null;
+                    return (
+                      <LiveThinkingStatus
+                        harness={secondaryThread.harness}
+                        effort={secondaryThread.effort}
+                        wslDistro={project?.wslDistro}
+                        branch={secondaryThread.branch}
+                      />
+                    );
+                  })()}
                 </div>
                 <form
                   onSubmit={handleSecondarySubmit}
@@ -2572,6 +2820,57 @@ export function ChatPane({
                     </span>
                   );
                 })}
+              </div>
+            )}
+
+            {(isRecording || isTranscribing || isSpeaking) && (
+              <div
+                className="pop-enter px-3.5 py-1.5 border-b flex items-center justify-between gap-2 text-[11px] font-mono-tech"
+                style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  {isRecording && (
+                    <>
+                      <span className="voice-wave shrink-0" aria-hidden="true">
+                        <span /><span /><span /><span />
+                      </span>
+                      <span style={{ color: 'var(--accent-red)' }}>Listening…</span>
+                      {interimTranscript && (
+                        <span className="truncate font-sans" style={{ color: 'var(--text-muted)' }}>
+                          “{interimTranscript}”
+                        </span>
+                      )}
+                    </>
+                  )}
+                  {!isRecording && isTranscribing && (
+                    <>
+                      <CircleNotch size={12} className="animate-spin shrink-0" style={{ color: 'var(--accent-blue)' }} />
+                      <span className="thinking-shimmer" style={{ color: 'var(--text-body)' }}>
+                        Transcribing audio…
+                      </span>
+                    </>
+                  )}
+                  {!isRecording && !isTranscribing && isSpeaking && (
+                    <>
+                      <SpeakerHigh size={12} className="shrink-0" style={{ color: 'var(--accent-blue)' }} />
+                      <span style={{ color: 'var(--text-body)' }}>Speaking reply…</span>
+                    </>
+                  )}
+                </div>
+                {isSpeaking && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                        window.speechSynthesis.cancel();
+                      }
+                      setIsSpeaking(false);
+                    }}
+                    className="btn-ghost px-2 py-0.5 text-[10px] cursor-pointer shrink-0"
+                  >
+                    Stop
+                  </button>
+                )}
               </div>
             )}
 
@@ -3009,15 +3308,22 @@ export function ChatPane({
                   <button
                     type="button"
                     onClick={() => void toggleVoiceRecording()}
-                    className="w-7 h-7 rounded-[7px] flex items-center justify-center hover:bg-[var(--bg-hover)] cursor-pointer"
+                    disabled={isTranscribing}
+                    className={`w-7 h-7 rounded-[7px] flex items-center justify-center hover:bg-[var(--bg-hover)] cursor-pointer transition-colors disabled:opacity-60 ${isRecording ? 'voice-pulse-ring' : ''}`}
                     style={{
-                      color: isRecording ? 'var(--accent-red)' : 'var(--text-muted)',
-                      backgroundColor: isRecording ? 'rgba(239,68,68,0.12)' : 'transparent',
+                      color: isRecording ? 'var(--accent-red)' : isTranscribing ? 'var(--accent-blue)' : 'var(--text-muted)',
+                      backgroundColor: isRecording ? 'rgba(239,68,68,0.14)' : 'transparent',
                     }}
-                    title={isRecording ? 'Stop voice dictation' : 'Voice dictation (STT)'}
+                    title={isTranscribing ? 'Transcribing audio...' : isRecording ? 'Stop voice dictation' : 'Voice dictation (STT)'}
                     aria-label={isRecording ? 'Stop voice dictation' : 'Voice dictation'}
                   >
-                    {isRecording ? <MicrophoneSlash size={14} weight="fill" /> : <Microphone size={14} />}
+                    {isTranscribing ? (
+                      <CircleNotch size={14} className="animate-spin" />
+                    ) : isRecording ? (
+                      <MicrophoneSlash size={14} weight="fill" />
+                    ) : (
+                      <Microphone size={14} />
+                    )}
                   </button>
                   <button
                     type="button"

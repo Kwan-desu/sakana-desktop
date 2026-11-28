@@ -44,10 +44,7 @@ export function TelemetryAnalyticsCard() {
   const maxDayTokens = Math.max(1, ...(summary?.byDay.map((p) => p.totalTokens) ?? [1]));
 
   return (
-    <div
-      className="rounded-[12px] border p-4 space-y-3"
-      style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-surface)' }}
-    >
+    <div className="sakana-card view-enter rounded-[12px] p-4 space-y-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <ChartBar size={15} style={{ color: 'var(--accent-blue)' }} />
@@ -201,10 +198,7 @@ export function FailoverConfigCard({ onToast }: { onToast: (msg: string) => void
   };
 
   return (
-    <div
-      className="rounded-[12px] border p-4 space-y-3"
-      style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-surface)' }}
-    >
+    <div className="sakana-card view-enter rounded-[12px] p-4 space-y-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <ArrowsLeftRight size={15} style={{ color: 'var(--accent-yellow)' }} />
@@ -346,10 +340,7 @@ export function VoiceSettingsCard({ onToast }: { onToast: (msg: string) => void 
   };
 
   return (
-    <div
-      className="rounded-[12px] border p-4 space-y-3"
-      style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-surface)' }}
-    >
+    <div className="sakana-card view-enter rounded-[12px] p-5 space-y-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Microphone size={15} style={{ color: 'var(--accent-blue)' }} />
@@ -361,7 +352,7 @@ export function VoiceSettingsCard({ onToast }: { onToast: (msg: string) => void 
           type="button"
           disabled={saving}
           onClick={() => void handleSave()}
-          className="btn-primary px-3 py-1 text-[11.5px] cursor-pointer disabled:opacity-50"
+          className="btn-solid px-3 py-1.5 text-[11.5px] font-medium cursor-pointer disabled:opacity-50"
         >
           {saving ? 'Saving...' : 'Save Voice Config'}
         </button>
@@ -447,10 +438,7 @@ export function AuditLogCard() {
   }, [source, status]);
 
   return (
-    <div
-      className="rounded-[12px] border p-4 space-y-3"
-      style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-surface)' }}
-    >
+    <div className="sakana-card view-enter rounded-[12px] p-5 space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <ShieldCheck size={15} style={{ color: 'var(--accent-green)' }} />

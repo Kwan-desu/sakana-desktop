@@ -753,7 +753,7 @@ export function RightInspector({
         backgroundColor: 'var(--bg-sidebar)',
         borderColor: 'var(--border-line)',
       }}
-      className="h-full min-w-[360px] shrink-0 border-l flex flex-col overflow-hidden"
+      className="drawer-right-enter h-full min-w-[360px] shrink-0 border-l flex flex-col overflow-hidden"
     >
       {/* Inspector Tab Bar */}
       <div

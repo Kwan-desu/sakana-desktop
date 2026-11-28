@@ -2938,7 +2938,7 @@ export default function App() {
       {/* Toast */}
       {toast && (
         <div
-          className="sakana-popover pop-enter fixed bottom-5 right-5 z-[80] max-w-[520px] break-words px-3.5 py-2 rounded-[10px] text-[12px] font-medium"
+          className="sakana-popover toast-enter fixed bottom-5 right-5 z-[80] max-w-[520px] break-words px-3.5 py-2 rounded-[10px] text-[12px] font-medium"
           style={{ color: 'var(--text-main)' }}
         >
           {toast}

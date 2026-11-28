@@ -782,7 +782,7 @@ export function OfficeChatPanel({
                       className="msg-enter rounded-[10px] p-3 border"
                       style={{
                         backgroundColor:
-                          msg.role === 'user' ? 'var(--bg-app)' : 'var(--bg-surface)',
+                          msg.role === 'user' ? 'var(--bg-app)' : 'var(--bg-elevated)',
                         borderColor: 'var(--border-line)',
                       }}
                     >
@@ -861,6 +861,19 @@ export function OfficeChatPanel({
                     </div>
                   ))
                 )}
+                {selectedStaff.status === 'WORKING' && (
+                  <div
+                    className="msg-enter rounded-[10px] px-3 py-2 border flex items-center gap-2 text-[11.5px] font-mono-tech"
+                    style={{ backgroundColor: 'var(--bg-elevated)', borderColor: 'var(--border-line)', color: 'var(--text-muted)' }}
+                  >
+                    <span className="thinking-dots" aria-hidden="true">
+                      <span /><span /><span />
+                    </span>
+                    <span className="thinking-shimmer" style={{ color: 'var(--text-body)' }}>
+                      {selectedStaff.name} is thinking…
+                    </span>
+                  </div>
+                )}
               </div>
 
               {showJumpBottom && (
@@ -872,7 +885,7 @@ export function OfficeChatPanel({
                     }
                   }}
                   aria-label="Jump to bottom"
-                  className="sakana-popover absolute bottom-3 right-3 w-7 h-7 rounded-full flex items-center justify-center cursor-pointer"
+                  className="sakana-popover pop-enter absolute bottom-3 right-3 w-7 h-7 rounded-full flex items-center justify-center cursor-pointer"
                   style={{ color: 'var(--text-main)' }}
                 >
                   <ArrowDown size={13} />

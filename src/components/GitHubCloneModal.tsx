@@ -176,14 +176,14 @@ export function GitHubCloneModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center p-4"
       style={{ backgroundColor: 'rgba(0, 0, 0, 0.45)', backdropFilter: 'blur(3px)' }}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
-        className="sakana-popover pop-enter w-full max-w-[600px] max-h-[82vh] rounded-[14px] border flex flex-col overflow-hidden"
+        className="sakana-popover modal-panel-enter w-full max-w-[600px] max-h-[82vh] rounded-[14px] border flex flex-col overflow-hidden"
         style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border-strong)' }}
       >
         {/* Header */}

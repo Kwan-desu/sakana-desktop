@@ -1741,6 +1741,20 @@ export function ChatPane({
     }
   }, [applyFinalTranscript, isRecording, onToast, voiceEngine, voiceLang]);
 
+  const [timelineOpen, setTimelineOpen] = useState(false);
+  const [hoveredTurnId, setHoveredTurnId] = useState<string | null>(null);
+  const [hoveredTurnIdx, setHoveredTurnIdx] = useState<number | null>(null);
+  const [timelineHoverOffsetY, setTimelineHoverOffsetY] = useState<number>(0);
+  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [scrollProgress, setScrollProgress] = useState<number>(1);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const feedRef = useRef<HTMLDivElement>(null);
+  const timelineTrackRef = useRef<HTMLDivElement>(null);
+  const timelinePopoverListRef = useRef<HTMLDivElement>(null);
+  const timelineScrollRafRef = useRef<number | null>(null);
+  const feedScrollAnimRafRef = useRef<number | null>(null);
+  const timelineScrubbingRef = useRef(false);
+
   const openTimeline = () => {
     if (timelineCloseTimerRef.current !== null) {
       window.clearTimeout(timelineCloseTimerRef.current);
@@ -1750,20 +1764,137 @@ export function ChatPane({
   };
 
   const scheduleCloseTimeline = () => {
+    if (timelineScrubbingRef.current) return;
     if (timelineCloseTimerRef.current !== null) {
       window.clearTimeout(timelineCloseTimerRef.current);
     }
     timelineCloseTimerRef.current = window.setTimeout(() => {
       setTimelineOpen(false);
       setHoveredTurnId(null);
+      setHoveredTurnIdx(null);
+      setTimelineHoverOffsetY(0);
       timelineCloseTimerRef.current = null;
     }, 180);
   };
-  const [timelineOpen, setTimelineOpen] = useState(false);
-  const [hoveredTurnId, setHoveredTurnId] = useState<string | null>(null);
-  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
-  const [isDraggingFile, setIsDraggingFile] = useState(false);
-  const feedRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onWindowMouseUp = () => {
+      timelineScrubbingRef.current = false;
+    };
+    window.addEventListener('mouseup', onWindowMouseUp);
+    return () => {
+      window.removeEventListener('mouseup', onWindowMouseUp);
+      if (timelineCloseTimerRef.current !== null) {
+        window.clearTimeout(timelineCloseTimerRef.current);
+      }
+      if (timelineScrollRafRef.current !== null) {
+        window.cancelAnimationFrame(timelineScrollRafRef.current);
+      }
+      if (feedScrollAnimRafRef.current !== null) {
+        window.cancelAnimationFrame(feedScrollAnimRafRef.current);
+      }
+    };
+  }, []);
+
+  const scrollToTurn = useCallback((turnId: string, instant = false) => {
+    const container = feedRef.current;
+    if (!container) return;
+    const target = container.querySelector(`[data-turn-id="${turnId}"]`) as HTMLElement | null;
+    if (!target) return;
+
+    setActiveTurnId(turnId);
+    if (feedScrollAnimRafRef.current !== null) {
+      window.cancelAnimationFrame(feedScrollAnimRafRef.current);
+      feedScrollAnimRafRef.current = null;
+    }
+
+    const containerRect = container.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const relativeTop = targetRect.top - containerRect.top + container.scrollTop;
+    const desiredTop = relativeTop - Math.max(24, (container.clientHeight - targetRect.height) * 0.35);
+    const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+    const clampedTop = Math.max(0, Math.min(maxScroll, desiredTop));
+
+    const flashTarget = () => {
+      target.classList.remove('turn-jump-highlight');
+      void target.offsetWidth;
+      target.classList.add('turn-jump-highlight');
+      window.setTimeout(() => {
+        target.classList.remove('turn-jump-highlight');
+      }, 980);
+    };
+
+    if (instant || Math.abs(container.scrollTop - clampedTop) < 4) {
+      container.scrollTop = clampedTop;
+      if (!instant) flashTarget();
+      return;
+    }
+
+    const startTop = container.scrollTop;
+    const delta = clampedTop - startTop;
+    const duration = Math.min(440, Math.max(220, Math.abs(delta) * 0.25));
+    const startTime = performance.now();
+
+    const step = (now: number) => {
+      const elapsed = now - startTime;
+      const t = Math.min(1, elapsed / duration);
+      // easeOutCubic
+      const eased = 1 - Math.pow(1 - t, 3);
+      container.scrollTop = startTop + delta * eased;
+      if (t < 1) {
+        feedScrollAnimRafRef.current = window.requestAnimationFrame(step);
+      } else {
+        feedScrollAnimRafRef.current = null;
+        flashTarget();
+      }
+    };
+    feedScrollAnimRafRef.current = window.requestAnimationFrame(step);
+  }, []);
+
+  const syncActiveTurnFromScroll = useCallback(() => {
+    const el = feedRef.current;
+    if (!el) return;
+    const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+    const progress = maxScroll > 0 ? Math.max(0, Math.min(1, el.scrollTop / maxScroll)) : 1;
+    setScrollProgress(progress);
+
+    const nodes = Array.from(el.querySelectorAll<HTMLElement>('[data-turn-id]'));
+    if (nodes.length === 0) return;
+
+    if (el.scrollTop <= 16) {
+      const firstId = nodes[0].getAttribute('data-turn-id');
+      if (firstId) setActiveTurnId(firstId);
+      return;
+    }
+    if (maxScroll - el.scrollTop < 36) {
+      const lastId = nodes[nodes.length - 1].getAttribute('data-turn-id');
+      if (lastId) setActiveTurnId(lastId);
+      return;
+    }
+
+    const rect = el.getBoundingClientRect();
+    const focalY = rect.top + rect.height * 0.35;
+    let bestId: string | null = null;
+    let bestDist = Infinity;
+    for (const node of nodes) {
+      const r = node.getBoundingClientRect();
+      const center = r.top + Math.min(r.height, 140) * 0.5;
+      const dist = Math.abs(center - focalY);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestId = node.getAttribute('data-turn-id');
+      }
+    }
+    if (bestId) setActiveTurnId(bestId);
+  }, []);
+
+  useEffect(() => {
+    if (!timelineOpen || !hoveredTurnId) return;
+    const list = timelinePopoverListRef.current;
+    if (!list) return;
+    const item = list.querySelector(`[data-timeline-item="${hoveredTurnId}"]`) as HTMLElement | null;
+    item?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [hoveredTurnId, timelineOpen]);
   const isNearBottomRef = useRef(true);
   const prevThreadIdRef = useRef<string | undefined>(thread?.id);
   const secondaryFeedRef = useRef<HTMLDivElement>(null);
@@ -1849,22 +1980,35 @@ export function ChatPane({
     const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     isNearBottomRef.current = near;
     setShowScrollBottom(!near);
+    if (timelineScrollRafRef.current === null) {
+      timelineScrollRafRef.current = window.requestAnimationFrame(() => {
+        timelineScrollRafRef.current = null;
+        syncActiveTurnFromScroll();
+      });
+    }
   };
 
   useEffect(() => {
     const el = feedRef.current;
     if (!el || !thread?.id) return;
+    const lastMsgId = thread.messages[thread.messages.length - 1]?.id ?? null;
     if (prevThreadIdRef.current !== thread.id) {
       prevThreadIdRef.current = thread.id;
       isNearBottomRef.current = true;
       setShowScrollBottom(false);
+      setActiveTurnId(lastMsgId);
+      setScrollProgress(1);
       el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
       return;
     }
     if (isNearBottomRef.current) {
+      if (lastMsgId) setActiveTurnId(lastMsgId);
+      setScrollProgress(1);
       el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    } else {
+      syncActiveTurnFromScroll();
     }
-  }, [thread?.id, thread?.messages, thread?.status]);
+  }, [thread?.id, thread?.messages, thread?.status, syncActiveTurnFromScroll]);
 
   const handleSecondaryFeedScroll = () => {
     const el = secondaryFeedRef.current;
@@ -2101,7 +2245,7 @@ export function ChatPane({
               <button
                 type="button"
                 onClick={() => onSleepSession?.(thread.id)}
-                className="px-2 py-1 rounded-[6px] border text-[11px] font-medium inline-flex items-center gap-1.5 cursor-pointer transition-colors hover:opacity-85"
+                className="px-2 py-1 rounded-[6px] border text-[11px] font-medium inline-flex items-center gap-1.5 cursor-pointer transition-opacity hover:opacity-80"
                 style={{
                   backgroundColor: 'var(--accent-green-bg)',
                   borderColor: 'var(--accent-green)',
@@ -2257,106 +2401,227 @@ export function ChatPane({
             </div>
           </div>
 
-          {/* Floating Turn Minimap Scrubber + Timeline Viewer Popover */}
-          {thread.messages.length > 0 && (
-            <div
-              className="hidden lg:flex flex-col items-end gap-1.5 absolute right-3 top-1/2 -translate-y-1/2 z-20 py-2 pl-3"
-              onMouseEnter={openTimeline}
-              onMouseLeave={scheduleCloseTimeline}
-            >
-              {timelineOpen && (
-                <div
-                  className="absolute right-full top-1/2 -translate-y-1/2 pr-3 z-30"
-                  onMouseEnter={openTimeline}
-                  onMouseLeave={scheduleCloseTimeline}
-                >
-                  <div className="w-72 max-h-80 overflow-y-auto rounded-[10px] p-1.5 space-y-0.5 sakana-popover pop-enter">
+          {/* Floating Turn Minimap Scrubber + Mouse-Following Timeline Popover */}
+          {thread.messages.length > 0 && (() => {
+            const totalTurns = thread.messages.length;
+            const activeIdx = Math.max(
+              0,
+              thread.messages.findIndex((m) => m.id === activeTurnId),
+            );
+            const focusedIdx = hoveredTurnIdx !== null ? hoveredTurnIdx : activeIdx;
+            const focusedRatio =
+              totalTurns > 1
+                ? hoveredTurnIdx !== null
+                  ? hoveredTurnIdx / (totalTurns - 1)
+                  : scrollProgress
+                : 0;
+            const compactGap = totalTurns > 60 ? 1 : totalTurns > 32 ? 2 : totalTurns > 16 ? 4 : 6;
+            const tickHeight = totalTurns > 60 ? 2 : 2.5;
+            const tickSlotHeight = tickHeight + compactGap;
+            const trackHeight = Math.min(380, Math.max(24, totalTurns * tickSlotHeight - compactGap));
+            const thumbHeight = Math.max(14, Math.min(28, trackHeight / Math.max(totalTurns, 1) + 10));
+            const thumbTravel = Math.max(0, trackHeight - thumbHeight);
+            const thumbTranslateY = focusedRatio * thumbTravel;
+
+            const updateHoverFromClientY = (clientY: number, scrubNow = false) => {
+              const trackEl = timelineTrackRef.current;
+              if (!trackEl || totalTurns === 0) return;
+              const rect = trackEl.getBoundingClientRect();
+              const relY = Math.max(0, Math.min(rect.height, clientY - rect.top));
+              const ratio = rect.height > 0 ? relY / rect.height : 0;
+              const idx = Math.max(0, Math.min(totalTurns - 1, Math.round(ratio * (totalTurns - 1))));
+              const targetMsg = thread.messages[idx];
+              if (!targetMsg) return;
+              setHoveredTurnIdx(idx);
+              setHoveredTurnId(targetMsg.id);
+              const feedHeight = feedRef.current?.clientHeight ?? 520;
+              const maxOffset = Math.max(0, feedHeight * 0.5 - 175);
+              const rawOffset = relY - rect.height * 0.5;
+              setTimelineHoverOffsetY(Math.max(-maxOffset, Math.min(maxOffset, rawOffset)));
+              if (scrubNow) {
+                scrollToTurn(targetMsg.id, true);
+              }
+            };
+
+            return (
+              <div
+                className="hidden lg:flex items-center absolute right-2.5 top-1/2 -translate-y-1/2 z-20 py-2 pl-4 pr-1 select-none"
+                onMouseEnter={openTimeline}
+                onMouseLeave={scheduleCloseTimeline}
+              >
+                {timelineOpen && (
                   <div
-                    className="px-2 py-1 text-[10px] font-mono-tech uppercase flex items-center justify-between"
-                    style={{ color: 'var(--text-muted)' }}
+                    className="timeline-popover-anchor absolute right-full top-1/2 pr-3 z-30"
+                    style={{
+                      transform: `translateY(calc(-50% + ${timelineHoverOffsetY}px))`,
+                    }}
+                    onMouseEnter={openTimeline}
+                    onMouseLeave={scheduleCloseTimeline}
                   >
-                    <span>Timeline</span>
-                    <span>{thread.messages.length} turns</span>
-                  </div>
-                  {thread.messages.map((m) => {
-                    const isUser = m.role === 'user';
-                    const isHighlighted = hoveredTurnId === m.id || activeTurnId === m.id;
-                    const snippet =
-                      m.text.trim().replace(/\s+/g, ' ') ||
-                      (m.tools?.length ? `${m.tools.length} tool call(s)` : '(empty)');
-                    return (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onMouseEnter={() => setHoveredTurnId(m.id)}
-                        onClick={() => {
-                          setActiveTurnId(m.id);
-                          const el = feedRef.current?.querySelector(`[data-turn-id="${m.id}"]`);
-                          el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        }}
-                        className="w-full px-2 py-1.5 rounded-[7px] text-left flex items-start gap-2 cursor-pointer transition-colors"
-                        style={{
-                          backgroundColor: isHighlighted ? 'var(--bg-hover)' : 'transparent',
-                          color: 'var(--text-main)',
-                        }}
+                    <div
+                      ref={timelinePopoverListRef}
+                      className="w-72 max-h-80 overflow-y-auto rounded-[10px] p-1.5 space-y-0.5 sakana-popover pop-enter"
+                    >
+                      <div
+                        className="px-2 py-1 text-[10px] font-mono-tech uppercase flex items-center justify-between sticky top-0 z-10 rounded-[6px]"
+                        style={{ color: 'var(--text-muted)', backgroundColor: 'var(--bg-card)' }}
                       >
-                        <span
-                          className="mt-0.5 w-4 h-4 rounded-[4px] flex items-center justify-center shrink-0"
-                          style={{
-                            backgroundColor: isUser ? 'var(--accent-blue-bg)' : 'var(--bg-elevated)',
-                            color: isUser ? 'var(--accent-blue)' : 'var(--text-muted)',
-                          }}
-                        >
-                          {isUser ? <User size={10} weight="bold" /> : <Robot size={10} weight="bold" />}
+                        <span>Timeline</span>
+                        <span>
+                          {focusedIdx + 1} / {totalTurns}
                         </span>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center justify-between gap-2 text-[10px] font-mono-tech">
-                            <span className="font-medium truncate" style={{ color: isUser ? 'var(--accent-blue)' : 'var(--text-main)' }}>
-                              {isUser ? 'You' : m.author || HARNESS_META[thread.harness].name}
+                      </div>
+                      {thread.messages.map((m, idx) => {
+                        const isUser = m.role === 'user';
+                        const isHovered = hoveredTurnId === m.id;
+                        const isActive = activeTurnId === m.id;
+                        const snippet =
+                          m.text.trim().replace(/\s+/g, ' ') ||
+                          (m.tools?.length ? `${m.tools.length} tool call(s)` : '(empty)');
+                        return (
+                          <button
+                            key={m.id}
+                            type="button"
+                            data-timeline-item={m.id}
+                            onMouseEnter={() => {
+                              setHoveredTurnId(m.id);
+                              setHoveredTurnIdx(idx);
+                            }}
+                            onClick={() => scrollToTurn(m.id)}
+                            className="w-full px-2 py-1.5 rounded-[7px] text-left flex items-start gap-2 cursor-pointer transition-colors"
+                            style={{
+                              backgroundColor: isHovered
+                                ? 'var(--bg-hover)'
+                                : isActive
+                                  ? 'var(--bg-elevated)'
+                                  : 'transparent',
+                              color: 'var(--text-main)',
+                              boxShadow: isActive ? 'inset 2px 0 0 var(--accent-blue)' : 'none',
+                            }}
+                          >
+                            <span
+                              className="mt-0.5 w-4 h-4 rounded-[4px] flex items-center justify-center shrink-0"
+                              style={{
+                                backgroundColor: isUser ? 'var(--accent-blue-bg)' : 'var(--bg-elevated)',
+                                color: isUser ? 'var(--accent-blue)' : 'var(--text-muted)',
+                              }}
+                            >
+                              {isUser ? <User size={10} weight="bold" /> : <Robot size={10} weight="bold" />}
                             </span>
-                            <span className="shrink-0" style={{ color: 'var(--text-muted)' }}>
-                              {m.timestamp}
-                            </span>
-                          </div>
-                          <div className="text-[11px] truncate" style={{ color: 'var(--text-muted)' }}>
-                            {snippet}
-                          </div>
-                        </div>
-                      </button>
-                    );
-                  })}
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center justify-between gap-2 text-[10px] font-mono-tech">
+                                <span className="font-medium truncate" style={{ color: isUser ? 'var(--accent-blue)' : 'var(--text-main)' }}>
+                                  {isUser ? 'You' : m.author || HARNESS_META[thread.harness].name}
+                                </span>
+                                <span className="shrink-0" style={{ color: 'var(--text-muted)' }}>
+                                  {m.timestamp}
+                                </span>
+                              </div>
+                              <div className="text-[11px] truncate" style={{ color: 'var(--text-muted)' }}>
+                                {snippet}
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div
+                  ref={timelineTrackRef}
+                  className="relative flex items-center gap-1.5 max-h-[68vh] py-1 cursor-pointer"
+                  onMouseMove={(e) => updateHoverFromClientY(e.clientY, timelineScrubbingRef.current)}
+                  onMouseDown={(e) => {
+                    if (e.button !== 0) return;
+                    timelineScrubbingRef.current = true;
+                    updateHoverFromClientY(e.clientY, false);
+                  }}
+                  onMouseUp={() => {
+                    timelineScrubbingRef.current = false;
+                  }}
+                  onClick={(e) => {
+                    const trackEl = timelineTrackRef.current;
+                    if (!trackEl || totalTurns === 0) return;
+                    const rect = trackEl.getBoundingClientRect();
+                    const relY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+                    const ratio = rect.height > 0 ? relY / rect.height : 0;
+                    const idx = Math.max(0, Math.min(totalTurns - 1, Math.round(ratio * (totalTurns - 1))));
+                    const targetMsg = thread.messages[idx];
+                    if (targetMsg) scrollToTurn(targetMsg.id, false);
+                  }}
+                >
+                  <div
+                    className="flex flex-col items-end overflow-hidden"
+                    style={{ gap: `${compactGap}px` }}
+                  >
+                    {thread.messages.map((m, idx) => {
+                      const isFocused = idx === focusedIdx;
+                      const isActive = m.id === activeTurnId;
+                      const dist = Math.abs(idx - focusedIdx);
+                      const baseWidth = m.role === 'user' ? 12 : 8;
+                      const tickWidth =
+                        timelineOpen || hoveredTurnIdx !== null
+                          ? dist === 0
+                            ? 22
+                            : dist === 1
+                              ? 16
+                              : dist === 2
+                                ? 13
+                                : baseWidth
+                          : isActive
+                            ? 18
+                            : baseWidth;
+                      return (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            scrollToTurn(m.id);
+                          }}
+                          title={`${m.role === 'user' ? 'You' : 'Agent'} · ${m.timestamp}`}
+                          aria-label={`Jump to ${m.role === 'user' ? 'user' : 'agent'} message at ${m.timestamp}`}
+                          className="timeline-tick rounded-full cursor-pointer"
+                          style={{
+                            height: isFocused ? `${tickHeight + 0.5}px` : `${tickHeight}px`,
+                            width: `${tickWidth}px`,
+                            opacity: isFocused || isActive ? 1 : dist <= 2 && timelineOpen ? 0.85 : 0.65,
+                            backgroundColor:
+                              isFocused || isActive
+                                ? 'var(--accent-blue)'
+                                : m.role === 'user'
+                                  ? 'var(--text-main)'
+                                  : 'var(--border-strong)',
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+
+                  {/* Animated sliding scroll/hover rail thumb */}
+                  <div
+                    className="relative w-[3px] rounded-full overflow-hidden shrink-0"
+                    style={{
+                      height: `${trackHeight}px`,
+                      backgroundColor: 'var(--border-line)',
+                    }}
+                    aria-hidden="true"
+                  >
+                    <div
+                      className="timeline-thumb absolute left-0 right-0 rounded-full"
+                      style={{
+                        height: `${thumbHeight}px`,
+                        transform: `translateY(${thumbTranslateY}px)`,
+                        backgroundColor: 'var(--accent-blue)',
+                        opacity: timelineOpen ? 1 : 0.75,
+                      }}
+                    />
                   </div>
                 </div>
-              )}
-
-              {thread.messages.map((m) => {
-                const isHighlighted = hoveredTurnId === m.id || activeTurnId === m.id;
-                return (
-                  <button
-                    key={m.id}
-                    type="button"
-                    onMouseEnter={() => setHoveredTurnId(m.id)}
-                    onClick={() => {
-                      setActiveTurnId(m.id);
-                      const el = feedRef.current?.querySelector(`[data-turn-id="${m.id}"]`);
-                      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    }}
-                    title={`${m.role === 'user' ? 'You' : 'Agent'} · ${m.timestamp}`}
-                    aria-label={`Jump to ${m.role === 'user' ? 'user' : 'agent'} message at ${m.timestamp}`}
-                    className="h-[2.5px] rounded-full transition-all cursor-pointer hover:w-5"
-                    style={{
-                      width: isHighlighted ? '20px' : m.role === 'user' ? '14px' : '9px',
-                      backgroundColor: isHighlighted
-                        ? 'var(--accent-blue)'
-                        : m.role === 'user'
-                          ? 'var(--text-main)'
-                          : 'var(--border-strong)',
-                    }}
-                  />
-                );
-              })}
-            </div>
-          )}
+              </div>
+            );
+          })()}
 
           {/* Floating Jump-to-Bottom Button */}
           {showScrollBottom && (

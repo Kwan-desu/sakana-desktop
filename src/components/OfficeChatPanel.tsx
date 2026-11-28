@@ -596,7 +596,7 @@ export function OfficeChatPanel({
               <span>Activity Feed</span>
               {office.events.length > 0 && (
                 <span
-                  className="px-1.5 py-0.2 rounded-full font-mono-tech text-[10px]"
+                  className="px-1.5 py-[1px] rounded-full font-mono-tech text-[10px]"
                   style={{
                     backgroundColor: 'var(--bg-elevated)',
                     color: 'var(--text-muted)',

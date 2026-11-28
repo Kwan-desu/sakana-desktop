@@ -432,6 +432,41 @@ select:focus:not(:focus-visible) {
   filter: brightness(1.06);
 }
 
+/* Chat Timeline Scrubber & Jump-to-Turn Animations */
+.timeline-thumb {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), height 180ms ease, opacity 160ms ease;
+  will-change: transform;
+}
+
+.timeline-popover-anchor {
+  transition: transform 170ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+.timeline-tick {
+  transition: width 160ms cubic-bezier(0.22, 1, 0.36, 1), height 160ms cubic-bezier(0.22, 1, 0.36, 1), background-color 140ms ease, opacity 140ms ease;
+}
+
+@keyframes turnJumpPulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--accent-blue-bg);
+    background-color: var(--accent-blue-bg);
+  }
+  35% {
+    box-shadow: 0 0 0 6px var(--accent-blue-bg);
+    background-color: var(--accent-blue-bg);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    background-color: transparent;
+  }
+}
+
+.turn-jump-highlight {
+  border-radius: 12px;
+  animation: turnJumpPulse 950ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pulse-dot,
   .thinking-shimmer,
@@ -439,8 +474,15 @@ select:focus:not(:focus-visible) {
   .voice-wave span,
   .voice-pulse-ring,
   .effort-high-text,
-  .effort-xhigh-text {
+  .effort-xhigh-text,
+  .turn-jump-highlight {
     animation: none !important;
+  }
+
+  .timeline-thumb,
+  .timeline-popover-anchor,
+  .timeline-tick {
+    transition: none !important;
   }
 
   .msg-enter,

@@ -2848,7 +2848,7 @@ export default function App() {
           className="sakana-popover pop-enter fixed bottom-5 left-5 z-[80] w-[360px] rounded-[12px] p-3.5 border"
           style={{
             background: 'var(--bg-elevated)',
-            borderColor: 'var(--border-subtle)',
+            borderColor: 'var(--border-strong)',
             color: 'var(--text-main)',
           }}
         >
@@ -2857,7 +2857,7 @@ export default function App() {
               <div className="text-[12.5px] font-semibold">
                 Update Available · v{availableUpdate.latestVersion}
               </div>
-              <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-dim)' }}>
+              <div className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
                 Current v{availableUpdate.currentVersion} → v{availableUpdate.latestVersion}
               </div>
             </div>
@@ -2877,7 +2877,7 @@ export default function App() {
                 showToast(`Skipped v${availableUpdate.latestVersion}`);
               }}
               className="text-[11px] px-1.5 py-0.5 rounded hover:opacity-80 cursor-pointer"
-              style={{ color: 'var(--text-dim)' }}
+              style={{ color: 'var(--text-muted)' }}
               disabled={installingUpdate}
               title="Skip this version"
             >
@@ -2894,11 +2894,11 @@ export default function App() {
                   className="h-full transition-all duration-150"
                   style={{
                     width: `${updateProgress ?? 15}%`,
-                    background: 'var(--accent)',
+                    background: 'var(--accent-blue)',
                   }}
                 />
               </div>
-              <div className="text-[10.5px] mt-1" style={{ color: 'var(--text-dim)' }}>
+              <div className="text-[10.5px] mt-1" style={{ color: 'var(--text-muted)' }}>
                 {updateProgress !== null
                   ? `Downloading update (${updateProgress}%)...`
                   : 'Downloading and verifying signature...'}
@@ -2975,8 +2975,8 @@ export default function App() {
                   showToast(`Update failed: ${String(err)}`);
                 }
               }}
-              className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-medium text-white disabled:opacity-60 cursor-pointer"
-              style={{ background: 'var(--accent)' }}
+              className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-medium text-white disabled:opacity-60 cursor-pointer hover:opacity-90 transition-opacity"
+              style={{ background: 'var(--accent-blue)' }}
             >
               {installingUpdate
                 ? updateProgress !== null

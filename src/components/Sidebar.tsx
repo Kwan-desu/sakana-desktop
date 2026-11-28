@@ -1346,7 +1346,7 @@ export function Sidebar({
                                       <HarnessIcon harness={t.harness} size={11} />
                                       {awakeSessionIds.includes(t.id) && (
                                         <span
-                                          className="inline-flex items-center gap-0.5 px-1 py-0.2 rounded-[4px] text-[9px] font-medium shrink-0"
+                                          className="inline-flex items-center gap-0.5 px-1 py-[1px] rounded-[4px] text-[9px] font-medium shrink-0"
                                           style={{
                                             backgroundColor: 'var(--accent-green-bg)',
                                             color: 'var(--accent-green)',

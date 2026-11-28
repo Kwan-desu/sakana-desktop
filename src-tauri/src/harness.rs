@@ -2119,6 +2119,7 @@ pub async fn send_turn_with_options(
         }
 
         let mut cancel_rx_opt = Some(cancel_rx);
+        let mut skip_acp = false;
         let run_result = loop {
             let (resolved_model, resolved_effort) = if cur_harness == "agy-cli" {
                 let (m, e) =
@@ -2154,7 +2155,7 @@ pub async fn send_turn_with_options(
                         attempt_cancel_rx,
                     )
                     .await
-                } else if cur_harness == "agy-cli" && cross_cmd.is_none() {
+                } else if cur_harness == "agy-cli" && cross_cmd.is_none() && !skip_acp {
                     crate::acp_pool::run_persistent_agy_turn(
                         None,
                         Some(distro.as_str()),
@@ -2195,7 +2196,7 @@ pub async fn send_turn_with_options(
                     .await
                 }
             } else if let Some(bin) = resolve_harness_binary(&cur_harness) {
-                if cur_harness == "agy-cli" && cross_cmd.is_none() {
+                if cur_harness == "agy-cli" && cross_cmd.is_none() && !skip_acp {
                     crate::acp_pool::run_persistent_agy_turn(
                         Some(&bin),
                         None,
@@ -2276,6 +2277,17 @@ pub async fn send_turn_with_options(
 
             match attempt_res {
                 Ok(()) => break Ok(()),
+                Err(err_msg)
+                    if cur_harness == "agy-cli"
+                        && cross_cmd.is_none()
+                        && !skip_acp
+                        && acc.text.is_empty()
+                        && !err_msg.to_lowercase().contains("cancelled") =>
+                {
+                    let _ = crate::acp_pool::sleep_session_inner(app_handle.as_ref(), &sid).await;
+                    skip_acp = true;
+                    continue;
+                }
                 Err(err_msg) if failover_cfg.enabled && failover_hops < 3 && is_rate_limit_or_quota_error(&err_msg) => {
                     let from_h = cur_harness.clone();
                     let from_acc_label = cur_account

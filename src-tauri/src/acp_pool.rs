@@ -9,7 +9,7 @@ use serde_json::Value;
 use tauri::{AppHandle, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Semaphore};
 
 use crate::harness::{emit_thinking, emit_token, emit_tool, TurnAccumulator};
 use crate::models::{HarnessAccountRow, McpServer, ToolCall};
@@ -35,13 +35,19 @@ struct AcpWorker {
     mode: String,
     next_rpc_id: u64,
     turns_completed: u64,
+    supports_effort: bool,
     dead: bool,
 }
 
 static ACP_POOL: OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<AcpWorker>>>>>> = OnceLock::new();
+static ACP_SPAWN_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn pool() -> &'static Arc<Mutex<HashMap<String, Arc<Mutex<AcpWorker>>>>> {
     ACP_POOL.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+fn spawn_semaphore() -> &'static Arc<Semaphore> {
+    ACP_SPAWN_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1)))
 }
 
 fn emit_awake(app: Option<&AppHandle>, session_id: &str, awake: bool) {
@@ -158,6 +164,11 @@ impl AcpWorker {
         effort: &str,
         permission_mode: &str,
     ) -> Result<Self, String> {
+        let _spawn_permit = spawn_semaphore()
+            .acquire()
+            .await
+            .map_err(|e| format!("ACP spawn gate closed: {e}"))?;
+
         let auth_method = account
             .map(|a| a.auth_type.trim())
             .filter(|s| !s.is_empty())
@@ -233,6 +244,7 @@ impl AcpWorker {
             mode: String::new(),
             next_rpc_id: 1,
             turns_completed: 0,
+            supports_effort: false,
             dead: false,
         };
 
@@ -244,7 +256,7 @@ impl AcpWorker {
                     "clientCapabilities": {},
                     "clientInfo": { "name": "sakana", "version": env!("CARGO_PKG_VERSION") }
                 }),
-                15,
+                45,
             )
             .await?;
 
@@ -252,7 +264,7 @@ impl AcpWorker {
             .rpc_call(
                 "authenticate",
                 serde_json::json!({ "methodId": auth_method }),
-                15,
+                45,
             )
             .await?;
 
@@ -263,7 +275,7 @@ impl AcpWorker {
                     "cwd": session_cwd,
                     "mcpServers": [],
                 }),
-                25,
+                60,
             )
             .await?;
 
@@ -281,21 +293,29 @@ impl AcpWorker {
                 let cur = opt.get("currentValue").and_then(Value::as_str).unwrap_or("");
                 match id {
                     "model" => worker.model = cur.to_string(),
-                    "thought_level" => worker.effort = cur.to_string(),
+                    "thought_level" => {
+                        worker.supports_effort = true;
+                        worker.effort = cur.to_string();
+                    }
                     "mode" => worker.mode = cur.to_string(),
                     _ => {}
                 }
             }
         }
 
-        worker.sync_config(model, effort, permission_mode).await;
+        worker.sync_config(model, effort, permission_mode).await?;
         Ok(worker)
     }
 
-    async fn sync_config(&mut self, model: &str, effort: &str, permission_mode: &str) {
+    async fn sync_config(
+        &mut self,
+        model: &str,
+        effort: &str,
+        permission_mode: &str,
+    ) -> Result<(), String> {
         let trimmed_model = model.trim();
         if !trimmed_model.is_empty() && self.model != trimmed_model {
-            if self
+            match self
                 .rpc_call(
                     "session/set_config_option",
                     serde_json::json!({
@@ -303,20 +323,22 @@ impl AcpWorker {
                         "configId": "model",
                         "value": trimmed_model,
                     }),
-                    10,
+                    20,
                 )
                 .await
-                .is_ok()
             {
-                self.model = trimmed_model.to_string();
+                Ok(_) => self.model = trimmed_model.to_string(),
+                Err(e) if self.dead => return Err(e),
+                Err(_) => {}
             }
         }
 
         let trimmed_effort = effort.trim();
-        if matches!(trimmed_effort, "low" | "medium" | "high" | "xhigh")
+        if self.supports_effort
+            && matches!(trimmed_effort, "low" | "medium" | "high" | "xhigh")
             && self.effort != trimmed_effort
         {
-            if self
+            match self
                 .rpc_call(
                     "session/set_config_option",
                     serde_json::json!({
@@ -324,18 +346,19 @@ impl AcpWorker {
                         "configId": "thought_level",
                         "value": trimmed_effort,
                     }),
-                    10,
+                    20,
                 )
                 .await
-                .is_ok()
             {
-                self.effort = trimmed_effort.to_string();
+                Ok(_) => self.effort = trimmed_effort.to_string(),
+                Err(e) if self.dead => return Err(e),
+                Err(_) => {}
             }
         }
 
         let target_mode = map_permission_mode(permission_mode);
         if self.mode != target_mode {
-            if self
+            match self
                 .rpc_call(
                     "session/set_config_option",
                     serde_json::json!({
@@ -343,14 +366,17 @@ impl AcpWorker {
                         "configId": "mode",
                         "value": target_mode,
                     }),
-                    10,
+                    20,
                 )
                 .await
-                .is_ok()
             {
-                self.mode = target_mode.to_string();
+                Ok(_) => self.mode = target_mode.to_string(),
+                Err(e) if self.dead => return Err(e),
+                Err(_) => {}
             }
         }
+
+        Ok(())
     }
 
     async fn handle_server_request(&mut self, msg: &Value) {
@@ -617,7 +643,7 @@ pub(crate) async fn run_persistent_agy_turn(
     message_id: &str,
     started: Instant,
     acc: &mut TurnAccumulator,
-    cancel_rx: oneshot::Receiver<()>,
+    mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let account_id = account
         .map(|a| a.id.trim().to_string())
@@ -643,17 +669,19 @@ pub(crate) async fn run_persistent_agy_turn(
         } else {
             // Stale or dead worker — evict and respawn cleanly
             sleep_session_inner(app, session_id).await;
-            let fresh = AcpWorker::spawn_and_init(
-                bin,
-                wsl_distro,
-                account,
-                enabled_mcp_servers,
-                cwd,
-                model,
-                effort,
-                permission_mode,
-            )
-            .await?;
+            let fresh = tokio::select! {
+                _ = &mut cancel_rx => return Err("Turn cancelled by user".to_string()),
+                res = AcpWorker::spawn_and_init(
+                    bin,
+                    wsl_distro,
+                    account,
+                    enabled_mcp_servers,
+                    cwd,
+                    model,
+                    effort,
+                    permission_mode,
+                ) => res?,
+            };
             let new_arc = Arc::new(Mutex::new(fresh));
             {
                 let mut map = pool().lock().await;
@@ -663,17 +691,19 @@ pub(crate) async fn run_persistent_agy_turn(
             new_arc
         }
     } else {
-        let fresh = AcpWorker::spawn_and_init(
-            bin,
-            wsl_distro,
-            account,
-            enabled_mcp_servers,
-            cwd,
-            model,
-            effort,
-            permission_mode,
-        )
-        .await?;
+        let fresh = tokio::select! {
+            _ = &mut cancel_rx => return Err("Turn cancelled by user".to_string()),
+            res = AcpWorker::spawn_and_init(
+                bin,
+                wsl_distro,
+                account,
+                enabled_mcp_servers,
+                cwd,
+                model,
+                effort,
+                permission_mode,
+            ) => res?,
+        };
         let new_arc = Arc::new(Mutex::new(fresh));
         {
             let mut map = pool().lock().await;
@@ -685,7 +715,11 @@ pub(crate) async fn run_persistent_agy_turn(
 
     let res = {
         let mut w = worker_arc.lock().await;
-        w.sync_config(model, effort, permission_mode).await;
+        if let Err(e) = w.sync_config(model, effort, permission_mode).await {
+            drop(w);
+            sleep_session_inner(app, session_id).await;
+            return Err(e);
+        }
         let prompt_to_send = if w.turns_completed == 0 {
             cold_prompt
         } else {
@@ -896,4 +930,27 @@ pub async fn wake_session(
     session_id: String,
 ) -> Result<bool, String> {
     wake_session_inner(Some(&app), &db_state.0, &session_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_permission_mode_maps_plan_and_auto() {
+        assert_eq!(map_permission_mode("plan"), "plan");
+        assert_eq!(map_permission_mode("yolo"), "auto");
+        assert_eq!(map_permission_mode("default"), "auto");
+    }
+
+    #[tokio::test]
+    async fn spawn_semaphore_serializes_permits() {
+        let sem = spawn_semaphore();
+        assert!(sem.available_permits() >= 1);
+        let before = sem.available_permits();
+        let permit = sem.acquire().await.expect("acquire permit");
+        assert_eq!(sem.available_permits(), before - 1);
+        drop(permit);
+        assert_eq!(sem.available_permits(), before);
+    }
 }

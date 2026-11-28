@@ -216,10 +216,18 @@ export default function App() {
     currentVersion: string;
     latestVersion: string;
     body?: string;
+    releaseUrl?: string;
   } | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
+  const [updatePrefsTick, setUpdatePrefsTick] = useState(0);
+
+  useEffect(() => {
+    const onPrefsChanged = () => setUpdatePrefsTick((n) => n + 1);
+    window.addEventListener('sakana:update-prefs-changed', onPrefsChanged);
+    return () => window.removeEventListener('sakana:update-prefs-changed', onPrefsChanged);
+  }, []);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -239,31 +247,65 @@ export default function App() {
       })
       .catch(() => {});
 
+    const autoEnabled = (() => {
+      try {
+        return window.localStorage.getItem('sakana_auto_update_enabled') !== 'false';
+      } catch {
+        return true;
+      }
+    })();
+    const intervalHours = (() => {
+      try {
+        const raw = Number(window.localStorage.getItem('sakana_auto_update_interval_hours') || '6');
+        return Number.isFinite(raw) && raw > 0 ? raw : 6;
+      } catch {
+        return 6;
+      }
+    })();
+
     const checkUpdates = async () => {
+      if (!autoEnabled) return;
+      try {
+        const snoozeUntil = Number(window.localStorage.getItem('sakana_update_snooze_until') || '0');
+        if (snoozeUntil > Date.now()) return;
+      } catch {
+        // ignore storage errors
+      }
       try {
         const res = await tauriApi.checkForUpdates();
         if (!cancelled && res.available && res.latestVersion) {
+          let skipped = '';
+          try {
+            skipped = window.localStorage.getItem('sakana_update_skipped_version') || '';
+          } catch {
+            // ignore
+          }
+          if (skipped && skipped === res.latestVersion) return;
+          setUpdateDismissed(false);
           setAvailableUpdate({
             currentVersion: res.currentVersion,
             latestVersion: res.latestVersion,
             body: res.body ?? undefined,
+            releaseUrl: res.releaseUrl ?? undefined,
           });
         }
       } catch {
-        // Silent background check; manual check in System tab surfaces errors
+        // Silent background check; manual check in Settings surfaces errors
       }
     };
 
-    const startupTimer = window.setTimeout(checkUpdates, 3000);
-    const intervalTimer = window.setInterval(checkUpdates, 6 * 60 * 60 * 1000);
+    const startupTimer = autoEnabled ? window.setTimeout(checkUpdates, 5000) : undefined;
+    const intervalTimer = autoEnabled
+      ? window.setInterval(checkUpdates, intervalHours * 60 * 60 * 1000)
+      : undefined;
 
     return () => {
       cancelled = true;
-      window.clearTimeout(startupTimer);
-      window.clearInterval(intervalTimer);
+      if (startupTimer !== undefined) window.clearTimeout(startupTimer);
+      if (intervalTimer !== undefined) window.clearInterval(intervalTimer);
       unlisten?.();
     };
-  }, []);
+  }, [updatePrefsTick]);
 
   const showToast = (msg: string) => {
     const firstLine =
@@ -391,18 +433,25 @@ export default function App() {
     void refreshQuotasRef.current(true);
   }, [bootstrapActiveHost, refreshRemoteHosts, refreshOffices]);
 
-  // Auto-poll usage limits periodically and when window regains focus
+  // Auto-poll usage limits periodically with cooldown on focus/visibility to keep CPU & network low
   useEffect(() => {
     if (!isTauriRuntime()) return;
+    let lastFocusRefresh = 0;
+    const maybeRefreshOnFocus = () => {
+      const now = Date.now();
+      if (now - lastFocusRefresh < 60_000) return;
+      lastFocusRefresh = now;
+      void refreshQuotasRef.current(false);
+    };
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
         void refreshQuotasRef.current(true);
       }
-    }, 60_000);
-    const onFocus = () => void refreshQuotasRef.current(false);
+    }, 300_000);
+    const onFocus = () => maybeRefreshOnFocus();
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
-        void refreshQuotasRef.current(false);
+        maybeRefreshOnFocus();
       }
     };
     window.addEventListener('focus', onFocus);
@@ -740,7 +789,11 @@ export default function App() {
     if (primarySection !== 'dashboard' || !isTauriRuntime()) return;
     if (dashSubtab === 'overview') {
       void refreshTelemetry();
-      const timer = setInterval(() => void refreshTelemetry(), 5000);
+      const timer = setInterval(() => {
+        if (document.visibilityState === 'visible') {
+          void refreshTelemetry();
+        }
+      }, 15_000);
       return () => clearInterval(timer);
     }
     if (dashSubtab === 'harnesses') {
@@ -948,7 +1001,7 @@ export default function App() {
   }, [activeProject?.cwd]);
 
   const pendingTokensRef = useRef<Record<string, Record<string, string>>>({});
-  const tokenRafRef = useRef<number | null>(null);
+  const tokenFlushTimerRef = useRef<number | null>(null);
 
   // Subscribe to Phase 2 Tauri streaming & Terminal Guard events
   useEffect(() => {
@@ -957,9 +1010,9 @@ export default function App() {
     const unlisteners: Array<() => void> = [];
 
     const flushPendingTokens = () => {
-      if (tokenRafRef.current !== null) {
-        cancelAnimationFrame(tokenRafRef.current);
-        tokenRafRef.current = null;
+      if (tokenFlushTimerRef.current !== null) {
+        window.clearTimeout(tokenFlushTimerRef.current);
+        tokenFlushTimerRef.current = null;
       }
       const batch = pendingTokensRef.current;
       const sessionIds = Object.keys(batch);
@@ -986,14 +1039,30 @@ export default function App() {
 
     const register = async () => {
       const fns = await Promise.all([
+        tauriApi.onSessionCompacted((res) => {
+          if (res.message) {
+            setThreads((prev) =>
+              prev.map((t) => {
+                if (t.id !== res.sessionId) return t;
+                if (t.messages.some((m) => m.id === res.message!.id)) return t;
+                return { ...t, messages: [...t.messages, res.message!] };
+              }),
+            );
+          }
+          if (res.compactedCount > 0) {
+            showToast(
+              `${res.autoTriggered ? 'Auto-compacted' : 'Compacted'} ${res.compactedCount} older messages into retained memory`,
+            );
+          }
+        }),
         tauriApi.onTurnToken(({ sessionId, messageId, token }) => {
           if (!pendingTokensRef.current[sessionId]) {
             pendingTokensRef.current[sessionId] = {};
           }
           pendingTokensRef.current[sessionId][messageId] =
             (pendingTokensRef.current[sessionId][messageId] || '') + token;
-          if (tokenRafRef.current === null) {
-            tokenRafRef.current = requestAnimationFrame(flushPendingTokens);
+          if (tokenFlushTimerRef.current === null) {
+            tokenFlushTimerRef.current = window.setTimeout(flushPendingTokens, 80);
           }
         }),
         tauriApi.onTurnThinking(({ sessionId, messageId, thinking, durationMs }) => {
@@ -1245,9 +1314,9 @@ export default function App() {
     void register();
     return () => {
       disposed = true;
-      if (tokenRafRef.current !== null) {
-        cancelAnimationFrame(tokenRafRef.current);
-        tokenRafRef.current = null;
+      if (tokenFlushTimerRef.current !== null) {
+        window.clearTimeout(tokenFlushTimerRef.current);
+        tokenFlushTimerRef.current = null;
       }
       unlisteners.forEach((fn) => fn());
     };
@@ -1276,7 +1345,26 @@ export default function App() {
     }
   };
 
+  const handleCompactThread = useCallback(async (threadId: string) => {
+    if (!isTauriRuntime()) {
+      showToast('Compaction requires Sakana Desktop runtime');
+      return;
+    }
+    try {
+      const res = await tauriApi.compactSession(threadId);
+      if (!res || res.compactedCount === 0) {
+        showToast('Thread is already compact (not enough older messages yet)');
+      }
+    } catch (err) {
+      showToast(`Compact failed: ${String(err)}`);
+    }
+  }, []);
+
   const handleSendPrompt = (threadId: string, promptText: string) => {
+    if (promptText.trim().toLowerCase() === '/compact') {
+      void handleCompactThread(threadId);
+      return;
+    }
     // Reset Split-Mode Peer Bridge hop counter on every human-initiated message
     peerBridgeHopRef.current = 0;
     const target = threads.find((t) => t.id === threadId);
@@ -1783,6 +1871,7 @@ export default function App() {
             onToggleRightInspector={() => setRightOpen((v) => !v)}
             onSelectThread={(id) => setSelectedThreadId(id)}
             onSendPrompt={handleSendPrompt}
+            onCompactThread={(id) => void handleCompactThread(id)}
             onStopStreaming={(id) => {
               void tauriApi.cancelTurn(id).catch((err) => {
                 console.error('cancel_turn failed:', err);
@@ -2611,12 +2700,25 @@ export default function App() {
             </div>
             <button
               type="button"
-              onClick={() => setUpdateDismissed(true)}
-              className="text-[11px] px-1.5 py-0.5 rounded hover:opacity-80"
+              onClick={() => {
+                try {
+                  window.localStorage.setItem(
+                    'sakana_update_skipped_version',
+                    availableUpdate.latestVersion,
+                  );
+                  window.dispatchEvent(new Event('sakana:update-prefs-changed'));
+                } catch {
+                  // ignore
+                }
+                setUpdateDismissed(true);
+                showToast(`Skipped v${availableUpdate.latestVersion}`);
+              }}
+              className="text-[11px] px-1.5 py-0.5 rounded hover:opacity-80 cursor-pointer"
               style={{ color: 'var(--text-dim)' }}
               disabled={installingUpdate}
+              title="Skip this version"
             >
-              Dismiss
+              Skip
             </button>
           </div>
           {installingUpdate && (
@@ -2640,7 +2742,62 @@ export default function App() {
               </div>
             </div>
           )}
-          <div className="mt-3 flex items-center justify-end gap-2">
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-1.5">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                disabled={installingUpdate}
+                onClick={() => {
+                  try {
+                    window.localStorage.setItem(
+                      'sakana_update_snooze_until',
+                      String(Date.now() + 60 * 60 * 1000),
+                    );
+                    window.dispatchEvent(new Event('sakana:update-prefs-changed'));
+                  } catch {
+                    // ignore
+                  }
+                  setUpdateDismissed(true);
+                  showToast('Snoozed update reminder for 1 hour');
+                }}
+                className="btn-ghost px-2 py-1 text-[10.5px] cursor-pointer"
+              >
+                Snooze 1h
+              </button>
+              <button
+                type="button"
+                disabled={installingUpdate}
+                onClick={() => {
+                  try {
+                    window.localStorage.setItem(
+                      'sakana_update_snooze_until',
+                      String(Date.now() + 24 * 60 * 60 * 1000),
+                    );
+                    window.dispatchEvent(new Event('sakana:update-prefs-changed'));
+                  } catch {
+                    // ignore
+                  }
+                  setUpdateDismissed(true);
+                  showToast('Snoozed update reminder for 24 hours');
+                }}
+                className="btn-ghost px-2 py-1 text-[10.5px] cursor-pointer"
+              >
+                24h
+              </button>
+              {availableUpdate.releaseUrl && (
+                <button
+                  type="button"
+                  disabled={installingUpdate}
+                  onClick={() => {
+                    void tauriApi.openExternalUrl(availableUpdate.releaseUrl!);
+                  }}
+                  className="btn-ghost px-2 py-1 text-[10.5px] cursor-pointer"
+                  title="Download installer manually from GitHub"
+                >
+                  Manual
+                </button>
+              )}
+            </div>
             <button
               type="button"
               disabled={installingUpdate}
@@ -2655,7 +2812,7 @@ export default function App() {
                   showToast(`Update failed: ${String(err)}`);
                 }
               }}
-              className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-medium text-white disabled:opacity-60"
+              className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-medium text-white disabled:opacity-60 cursor-pointer"
               style={{ background: 'var(--accent)' }}
             >
               {installingUpdate

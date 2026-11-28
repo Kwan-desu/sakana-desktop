@@ -147,7 +147,7 @@ select:focus:not(:focus-visible) {
 }
 
 .pulse-dot {
-  animation: pulseDot 1.4s ease-in-out infinite;
+  animation: pulseDot 2.2s ease-in-out infinite;
 }
 
 @keyframes msgEnter {
@@ -228,20 +228,12 @@ select:focus:not(:focus-visible) {
 .syn-cmt { color: var(--syn-cmt); }
 .syn-fn { color: var(--syn-fn); }
 
-/* ChatGPT-style Effort Level Accents & Animations */
-@keyframes effortShimmer {
-  0% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-  100% { background-position: 0% 50%; }
-}
-
+/* Effort Level Accents (static gradients — avoids continuous software repaints on WebView2) */
 .effort-high-text {
-  background: linear-gradient(90deg, var(--effort-high), var(--effort-med), var(--effort-high));
-  background-size: 200% 100%;
+  background: linear-gradient(90deg, var(--effort-high), var(--effort-med));
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: effortShimmer 4s ease-in-out infinite;
 }
 
 .effort-xhigh-text {
@@ -249,14 +241,11 @@ select:focus:not(:focus-visible) {
     90deg,
     var(--effort-xhigh-a),
     var(--effort-xhigh-b),
-    var(--effort-xhigh-c),
-    var(--effort-xhigh-a)
+    var(--effort-xhigh-c)
   );
-  background-size: 240% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: effortShimmer 3s linear infinite;
 }
 
 .effort-xhigh-pill {

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use chrono::Local;
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1176,6 +1176,283 @@ async fn run_wsl_cli_harness(
     Ok(())
 }
 
+const COMPACTION_CONFIG_KEY: &str = "compaction_config";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionConfig {
+    pub auto_compact: bool,
+    pub message_threshold: usize,
+    pub char_threshold: usize,
+    pub keep_recent: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            auto_compact: true,
+            message_threshold: 36,
+            char_threshold: 32_000,
+            keep_recent: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionCompactionState {
+    summary: String,
+    compacted_up_to_id: String,
+    compacted_count: usize,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionResult {
+    pub session_id: String,
+    pub compacted_count: usize,
+    pub remaining_count: usize,
+    pub summary: String,
+    pub message: Option<ChatMessage>,
+    pub auto_triggered: bool,
+}
+
+fn compaction_setting_key(session_id: &str) -> String {
+    format!("compaction:{}", session_id)
+}
+
+pub fn load_compaction_config(db: &crate::db::Database) -> CompactionConfig {
+    db.get_setting(COMPACTION_CONFIG_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<CompactionConfig>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_compaction_config(
+    db: &crate::db::Database,
+    cfg: &CompactionConfig,
+) -> Result<(), String> {
+    let json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
+    db.set_setting(COMPACTION_CONFIG_KEY, &json)
+        .map_err(|e| e.to_string())
+}
+
+fn load_session_compaction(
+    db: &crate::db::Database,
+    session_id: &str,
+) -> Option<SessionCompactionState> {
+    db.get_setting(&compaction_setting_key(session_id))
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<SessionCompactionState>(&raw).ok())
+}
+
+fn save_session_compaction(
+    db: &crate::db::Database,
+    session_id: &str,
+    state: &SessionCompactionState,
+) -> Result<(), String> {
+    let json = serde_json::to_string(state).map_err(|e| e.to_string())?;
+    db.set_setting(&compaction_setting_key(session_id), &json)
+        .map_err(|e| e.to_string())
+}
+
+fn is_compaction_marker(msg: &ChatMessage) -> bool {
+    msg.role == "system" && msg.author.as_deref() == Some("Context Compacted")
+}
+
+/// Load full retained memory for a session: optional compacted summary + all messages after
+/// the compaction boundary (never dropping open-thread memory at an arbitrary 16-message cutoff).
+fn load_session_memory_for_turn(
+    db: &crate::db::Database,
+    session_id: &str,
+) -> (Option<String>, Vec<ChatMessage>) {
+    let all_msgs = db.list_recent_messages(session_id, 400).unwrap_or_default();
+    let compaction = load_session_compaction(db, session_id);
+    let uncompacted: Vec<ChatMessage> = if let Some(ref st) = compaction {
+        if let Some(pos) = all_msgs.iter().position(|m| m.id == st.compacted_up_to_id) {
+            all_msgs[pos + 1..]
+                .iter()
+                .filter(|m| !is_compaction_marker(m))
+                .cloned()
+                .collect()
+        } else {
+            all_msgs
+                .into_iter()
+                .filter(|m| !is_compaction_marker(m))
+                .collect()
+        }
+    } else {
+        all_msgs
+            .into_iter()
+            .filter(|m| !is_compaction_marker(m))
+            .collect()
+    };
+    let summary = compaction.map(|c| c.summary).filter(|s| !s.trim().is_empty());
+    (summary, uncompacted)
+}
+
+fn build_extractive_compaction_summary(
+    prev_summary: Option<&str>,
+    to_compact: &[ChatMessage],
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(prev) = prev_summary {
+        let trimmed = prev.trim();
+        if !trimmed.is_empty() {
+            let kept: String = trimmed.chars().take(2800).collect();
+            lines.push(kept);
+        }
+    }
+    for m in to_compact {
+        let text = m.text.trim();
+        if text.is_empty() || is_compaction_marker(m) {
+            continue;
+        }
+        let role_tag = match m.role.as_str() {
+            "assistant" => "Assistant",
+            "system" => "System",
+            _ => "User",
+        };
+        let compact_line: String = text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let snippet: String = if compact_line.chars().count() > 220 {
+            format!("{}…", compact_line.chars().take(220).collect::<String>())
+        } else {
+            compact_line
+        };
+        lines.push(format!("- [{}] {}", role_tag, snippet));
+    }
+    let joined = lines.join("\n");
+    if joined.chars().count() > 5500 {
+        let tail: String = joined
+            .chars()
+            .rev()
+            .take(5400)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!("(Earlier summary condensed)\n{}", tail)
+    } else {
+        joined
+    }
+}
+
+pub async fn compact_session_inner(
+    app: Option<&AppHandle>,
+    db: &Arc<Mutex<crate::db::Database>>,
+    session_id: &str,
+    auto_triggered: bool,
+) -> Result<CompactionResult, String> {
+    let (cfg, prev_compaction, uncompacted) = {
+        let db_lock = db.lock().await;
+        let cfg = load_compaction_config(&db_lock);
+        let prev = load_session_compaction(&db_lock, session_id);
+        let (_, msgs) = load_session_memory_for_turn(&db_lock, session_id);
+        (cfg, prev, msgs)
+    };
+
+    let keep_recent = cfg.keep_recent.clamp(2, 30);
+    if uncompacted.len() <= keep_recent {
+        return Ok(CompactionResult {
+            session_id: session_id.to_string(),
+            compacted_count: 0,
+            remaining_count: uncompacted.len(),
+            summary: prev_compaction.map(|c| c.summary).unwrap_or_default(),
+            message: None,
+            auto_triggered,
+        });
+    }
+
+    let split_idx = uncompacted.len() - keep_recent;
+    let to_compact = &uncompacted[..split_idx];
+    let boundary_id = to_compact
+        .last()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+
+    let summary = build_extractive_compaction_summary(
+        prev_compaction.as_ref().map(|c| c.summary.as_str()),
+        to_compact,
+    );
+    let total_compacted = prev_compaction.as_ref().map(|c| c.compacted_count).unwrap_or(0)
+        + to_compact.len();
+
+    let state = SessionCompactionState {
+        summary: summary.clone(),
+        compacted_up_to_id: boundary_id,
+        compacted_count: total_compacted,
+        updated_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    };
+
+    let notice_msg = ChatMessage {
+        id: format!("msg-{}", Uuid::new_v4()),
+        role: "system".to_string(),
+        author: Some("Context Compacted".to_string()),
+        timestamp: Local::now().format("%H:%M").to_string(),
+        text: format!(
+            "{}Compacted {} older messages into retained memory ({} recent messages kept verbatim).\n\n{}",
+            if auto_triggered { "[Auto-Compact] " } else { "" },
+            to_compact.len(),
+            keep_recent,
+            summary.chars().take(600).collect::<String>()
+        ),
+        thinking: None,
+        thinking_duration: None,
+        tools: None,
+        subagent: None,
+        widget: None,
+        checkpoint: None,
+    };
+
+    {
+        let db_lock = db.lock().await;
+        save_session_compaction(&db_lock, session_id, &state)?;
+        let _ = db_lock.append_message(session_id, &notice_msg);
+    }
+
+    let res = CompactionResult {
+        session_id: session_id.to_string(),
+        compacted_count: to_compact.len(),
+        remaining_count: keep_recent,
+        summary,
+        message: Some(notice_msg),
+        auto_triggered,
+    };
+
+    crate::platform::emit_app_and_remote(app, "session:compacted", &res);
+    Ok(res)
+}
+
+async fn maybe_auto_compact_session(
+    app: Option<&AppHandle>,
+    db: &Arc<Mutex<crate::db::Database>>,
+    session_id: &str,
+) {
+    let should_compact = {
+        let db_lock = db.lock().await;
+        let cfg = load_compaction_config(&db_lock);
+        if !cfg.auto_compact {
+            false
+        } else {
+            let (_, uncompacted) = load_session_memory_for_turn(&db_lock, session_id);
+            let total_chars: usize = uncompacted.iter().map(|m| m.text.len()).sum();
+            uncompacted.len() >= cfg.message_threshold.max(12)
+                || total_chars >= cfg.char_threshold.max(8_000)
+        }
+    };
+    if should_compact {
+        let _ = compact_session_inner(app, db, session_id, true).await;
+    }
+}
+
 fn build_cli_prompt_with_history(
     sakana_ctx: &str,
     history: &[ChatMessage],
@@ -1188,6 +1465,9 @@ fn build_cli_prompt_with_history(
 
     let mut history_lines = Vec::new();
     for m in prior {
+        if is_compaction_marker(m) {
+            continue;
+        }
         let trimmed = m.text.trim();
         if trimmed.is_empty() {
             continue;
@@ -1200,14 +1480,29 @@ fn build_cli_prompt_with_history(
         history_lines.push(format!("[{}]: {}", role_label, trimmed));
     }
 
+    // Keep CLI prompt safely under Windows CreateProcess 32KB command-line limit
+    // by trimming oldest uncompacted lines first (compacted summary in sakana_ctx is preserved).
+    const MAX_HISTORY_CHARS: usize = 20_000;
+    let mut kept_rev: Vec<String> = Vec::new();
+    let mut used_chars: usize = 0;
+    for line in history_lines.into_iter().rev() {
+        let line_len = line.len() + 1;
+        if used_chars + line_len > MAX_HISTORY_CHARS && !kept_rev.is_empty() {
+            break;
+        }
+        used_chars += line_len;
+        kept_rev.push(line);
+    }
+    kept_rev.reverse();
+
     let mut sections = Vec::new();
     if !sakana_ctx.trim().is_empty() {
         sections.push(sakana_ctx.trim().to_string());
     }
-    if !history_lines.is_empty() {
+    if !kept_rev.is_empty() {
         sections.push(format!(
             "<conversation_history>\n{}\n</conversation_history>",
-            history_lines.join("\n")
+            kept_rev.join("\n")
         ));
     }
     sections.push(current_prompt.to_string());
@@ -1235,7 +1530,7 @@ fn build_http_messages(
     };
 
     for m in prior {
-        if m.text.trim().is_empty() {
+        if is_compaction_marker(m) || m.text.trim().is_empty() {
             continue;
         }
         let role = match m.role.as_str() {
@@ -1601,7 +1896,10 @@ pub async fn send_turn_with_options(
             (session.harness.clone(), format!("{}{}", prompt, attach_text))
         };
 
-        let (active_account, recent_history, enabled_mcp_servers, self_control_ctx, split_peer_ctx) = {
+        // Auto-compact long threads before building turn context so open threads retain full memory.
+        maybe_auto_compact_session(app_handle.as_ref(), &db_arc, &sid).await;
+
+        let (active_account, compacted_summary, recent_history, enabled_mcp_servers, self_control_ctx, split_peer_ctx) = {
             let db = db_arc.lock().await;
             let account = db
                 .get_harness_account(&session.account)
@@ -1609,7 +1907,7 @@ pub async fn send_turn_with_options(
                 .flatten()
                 .filter(|a| a.harness == active_harness)
                 .or_else(|| db.get_default_harness_account(&active_harness).ok().flatten());
-            let history = db.list_recent_messages(&sid, 16).unwrap_or_default();
+            let (summary, history) = load_session_memory_for_turn(&db, &sid);
             let mcp_servers: Vec<McpServer> = db
                 .list_mcp_servers()
                 .unwrap_or_default()
@@ -1621,8 +1919,20 @@ pub async fn send_turn_with_options(
                 .as_deref()
                 .map(|pid| crate::self_control::build_split_peer_prompt(&db, pid))
                 .unwrap_or_default();
-            (account, history, mcp_servers, sc_ctx, peer_ctx)
+            (account, summary, history, mcp_servers, sc_ctx, peer_ctx)
         };
+
+        if let Some(summary) = compacted_summary {
+            let block = format!(
+                "<compacted_conversation_memory>\n{}\n</compacted_conversation_memory>",
+                summary
+            );
+            if sakana_ctx.trim().is_empty() {
+                sakana_ctx = block;
+            } else {
+                sakana_ctx = format!("{}\n\n{}", sakana_ctx, block);
+            }
+        }
 
         if !self_control_ctx.trim().is_empty() {
             if sakana_ctx.trim().is_empty() {
@@ -1894,6 +2204,39 @@ pub async fn send_turn(
         },
     )
     .await
+}
+
+#[tauri::command]
+pub async fn compact_session(
+    app: AppHandle,
+    db_state: State<'_, DbState>,
+    session_id: String,
+) -> Result<CompactionResult, String> {
+    compact_session_inner(Some(&app), &db_state.0, &session_id, false).await
+}
+
+#[tauri::command]
+pub async fn get_compaction_config(
+    db_state: State<'_, DbState>,
+) -> Result<CompactionConfig, String> {
+    let db = db_state.0.lock().await;
+    Ok(load_compaction_config(&db))
+}
+
+#[tauri::command]
+pub async fn update_compaction_config(
+    db_state: State<'_, DbState>,
+    config: CompactionConfig,
+) -> Result<CompactionConfig, String> {
+    let normalized = CompactionConfig {
+        auto_compact: config.auto_compact,
+        message_threshold: config.message_threshold.clamp(12, 200),
+        char_threshold: config.char_threshold.clamp(8_000, 120_000),
+        keep_recent: config.keep_recent.clamp(2, 30),
+    };
+    let db = db_state.0.lock().await;
+    save_compaction_config(&db, &normalized)?;
+    Ok(normalized)
 }
 
 #[tauri::command]
@@ -2874,6 +3217,26 @@ pub async fn run_one_shot_prompt_with_opts(
         .filter(|&s| s >= 30)
         .unwrap_or(600);
 
+    // Auto-compact long Discord threads and retain full conversation memory across turns.
+    maybe_auto_compact_session(Some(app), &db, session_id).await;
+    let (compacted_summary, recent_history) = {
+        let db_lock = db.lock().await;
+        load_session_memory_for_turn(&db_lock, session_id)
+    };
+    let mut sakana_ctx = load_sakana_context(&effective_cwd, proj_wsl.as_deref());
+    if let Some(summary) = compacted_summary {
+        let block = format!(
+            "<compacted_conversation_memory>\n{}\n</compacted_conversation_memory>",
+            summary
+        );
+        if sakana_ctx.trim().is_empty() {
+            sakana_ctx = block;
+        } else {
+            sakana_ctx = format!("{}\n\n{}", sakana_ctx, block);
+        }
+    }
+    let full_prompt_with_history = build_cli_prompt_with_history(&sakana_ctx, &recent_history, prompt);
+
     let permission_mode = if read_only {
         "plan"
     } else {
@@ -2881,7 +3244,7 @@ pub async fn run_one_shot_prompt_with_opts(
     };
 
     let reply_text = if let Some(ref distro) = proj_wsl.filter(|_| effective_harness != "sakana") {
-        let escaped_prompt = crate::platform::shell_escape_single(prompt);
+        let escaped_prompt = crate::platform::shell_escape_single(&full_prompt_with_history);
         let mut wsl_mcp_setup: Option<String> = None;
         let mut wsl_mcp_path: Option<String> = None;
         if effective_harness == "claude-code" {
@@ -2997,11 +3360,11 @@ pub async fn run_one_shot_prompt_with_opts(
         }
         let mut _mcp_guard: Option<TempFileGuard> = None;
         if active_harness == "kiro-cli" {
-            cmd.args(["chat", "--no-interactive", prompt]);
+            cmd.args(["chat", "--no-interactive", &full_prompt_with_history]);
         } else if active_harness == "agy-cli" {
             let (resolved_model, resolved_effort) =
                 resolve_agy_model_and_effort_with_db(&db, &effective_model, &effective_effort).await;
-            cmd.args(["-p", prompt]);
+            cmd.args(["-p", &full_prompt_with_history]);
             if let Some(m) = resolved_model {
                 cmd.args(["--model", &m]);
             }
@@ -3010,7 +3373,7 @@ pub async fn run_one_shot_prompt_with_opts(
             }
             cmd.args(build_permission_args(active_harness, permission_mode));
         } else {
-            cmd.args(["-p", prompt]);
+            cmd.args(["-p", &full_prompt_with_history]);
             if !effective_model.is_empty() {
                 cmd.args(["--model", &effective_model]);
             }
@@ -3076,13 +3439,14 @@ pub async fn run_one_shot_prompt_with_opts(
         } else {
             "gpt-4o-mini".to_string()
         };
+        let http_messages = build_http_messages(&sakana_ctx, &recent_history, prompt);
         let client = reqwest::Client::new();
         match client
             .post(url)
             .header("Authorization", format!("Bearer {}", key))
             .json(&serde_json::json!({
                 "model": model,
-                "messages": [{ "role": "user", "content": prompt }],
+                "messages": http_messages,
             }))
             .send()
             .await

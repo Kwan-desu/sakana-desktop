@@ -58,6 +58,7 @@ interface ChatPaneProps {
   onSelectThread: (id: string) => void;
   onSendPrompt: (threadId: string, prompt: string) => void;
   onStopStreaming: (threadId: string) => void;
+  onCompactThread?: (threadId: string) => void;
   onUpdateThreadConfig: (
     threadId: string,
     patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'account'>>,
@@ -1265,6 +1266,7 @@ export function ChatPane({
   onSelectThread,
   onSendPrompt,
   onStopStreaming,
+  onCompactThread,
   onUpdateThreadConfig,
   onRevertToCheckpoint,
   onViewCheckpointDiff,
@@ -1475,6 +1477,7 @@ export function ChatPane({
   };
 
   const builtInCommands: SkillItem[] = [
+    { slug: 'compact', scope: 'global', description: 'Compact older chat history into retained memory' },
     { slug: 'verify', scope: 'global', description: 'Run cross-harness /verify check' },
     { slug: 'delegate', scope: 'global', description: 'Delegate subtask via /delegate' },
   ];
@@ -1677,6 +1680,17 @@ export function ChatPane({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {onCompactThread && thread.id !== 'empty' && thread.messages.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onCompactThread(thread.id)}
+              className="btn-ghost px-2 py-1 text-[11px] font-medium inline-flex items-center gap-1.5 cursor-pointer"
+              title="Compact older messages into retained memory (/compact)"
+              aria-label="Compact thread memory"
+            >
+              <span>Compact</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={onToggleSplitView}

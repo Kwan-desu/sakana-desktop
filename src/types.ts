@@ -484,6 +484,23 @@ export interface UpdateCheckResult {
   latestVersion?: string;
   body?: string;
   error?: string;
+  releaseUrl?: string;
+}
+
+export interface CompactionConfig {
+  autoCompact: boolean;
+  messageThreshold: number;
+  charThreshold: number;
+  keepRecent: number;
+}
+
+export interface CompactionResult {
+  sessionId: string;
+  compactedCount: number;
+  remainingCount: number;
+  summary: string;
+  message?: ChatMessage;
+  autoTriggered: boolean;
 }
 
 export interface DiscordPromptEvent {

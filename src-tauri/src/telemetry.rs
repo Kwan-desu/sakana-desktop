@@ -14,6 +14,9 @@ use uuid::Uuid;
 struct TelemetrySampler {
     sys: System,
     last_cpu_sample: Option<Instant>,
+    last_disk_sample: Option<Instant>,
+    cached_disk_total: u64,
+    cached_disk_avail: u64,
 }
 
 static TELEMETRY_SAMPLER: OnceLock<Mutex<TelemetrySampler>> = OnceLock::new();
@@ -21,6 +24,8 @@ static TELEMETRY_SAMPLER: OnceLock<Mutex<TelemetrySampler>> = OnceLock::new();
 use crate::models::{EnvSecret, QuotaAccount, SystemTelemetry};
 use crate::platform::{read_env_entries, write_env_entries};
 use crate::DbState;
+
+const SAKANA_RELEASES_URL: &str = "https://github.com/Kwan-desu/sakana-desktop/releases/latest";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +35,7 @@ pub struct UpdateCheckResult {
     pub latest_version: Option<String>,
     pub body: Option<String>,
     pub error: Option<String>,
+    pub release_url: Option<String>,
 }
 
 fn mask_secret_value(val: &str) -> (String, String) {
@@ -60,27 +66,52 @@ pub async fn get_system_telemetry(app: AppHandle) -> Result<SystemTelemetry, Str
         Mutex::new(TelemetrySampler {
             sys,
             last_cpu_sample: None,
+            last_disk_sample: None,
+            cached_disk_total: 0,
+            cached_disk_avail: 0,
         })
     });
 
-    let (cpu_brand, cpu_cores, cpu_usage_pct, memory_used_bytes, memory_total_bytes) = {
+    let (
+        cpu_brand,
+        cpu_cores,
+        cpu_usage_pct,
+        memory_used_bytes,
+        memory_total_bytes,
+        disk_total,
+        disk_avail,
+    ) = {
         let mut guard = sampler.lock().await;
-        let needs_baseline = match guard.last_cpu_sample {
-            None => true,
-            Some(prev) => prev.elapsed() > Duration::from_secs(5),
-        };
-        if needs_baseline {
+        if guard.last_cpu_sample.is_none() {
             guard.sys.refresh_cpu_usage();
             tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
-        } else if let Some(prev) = guard.last_cpu_sample {
-            let min_interval = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
-            if prev.elapsed() < min_interval {
-                tokio::time::sleep(min_interval - prev.elapsed()).await;
-            }
         }
         guard.sys.refresh_cpu_usage();
         guard.sys.refresh_memory();
         guard.last_cpu_sample = Some(Instant::now());
+
+        let refresh_disks = match guard.last_disk_sample {
+            None => true,
+            Some(prev) => prev.elapsed() >= Duration::from_secs(60),
+        };
+        if refresh_disks {
+            let disks = Disks::new_with_refreshed_list();
+            let mut seen_mounts: HashSet<PathBuf> = HashSet::new();
+            let mut total: u64 = 0;
+            let mut avail: u64 = 0;
+            for disk in disks.list() {
+                if disk.is_removable() || disk.total_space() == 0 {
+                    continue;
+                }
+                if seen_mounts.insert(disk.mount_point().to_path_buf()) {
+                    total = total.saturating_add(disk.total_space());
+                    avail = avail.saturating_add(disk.available_space());
+                }
+            }
+            guard.cached_disk_total = total;
+            guard.cached_disk_avail = avail;
+            guard.last_disk_sample = Some(Instant::now());
+        }
 
         let brand = guard
             .sys
@@ -94,22 +125,10 @@ pub async fn get_system_telemetry(app: AppHandle) -> Result<SystemTelemetry, Str
             guard.sys.global_cpu_usage(),
             guard.sys.used_memory(),
             guard.sys.total_memory(),
+            guard.cached_disk_total,
+            guard.cached_disk_avail,
         )
     };
-
-    let disks = Disks::new_with_refreshed_list();
-    let mut seen_mounts: HashSet<PathBuf> = HashSet::new();
-    let mut disk_total: u64 = 0;
-    let mut disk_avail: u64 = 0;
-    for disk in disks.list() {
-        if disk.is_removable() || disk.total_space() == 0 {
-            continue;
-        }
-        if seen_mounts.insert(disk.mount_point().to_path_buf()) {
-            disk_total = disk_total.saturating_add(disk.total_space());
-            disk_avail = disk_avail.saturating_add(disk.available_space());
-        }
-    }
 
     let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
 
@@ -535,16 +554,18 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     Ok(manager.is_enabled().unwrap_or(enabled))
 }
 
-fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+fn build_updater(app: &AppHandle, with_auth: bool) -> Result<tauri_plugin_updater::Updater, String> {
     let mut builder = app.updater_builder();
-    if let Some(token) = crate::platform::get_env_or_dotenv("GITHUB_TOKEN")
-        .or_else(|| crate::platform::get_env_or_dotenv("GH_TOKEN"))
-    {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            builder = builder
-                .header("Authorization", format!("Bearer {trimmed}"))
-                .map_err(|e| format!("Invalid GitHub token header: {e}"))?;
+    if with_auth {
+        if let Some(token) = crate::platform::get_env_or_dotenv("GITHUB_TOKEN")
+            .or_else(|| crate::platform::get_env_or_dotenv("GH_TOKEN"))
+        {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                builder = builder
+                    .header("Authorization", format!("Bearer {trimmed}"))
+                    .map_err(|e| format!("Invalid GitHub token header: {e}"))?;
+            }
         }
     }
     builder
@@ -552,29 +573,45 @@ fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Strin
         .map_err(|e| format!("Updater unavailable: {e}"))
 }
 
+async fn check_update_with_fallback(
+    app: &AppHandle,
+) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    // Public GitHub releases must be fetched without stale GITHUB_TOKEN headers first;
+    // only retry with auth if unauthenticated fails (e.g. private mirror/rate limit).
+    let primary = build_updater(app, false)?;
+    match primary.check().await {
+        Ok(res) => Ok(res),
+        Err(first_err) => {
+            let has_token = crate::platform::get_env_or_dotenv("GITHUB_TOKEN")
+                .or_else(|| crate::platform::get_env_or_dotenv("GH_TOKEN"))
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
+            if has_token {
+                if let Ok(authed) = build_updater(app, true) {
+                    if let Ok(res) = authed.check().await {
+                        return Ok(res);
+                    }
+                }
+            }
+            Err(first_err.to_string())
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckResult, String> {
     let current_version = app.package_info().version.to_string();
-    let updater = match build_updater(&app) {
-        Ok(u) => u,
-        Err(err) => {
-            return Ok(UpdateCheckResult {
-                available: false,
-                current_version,
-                latest_version: None,
-                body: None,
-                error: Some(err),
-            });
-        }
-    };
-
-    match updater.check().await {
+    match check_update_with_fallback(&app).await {
         Ok(Some(update)) => Ok(UpdateCheckResult {
             available: true,
             current_version,
-            latest_version: Some(update.version),
+            latest_version: Some(update.version.clone()),
             body: update.body,
             error: None,
+            release_url: Some(format!(
+                "https://github.com/Kwan-desu/sakana-desktop/releases/tag/v{}",
+                update.version.trim_start_matches('v')
+            )),
         }),
         Ok(None) => Ok(UpdateCheckResult {
             available: false,
@@ -582,22 +619,22 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckResult, Stri
             latest_version: None,
             body: None,
             error: None,
+            release_url: Some(SAKANA_RELEASES_URL.to_string()),
         }),
         Err(err) => Ok(UpdateCheckResult {
             available: false,
             current_version,
             latest_version: None,
             body: None,
-            error: Some(err.to_string()),
+            error: Some(err),
+            release_url: Some(SAKANA_RELEASES_URL.to_string()),
         }),
     }
 }
 
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
-    let updater = build_updater(&app)?;
-    let Some(update) = updater
-        .check()
+    let Some(update) = check_update_with_fallback(&app)
         .await
         .map_err(|e| format!("Update check failed: {e}"))?
     else {
@@ -621,6 +658,10 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
             || {},
         )
         .await
-        .map_err(|e| format!("Failed to install update: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Failed to install update: {e}. If running a standalone .exe, download the NSIS/MSI installer from GitHub Releases."
+            )
+        })?;
     app.restart();
 }

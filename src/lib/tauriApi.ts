@@ -54,6 +54,8 @@ import type {
   TurnTokenEvent,
   TurnToolEvent,
   UpdateCheckResult,
+  CompactionConfig,
+  CompactionResult,
   UpdateStaffInput,
   WorkspaceFile,
   WslDistro,
@@ -585,6 +587,23 @@ export const tauriApi = {
   onUpdateProgress: (
     handler: (payload: { downloaded: number; total?: number | null }) => void,
   ) => tauriListen<{ downloaded: number; total?: number | null }>('update:progress', handler),
+
+  compactSession: async (sessionId: string): Promise<CompactionResult | null> =>
+    (await tauriInvoke<CompactionResult>('compact_session', { sessionId })) ?? null,
+
+  getCompactionConfig: async (): Promise<CompactionConfig> =>
+    (await tauriInvoke<CompactionConfig>('get_compaction_config')) ?? {
+      autoCompact: true,
+      messageThreshold: 36,
+      charThreshold: 32000,
+      keepRecent: 8,
+    },
+
+  updateCompactionConfig: async (config: CompactionConfig): Promise<CompactionConfig> =>
+    (await tauriInvoke<CompactionConfig>('update_compaction_config', { config })) ?? config,
+
+  onSessionCompacted: (handler: (payload: CompactionResult) => void) =>
+    tauriListen<CompactionResult>('session:compacted', handler),
 
   listHarnessModels: async (refresh?: boolean): Promise<Record<string, HarnessModelOption[]>> =>
     (await tauriInvoke<Record<string, HarnessModelOption[]>>(

@@ -28,6 +28,7 @@ import {
 import type {
   AppCustomization,
   AutomationItem,
+  CompactionConfig,
   DashboardSubtab,
   DiscordSettings,
   DiscordStatus,
@@ -227,6 +228,14 @@ export function DashboardView({
   useEffect(() => {
     if (subtab === 'remote') {
       void refreshGitHubStatus();
+      if (isTauriRuntime()) {
+        void tauriApi
+          .getCompactionConfig()
+          .then((cfg) => {
+            if (cfg) setCompactionCfg(cfg);
+          })
+          .catch(() => {});
+      }
     }
     if (subtab === 'discord' && isTauriRuntime()) {
       void tauriApi
@@ -247,10 +256,97 @@ export function DashboardView({
   const [testingHostId, setTestingHostId] = useState<string | null>(null);
 
 
-  // Desktop App Updater state
+  // Desktop App Updater state & preferences
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+  const [autoUpdateEnabled, setAutoUpdateEnabled] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('sakana_auto_update_enabled') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const [autoUpdateIntervalHours, setAutoUpdateIntervalHours] = useState<number>(() => {
+    try {
+      const raw = Number(window.localStorage.getItem('sakana_auto_update_interval_hours') || '6');
+      return Number.isFinite(raw) && raw > 0 ? raw : 6;
+    } catch {
+      return 6;
+    }
+  });
+  const [updateSnoozeUntil, setUpdateSnoozeUntil] = useState<number>(() => {
+    try {
+      return Number(window.localStorage.getItem('sakana_update_snooze_until') || '0');
+    } catch {
+      return 0;
+    }
+  });
+  const [skippedVersion, setSkippedVersion] = useState<string>(() => {
+    try {
+      return window.localStorage.getItem('sakana_update_skipped_version') || '';
+    } catch {
+      return '';
+    }
+  });
+
+  // Context Memory & Auto-Compacting state
+  const [compactionCfg, setCompactionCfg] = useState<CompactionConfig>({
+    autoCompact: true,
+    messageThreshold: 36,
+    charThreshold: 32000,
+    keepRecent: 8,
+  });
+  const [savingCompaction, setSavingCompaction] = useState(false);
+
+  const saveUpdatePrefs = (nextEnabled: boolean, nextHours: number) => {
+    setAutoUpdateEnabled(nextEnabled);
+    setAutoUpdateIntervalHours(nextHours);
+    try {
+      window.localStorage.setItem('sakana_auto_update_enabled', String(nextEnabled));
+      window.localStorage.setItem('sakana_auto_update_interval_hours', String(nextHours));
+      window.dispatchEvent(new Event('sakana:update-prefs-changed'));
+    } catch {
+      // ignore
+    }
+    onToast(
+      nextEnabled
+        ? `Auto-update enabled (checks every ${nextHours}h)`
+        : 'Auto-update checks paused',
+    );
+  };
+
+  const clearUpdateSnooze = () => {
+    setUpdateSnoozeUntil(0);
+    setSkippedVersion('');
+    try {
+      window.localStorage.removeItem('sakana_update_snooze_until');
+      window.localStorage.removeItem('sakana_update_skipped_version');
+      window.dispatchEvent(new Event('sakana:update-prefs-changed'));
+    } catch {
+      // ignore
+    }
+    onToast('Cleared update snooze & skipped version');
+  };
+
+  const handleSaveCompactionConfig = async (next: CompactionConfig) => {
+    setCompactionCfg(next);
+    if (!isTauriRuntime()) return;
+    setSavingCompaction(true);
+    try {
+      const saved = await tauriApi.updateCompactionConfig(next);
+      setCompactionCfg(saved);
+      onToast(
+        saved.autoCompact
+          ? `Auto-compacting enabled (threshold: ${saved.messageThreshold} msgs)`
+          : 'Auto-compacting disabled (manual /compact still available)',
+      );
+    } catch (err) {
+      onToast(`Failed to save compaction settings: ${String(err)}`);
+    } finally {
+      setSavingCompaction(false);
+    }
+  };
 
   // MCP Add form
   const [addingMcp, setAddingMcp] = useState(false);
@@ -2833,6 +2929,243 @@ export function DashboardView({
                   )}
                 </div>
               )}
+            </div>
+
+            {/* Auto-Update & Releases Configuration */}
+            <div className="sakana-card rounded-[12px] p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-[14.5px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
+                    Software Updates &amp; Auto-Update
+                  </h2>
+                  <p className="text-[11.5px] m-0 mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                    Configure automatic update checks, snooze reminders, or manually check and install signed releases.
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {updateResult?.available && (
+                    <button
+                      type="button"
+                      disabled={installingUpdate}
+                      onClick={() => void handleInstallUpdate()}
+                      className="btn-solid px-2.5 py-1.5 text-[11.5px] font-medium cursor-pointer"
+                    >
+                      {installingUpdate ? 'Installing...' : 'Install & Restart'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={checkingUpdate}
+                    onClick={() => void handleCheckForUpdates()}
+                    className="btn-ghost px-2.5 py-1.5 text-[11.5px] font-medium cursor-pointer"
+                  >
+                    {checkingUpdate ? 'Checking...' : 'Check Now'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void tauriApi.openExternalUrl(
+                        updateResult?.releaseUrl ||
+                          'https://github.com/Kwan-desu/sakana-desktop/releases/latest',
+                      )
+                    }
+                    className="btn-ghost px-2.5 py-1.5 text-[11.5px] cursor-pointer"
+                    title="Open GitHub Releases page to download NSIS/MSI/AppImage manually"
+                  >
+                    Releases
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <label
+                  className="flex items-center justify-between gap-2 px-3 py-2 rounded-[8px] border cursor-pointer select-none"
+                  style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                >
+                  <div>
+                    <div className="text-[12px] font-medium" style={{ color: 'var(--text-main)' }}>
+                      Automatic Update Checks
+                    </div>
+                    <div className="text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
+                      Check for new signed Sakana releases in the background
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={autoUpdateEnabled}
+                    onChange={(e) => saveUpdatePrefs(e.target.checked, autoUpdateIntervalHours)}
+                  />
+                </label>
+
+                <div
+                  className="flex items-center justify-between gap-2 px-3 py-2 rounded-[8px] border"
+                  style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                >
+                  <div>
+                    <div className="text-[12px] font-medium" style={{ color: 'var(--text-main)' }}>
+                      Check Frequency
+                    </div>
+                    <div className="text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
+                      Interval between background update checks
+                    </div>
+                  </div>
+                  <select
+                    value={autoUpdateIntervalHours}
+                    disabled={!autoUpdateEnabled}
+                    onChange={(e) => saveUpdatePrefs(autoUpdateEnabled, Number(e.target.value))}
+                    className="rounded-[6px] border px-2 py-1 text-[11.5px]"
+                    style={{
+                      backgroundColor: 'var(--bg-card)',
+                      borderColor: 'var(--border-line)',
+                      color: 'var(--text-main)',
+                    }}
+                  >
+                    <option value={1}>Every 1 hour</option>
+                    <option value={6}>Every 6 hours</option>
+                    <option value={24}>Daily (24h)</option>
+                    <option value={168}>Weekly (7d)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div
+                className="rounded-[8px] border px-3 py-2 flex flex-wrap items-center justify-between gap-2 font-mono-tech text-[11px]"
+                style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)', color: 'var(--text-body)' }}
+              >
+                <span>
+                  {updateResult
+                    ? updateResult.error
+                      ? `v${updateResult.currentVersion} · Error: ${updateResult.error}`
+                      : updateResult.available
+                        ? `Update ready: v${updateResult.currentVersion} → v${updateResult.latestVersion ?? 'latest'}`
+                        : `v${updateResult.currentVersion} · Up to date`
+                    : 'Click "Check Now" to verify latest release status.'}
+                </span>
+                {(updateSnoozeUntil > Date.now() || skippedVersion) && (
+                  <button
+                    type="button"
+                    onClick={clearUpdateSnooze}
+                    className="btn-ghost px-2 py-0.5 text-[10.5px] cursor-pointer"
+                  >
+                    {updateSnoozeUntil > Date.now()
+                      ? `Snoozed until ${new Date(updateSnoozeUntil).toLocaleTimeString()} · Resume`
+                      : `Skipped v${skippedVersion} · Resume`}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Context Memory & Auto-Compacting */}
+            <div className="sakana-card rounded-[12px] p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-[14.5px] font-semibold m-0" style={{ color: 'var(--text-main)' }}>
+                    Chat Memory &amp; Auto-Compacting
+                  </h2>
+                  <p className="text-[11.5px] m-0 mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                    Retains full open-thread and Discord memory automatically. Long conversations compact older turns into retained memory instead of dropping them. Use <code>/compact</code> or the header Compact button anytime.
+                  </p>
+                </div>
+                <span className="font-mono-tech text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
+                  {savingCompaction ? 'Saving...' : compactionCfg.autoCompact ? 'Auto-Compact ON' : 'Manual Only'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <label
+                  className="flex items-center justify-between gap-2 px-3 py-2 rounded-[8px] border cursor-pointer select-none"
+                  style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                >
+                  <div>
+                    <div className="text-[12px] font-medium" style={{ color: 'var(--text-main)' }}>
+                      Auto-Compact
+                    </div>
+                    <div className="text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
+                      Compact long threads automatically
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={compactionCfg.autoCompact}
+                    onChange={(e) =>
+                      void handleSaveCompactionConfig({
+                        ...compactionCfg,
+                        autoCompact: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                <div
+                  className="flex items-center justify-between gap-2 px-3 py-2 rounded-[8px] border"
+                  style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                >
+                  <div>
+                    <div className="text-[12px] font-medium" style={{ color: 'var(--text-main)' }}>
+                      Compact After
+                    </div>
+                    <div className="text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
+                      Uncompacted message threshold
+                    </div>
+                  </div>
+                  <select
+                    value={compactionCfg.messageThreshold}
+                    onChange={(e) =>
+                      void handleSaveCompactionConfig({
+                        ...compactionCfg,
+                        messageThreshold: Number(e.target.value),
+                      })
+                    }
+                    className="rounded-[6px] border px-2 py-1 text-[11.5px]"
+                    style={{
+                      backgroundColor: 'var(--bg-card)',
+                      borderColor: 'var(--border-line)',
+                      color: 'var(--text-main)',
+                    }}
+                  >
+                    {[20, 36, 50, 80, 120].map((n) => (
+                      <option key={n} value={n}>
+                        {n} msgs
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div
+                  className="flex items-center justify-between gap-2 px-3 py-2 rounded-[8px] border"
+                  style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
+                >
+                  <div>
+                    <div className="text-[12px] font-medium" style={{ color: 'var(--text-main)' }}>
+                      Keep Verbatim
+                    </div>
+                    <div className="text-[10.5px]" style={{ color: 'var(--text-muted)' }}>
+                      Recent messages kept uncompacted
+                    </div>
+                  </div>
+                  <select
+                    value={compactionCfg.keepRecent}
+                    onChange={(e) =>
+                      void handleSaveCompactionConfig({
+                        ...compactionCfg,
+                        keepRecent: Number(e.target.value),
+                      })
+                    }
+                    className="rounded-[6px] border px-2 py-1 text-[11.5px]"
+                    style={{
+                      backgroundColor: 'var(--bg-card)',
+                      borderColor: 'var(--border-line)',
+                      color: 'var(--text-main)',
+                    }}
+                  >
+                    {[4, 6, 8, 12, 16].map((n) => (
+                      <option key={n} value={n}>
+                        Last {n}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
             </div>
 
             {/* GitHub Integration */}

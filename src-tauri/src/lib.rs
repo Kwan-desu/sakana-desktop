@@ -1,6 +1,7 @@
 pub mod acp_pool;
 pub mod auth;
 pub mod automation;
+pub mod browser;
 pub mod db;
 pub mod discord;
 pub mod git;
@@ -491,7 +492,8 @@ pub fn run() {
                 let discord_state = app_handle.state::<discord::DiscordState>();
                 discord::maybe_auto_start_discord_bot(&discord_state, &db_for_sched, app_handle.clone()).await;
                 let sync_state = app_handle.state::<sync::SyncState>();
-                sync::restart_auto_sync_loop(&sync_state, db_for_sched, app_handle.clone()).await;
+                sync::restart_auto_sync_loop(&sync_state, Arc::clone(&db_for_sched), app_handle.clone()).await;
+                acp_pool::spawn_auto_wake_task(app_handle.clone(), db_for_sched);
             });
             Ok(())
         })
@@ -521,6 +523,13 @@ pub fn run() {
             acp_pool::sleep_session,
             acp_pool::sleep_all_sessions,
             acp_pool::wake_session,
+            browser::browser_open_or_navigate,
+            browser::browser_set_bounds,
+            browser::browser_set_visible,
+            browser::browser_nav_action,
+            browser::browser_eval_js,
+            browser::browser_get_state,
+            browser::browser_close,
             harness::compact_session,
             harness::get_compaction_config,
             harness::update_compaction_config,

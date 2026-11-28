@@ -46,6 +46,15 @@ select:focus:not(:focus-visible) {
   box-shadow: none;
 }
 
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
 .font-mono-tech {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
@@ -401,35 +410,24 @@ select:focus:not(:focus-visible) {
 .syn-cmt { color: var(--syn-cmt); }
 .syn-fn { color: var(--syn-fn); }
 
-/* Effort Level Accents (static gradients — avoids continuous software repaints on WebView2) */
+/* Effort Level Accents (quiet monochrome & restrained single-accent treatment) */
 .effort-high-text {
-  background: linear-gradient(90deg, var(--effort-high), var(--effort-med));
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--accent-blue);
+  font-weight: 500;
 }
 
 .effort-xhigh-text {
-  background: linear-gradient(
-    90deg,
-    var(--effort-xhigh-a),
-    var(--effort-xhigh-b),
-    var(--effort-xhigh-c)
-  );
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--text-main);
+  font-weight: 600;
 }
 
 .effort-xhigh-pill {
-  background-color: var(--effort-xhigh-bg);
-  border: 1px solid var(--effort-xhigh-border);
-  box-shadow: 0 0 10px -2px var(--effort-xhigh-glow);
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
 }
 
 .effort-xhigh-pill:hover {
-  background-color: var(--effort-xhigh-bg);
-  filter: brightness(1.06);
+  background-color: var(--bg-hover);
 }
 
 /* Chat Timeline Scrubber & Jump-to-Turn Animations */

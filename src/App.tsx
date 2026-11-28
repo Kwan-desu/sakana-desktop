@@ -37,6 +37,7 @@ import type {
 import { Sidebar } from './components/Sidebar';
 import { ChatPane } from './components/ChatPane';
 import { RightInspector } from './components/RightInspector';
+import type { NativeBrowserCommand } from './components/NativeBrowserPane';
 import { DashboardView } from './components/DashboardView';
 import { OfficeView } from './components/OfficeView';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -148,6 +149,7 @@ export default function App() {
   );
   const [isResizing, setIsResizing] = useState<'left' | 'right' | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('changes');
+  const [browserCommand, setBrowserCommand] = useState<NativeBrowserCommand | null>(null);
   const [splitView, setSplitView] = useState(false);
   const [splitBridgeEnabled, setSplitBridgeEnabled] = useState(true);
   const peerBridgeHopRef = useRef<number>(0);
@@ -1363,6 +1365,61 @@ export default function App() {
             return prev.filter((id) => id !== sessionId);
           });
         }),
+        tauriApi.onUiControl((evt) => {
+          if (!evt || !evt.kind) return;
+          if (evt.kind === 'show_toast' && evt.message) {
+            showToast(evt.message);
+            return;
+          }
+          if (evt.kind === 'navigate' || evt.kind === 'switch_team' || evt.kind === 'switch_agent') {
+            if (evt.section) setPrimarySection(evt.section);
+            if (evt.dashboardSubtab) {
+              setDashSubtab(evt.dashboardSubtab);
+            }
+            if (evt.inspectorTab) {
+              setInspectorTab(evt.inspectorTab);
+              setRightOpen(true);
+            }
+            if (typeof evt.inspectorOpen === 'boolean') setRightOpen(evt.inspectorOpen);
+            if (typeof evt.sidebarOpen === 'boolean') setLeftOpen(evt.sidebarOpen);
+            if (typeof evt.splitView === 'boolean') setSplitView(evt.splitView);
+            if (evt.sessionId) {
+              setSelectedThreadId(evt.sessionId);
+              setPrimarySection('chat');
+            }
+            if (evt.officeId) {
+              setSelectedOfficeId(evt.officeId);
+            }
+            return;
+          }
+          if (evt.kind === 'browser_navigate' || evt.kind === 'open_browser') {
+            setPrimarySection('chat');
+            setRightOpen(true);
+            setInspectorTab('preview');
+            if (evt.url) {
+              setBrowserCommand({ seq: Date.now(), kind: 'navigate', url: evt.url });
+            }
+            return;
+          }
+          if (evt.kind === 'browser_action' && evt.action) {
+            const act = evt.action as NativeBrowserCommand['kind'];
+            if (['back', 'forward', 'reload', 'hide', 'show', 'close'].includes(act)) {
+              setBrowserCommand({ seq: Date.now(), kind: act });
+            }
+            return;
+          }
+          if (evt.kind === 'browser_eval' && evt.script) {
+            setBrowserCommand({ seq: Date.now(), kind: 'eval', script: evt.script });
+            return;
+          }
+          if (evt.kind === 'wake_session' && evt.sessionId) {
+            void tauriApi.wakeSession(evt.sessionId);
+            return;
+          }
+          if (evt.kind === 'sleep_session' && evt.sessionId) {
+            void tauriApi.sleepSession(evt.sessionId);
+          }
+        }),
         tauriApi.onPeerMessage((payload) => {
           const sp = splitStateRef.current;
           if (!sp.splitView || !sp.splitBridgeEnabled) return;
@@ -2355,6 +2412,8 @@ export default function App() {
             }}
             onToast={showToast}
             requestedFile={requestedFile}
+            browserOverlayBlocked={raceOpen || prOpen || cmdOpen}
+            browserCommand={browserCommand}
           />
           </ErrorBoundary>
         </>

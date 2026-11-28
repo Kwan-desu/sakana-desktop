@@ -10,7 +10,35 @@ export type PermissionMode = 'supervised' | 'auto-edit' | 'yolo';
 
 export type PrimarySection = 'chat' | 'office' | 'dashboard';
 
-export type InspectorTab = 'changes' | 'files' | 'preview' | 'terminal' | 'traces';
+export type InspectorTab = 'changes' | 'files' | 'preview' | 'terminal' | 'traces' | 'team';
+
+export interface BrowserState {
+  open: boolean;
+  visible: boolean;
+  url: string;
+}
+
+export interface BrowserNavigatedEvent {
+  url: string;
+  loading: boolean;
+}
+
+export interface UiControlEvent {
+  kind: string;
+  section?: PrimarySection;
+  dashboardSubtab?: DashboardSubtab;
+  inspectorTab?: InspectorTab;
+  inspectorOpen?: boolean;
+  sidebarOpen?: boolean;
+  splitView?: boolean;
+  sessionId?: string;
+  officeId?: string;
+  staffId?: string;
+  url?: string;
+  action?: string;
+  script?: string;
+  message?: string;
+}
 
 export type DashboardSubtab =
   | 'overview'

@@ -67,8 +67,107 @@ impl Default for AppCustomization {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiControlEvent {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard_subtab: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspector_tab: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspector_open: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidebar_open: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_view: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub office_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub staff_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 fn is_valid_builtin_theme(t: &str) -> bool {
     matches!(t, "paper" | "noir" | "slate" | "sand")
+}
+
+fn is_valid_section(s: &str) -> bool {
+    matches!(s, "chat" | "dashboard" | "office")
+}
+
+fn is_valid_inspector_tab(s: &str) -> bool {
+    matches!(
+        s,
+        "changes" | "files" | "preview" | "terminal" | "traces" | "team"
+    )
+}
+
+fn is_valid_browser_action(s: &str) -> bool {
+    matches!(s, "back" | "forward" | "reload" | "hide" | "show" | "close")
+}
+
+fn sanitize_dashboard_subtab(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn sanitize_browser_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 4096 || trimmed.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("data:")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn get_non_empty_str(val: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = val.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn get_opt_bool(val: &Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        if let Some(b) = val.get(*key).and_then(|v| v.as_bool()) {
+            return Some(b);
+        }
+    }
+    None
 }
 
 fn sanitize_css_var_name(k: &str) -> Option<String> {
@@ -196,53 +295,75 @@ pub fn build_self_control_prompt(db: &Database) -> String {
             .join(", ")
     };
 
+    let teams = db.list_offices().unwrap_or_default();
+    let teams_summary = if teams.is_empty() {
+        "None configured yet".to_string()
+    } else {
+        teams
+            .iter()
+            .take(8)
+            .map(|t| {
+                let members = t
+                    .staff
+                    .iter()
+                    .take(8)
+                    .map(|s| format!("{} [{}] ({})", s.name, s.id, s.role))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("- [{}] {} — {}", t.id, t.name, members)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     format!(
         "# Sakana Desktop Self-Control Capability\n\
-You are running inside **Sakana Desktop** and have live permission to modify Sakana itself (themes, colors, fonts, custom CSS, UI scale) and manage **Daily Routine Automations** (including sending daily Discord messages via webhook or bot channel).\n\n\
+You are running inside **Sakana Desktop** and have live permission to control Sakana itself: UI navigation, layout, Agent Teams, embedded browser, session sleep/wake, toast notifications, appearance (themes, colors, fonts, custom CSS, UI scale), and **Daily Routine Automations**.\n\n\
 Current Sakana state:\n\
 - Base theme: `{theme}` (built-ins: `paper`, `noir`, `slate`, `sand`)\n\
 - Active custom theme: `{custom_name}`\n\
 - Saved custom presets: {presets}\n\
 - Active CSS variable overrides: {override_count}\n\
+- Agent Teams:\n{teams}\n\
 - Existing automations:\n{automations}\n\n\
-## How to apply changes to Sakana\n\
-ONLY when the user asks you to customize Sakana's appearance/settings or create/manage routines/automations, include one or more fenced `sakana-action` JSON blocks in your reply. Sakana executes them automatically the moment your reply finishes. Do NOT emit `sakana-action` blocks for normal coding questions.\n\n\
-### Supported Actions (single JSON object or array of objects inside ```sakana-action ... ```)\n\
-1. Switch built-in theme:\n\
-```sakana-action\n{{\"action\": \"set_theme\", \"theme\": \"noir\"}}\n```\n\
-2. Apply a full custom color theme (and optionally save it as a preset):\n\
-```sakana-action\n{{\"action\": \"apply_custom_theme\", \"name\": \"Cyberpunk Neon\", \"baseTheme\": \"noir\", \"savePreset\": true, \"cssVars\": {{\"--bg-sidebar\": \"#0b0714\", \"--bg-app\": \"#110a1f\", \"--bg-canvas\": \"#140d24\", \"--bg-card\": \"#1c1230\", \"--bg-elevated\": \"#261942\", \"--bg-hover\": \"#322154\", \"--text-main\": \"#f5ecff\", \"--text-body\": \"#c9b8e8\", \"--text-muted\": \"#8f7ab8\", \"--border-line\": \"rgba(232,121,249,0.18)\", \"--accent-blue\": \"#ff2e97\", \"--accent-blue-bg\": \"rgba(255,46,151,0.15)\", \"--btn-solid-bg\": \"#ff2e97\", \"--btn-solid-text\": \"#ffffff\"}}, \"customCss\": \"\"}}\n```\n\
-3. Tweak specific CSS variables without replacing everything:\n\
-```sakana-action\n{{\"action\": \"set_css_vars\", \"cssVars\": {{\"--accent-blue\": \"#10b981\", \"--font-sans\": \"'Inter', sans-serif\"}}}}\n```\n\
-4. Inject custom CSS (for layout, borders, animations, fonts, etc.):\n\
-```sakana-action\n{{\"action\": \"set_custom_css\", \"css\": \"/* css rules */\", \"append\": false}}\n```\n\
-5. Change UI scale (0.85 to 1.25):\n\
-```sakana-action\n{{\"action\": \"set_ui_scale\", \"scale\": 1.05}}\n```\n\
-6. Reset custom appearance back to clean defaults:\n\
-```sakana-action\n{{\"action\": \"reset_appearance\"}}\n```\n\
-7. Create a Daily Routine / Cron or Webhook Automation:\n\
-```sakana-action\n{{\"action\": \"create_automation\", \"name\": \"Daily Standup\", \"kind\": \"cron\", \"schedule\": \"0 9 * * *\", \"prompt\": \"discord:webhook:https://discord.com/api/webhooks/...|Good morning! Time for daily standup.\"}}\n```\n\
-   - Cron schedules use 5-field format in local time (`MIN HOUR DOM MON DOW`, e.g. `0 9 * * *` = daily 9:00 AM, `30 8 * * 1-5` = weekdays 8:30 AM).\n\
-   - Supported automation prompt formats:\n\
-     - `discord:webhook:<URL>|<message>` — sends message directly to a Discord webhook\n\
-     - `discord:channel:<CHANNEL_ID>|<message>` — sends message via Sakana's Discord bot\n\
-     - `discord-ai:webhook:<URL>|<AI prompt>` — runs AI first, then posts result to Discord webhook\n\
-     - `discord-ai:channel:<CHANNEL_ID>|<AI prompt>` — runs AI first, then posts result to Discord channel\n\
-     - `notify:<Title>|<Message>` — triggers a desktop notification\n\
-     - `shell:<command>` — runs a shell command\n\
-     - Or any plain text AI prompt.\n\
-8. Manage automations: `toggle_automation` (`id`, `enabled`), `delete_automation` (`id`), `run_automation` (`id`).\n\n\
+## How to control Sakana\n\
+ONLY when the user asks you to control Sakana's UI, embedded browser, Agent Teams, sessions, appearance, or automations, include one or more fenced `sakana-control` (or legacy `sakana-action`) JSON blocks in your reply. Sakana executes them automatically the moment your reply finishes. Do NOT emit control blocks for normal coding questions.\n\n\
+### Supported Actions (single JSON object or array of objects inside ```sakana-control ... ```)\n\
+1. **UI Navigation & Layout** (`navigate` or `ui_navigate`):\n\
+```sakana-control\n{{\"action\": \"navigate\", \"section\": \"chat\", \"dashboardSubtab\": \"overview\", \"inspectorTab\": \"preview\", \"inspectorOpen\": true, \"sidebarOpen\": true, \"splitView\": false, \"sessionId\": \"...\", \"officeId\": \"...\", \"staffId\": \"...\"}}\n```\n\
+   - All fields are optional: `section` (`chat` | `dashboard`), `dashboardSubtab` (`overview` | `harnesses` | `mcp` | `automations` | `discord` | `remote`), `inspectorTab` (`changes` | `files` | `preview` | `terminal` | `traces` | `team`), `inspectorOpen`, `sidebarOpen`, `splitView`, `sessionId`, `officeId`, `staffId`.\n\
+2. **Quick Shortcuts**:\n\
+   - `switch_team`: `{{\"action\": \"switch_team\", \"officeId\": \"...\", \"staffId\": \"...\"}}` (opens Agent Teams inspector tab & selects team)\n\
+   - `switch_agent`: `{{\"action\": \"switch_agent\", \"staffId\": \"...\", \"officeId\": \"...\"}}` (focuses a specific team agent)\n\
+   - `open_browser`: `{{\"action\": \"open_browser\", \"url\": \"http://localhost:3000\"}}` (`url` optional; opens Browser/Preview inspector tab)\n\
+3. **Embedded Browser Control**:\n\
+   - `browser_navigate`: `{{\"action\": \"browser_navigate\", \"url\": \"http://localhost:5173\"}}`\n\
+   - `browser_action`: `{{\"action\": \"browser_action\", \"browserAction\": \"reload\"}}` (`back` | `forward` | `reload` | `hide` | `show` | `close`; also accepts `command` or `op`)\n\
+   - `browser_eval`: `{{\"action\": \"browser_eval\", \"script\": \"document.title\"}}`\n\
+4. **Session & UI Feedback**:\n\
+   - `wake_session`: `{{\"action\": \"wake_session\", \"sessionId\": \"...\"}}`\n\
+   - `sleep_session`: `{{\"action\": \"sleep_session\", \"sessionId\": \"...\"}}`\n\
+   - `show_toast`: `{{\"action\": \"show_toast\", \"message\": \"Build complete!\"}}`\n\
+5. **Appearance & Themes**:\n\
+   - `set_theme`: `{{\"action\": \"set_theme\", \"theme\": \"noir\"}}` (`paper` | `noir` | `slate` | `sand`)\n\
+   - `apply_custom_theme`: `{{\"action\": \"apply_custom_theme\", \"name\": \"Cyberpunk Neon\", \"baseTheme\": \"noir\", \"savePreset\": true, \"cssVars\": {{...}}, \"customCss\": \"\"}}`\n\
+   - `set_css_vars`: `{{\"action\": \"set_css_vars\", \"cssVars\": {{\"--accent-blue\": \"#10b981\"}}}}`\n\
+   - `set_custom_css`: `{{\"action\": \"set_custom_css\", \"css\": \"/* css */\", \"append\": false}}`\n\
+   - `set_ui_scale`: `{{\"action\": \"set_ui_scale\", \"scale\": 1.05}}` (0.85 to 1.25)\n\
+   - `reset_appearance`: `{{\"action\": \"reset_appearance\"}}`\n\
+6. **Automations**: `create_automation`, `toggle_automation` (`id`, `enabled`), `delete_automation` (`id`), `run_automation` (`id`).\n\n\
 ### Sakana Design Tokens Reference\n\
 `--bg-sidebar`, `--bg-app`, `--bg-canvas`, `--bg-card`, `--bg-elevated`, `--bg-hover`, `--bg-surface`, `--border-line`, `--border-strong`, `--text-main`, `--text-body`, `--text-muted`, `--accent-blue`, `--accent-blue-bg`, `--accent-green`, `--accent-green-bg`, `--accent-yellow`, `--accent-amber`, `--accent-yellow-bg`, `--accent-red`, `--accent-red-bg`, `--accent-discord`, `--accent-discord-bg`, `--btn-solid-bg`, `--btn-solid-text`, `--scrollbar-thumb`, `--syn-kw`, `--syn-str`, `--syn-num`, `--syn-cmt`, `--syn-fn`, `--font-sans`, `--font-mono`.",
         theme = cfg.theme,
         custom_name = cfg.custom_theme_name.as_deref().unwrap_or("None"),
         presets = preset_names,
         override_count = cfg.css_vars.len(),
+        teams = teams_summary,
         automations = auto_summary,
     )
 }
 
-/// Extract all ```sakana-action ... ``` blocks from an assistant response and apply them.
+/// Extract all ```sakana-control ... ``` and ```sakana-action ... ``` blocks from an assistant response and apply them.
 pub async fn extract_and_execute_actions(
     db_arc: &Arc<Mutex<Database>>,
     app: Option<&AppHandle>,
@@ -256,7 +377,7 @@ pub async fn extract_and_execute_actions(
         return Vec::new();
     }
 
-    let Ok(re) = Regex::new(r"(?s)```sakana-action\s*\n(.*?)```") else {
+    let Ok(re) = Regex::new(r"(?s)```sakana-(?:action|control)\s*\n(.*?)```") else {
         return Vec::new();
     };
 
@@ -281,12 +402,25 @@ pub async fn extract_and_execute_actions(
     }
 
     let mut applied: Vec<String> = Vec::new();
+    let mut ui_events: Vec<UiControlEvent> = Vec::new();
     let mut customization_changed = false;
     let mut automations_changed = false;
 
     for action_val in actions {
-        let Some(kind) = action_val.get("action").and_then(|v| v.as_str()) else {
-            continue;
+        let raw_action = action_val.get("action").and_then(|v| v.as_str());
+        let raw_type = action_val
+            .get("type")
+            .or_else(|| action_val.get("kind"))
+            .and_then(|v| v.as_str());
+        let (kind, browser_subaction_override) = match (raw_type, raw_action) {
+            (Some("browser_action"), Some(sub))
+                if is_valid_browser_action(&sub.trim().to_ascii_lowercase()) =>
+            {
+                ("browser_action", Some(sub.trim().to_ascii_lowercase()))
+            }
+            (_, Some(act)) => (act, None),
+            (Some(t), None) => (t, None),
+            (None, None) => continue,
         };
         match kind {
             "set_theme" => {
@@ -522,6 +656,233 @@ pub async fn extract_and_execute_actions(
                     ));
                 }
             }
+            "navigate" | "ui_navigate" => {
+                let section = get_non_empty_str(&action_val, &["section"])
+                    .map(|s| s.to_ascii_lowercase())
+                    .filter(|s| is_valid_section(s));
+                let dashboard_subtab =
+                    get_non_empty_str(&action_val, &["dashboardSubtab", "dashboard_subtab"])
+                        .and_then(|s| sanitize_dashboard_subtab(&s));
+                let inspector_tab =
+                    get_non_empty_str(&action_val, &["inspectorTab", "inspector_tab"])
+                        .map(|s| s.to_ascii_lowercase())
+                        .filter(|s| is_valid_inspector_tab(s));
+                let inspector_open =
+                    get_opt_bool(&action_val, &["inspectorOpen", "inspector_open"]);
+                let sidebar_open = get_opt_bool(&action_val, &["sidebarOpen", "sidebar_open"]);
+                let split_view = get_opt_bool(&action_val, &["splitView", "split_view"]);
+                let session_id = get_non_empty_str(&action_val, &["sessionId", "session_id"]);
+                let office_id = get_non_empty_str(
+                    &action_val,
+                    &["officeId", "office_id", "teamId", "team_id"],
+                );
+                let staff_id = get_non_empty_str(
+                    &action_val,
+                    &["staffId", "staff_id", "agentId", "agent_id"],
+                );
+
+                let has_any = section.is_some()
+                    || dashboard_subtab.is_some()
+                    || inspector_tab.is_some()
+                    || inspector_open.is_some()
+                    || sidebar_open.is_some()
+                    || split_view.is_some()
+                    || session_id.is_some()
+                    || office_id.is_some()
+                    || staff_id.is_some();
+
+                if has_any {
+                    let mut parts = Vec::new();
+                    if let Some(ref s) = section {
+                        parts.push(format!("section={}", s));
+                    }
+                    if let Some(ref d) = dashboard_subtab {
+                        parts.push(format!("dashboard={}", d));
+                    }
+                    if let Some(ref t) = inspector_tab {
+                        parts.push(format!("inspector={}", t));
+                    }
+                    if let Some(ref id) = session_id {
+                        parts.push(format!("session={}", id));
+                    }
+                    if let Some(ref id) = office_id {
+                        parts.push(format!("team={}", id));
+                    }
+                    if let Some(ref id) = staff_id {
+                        parts.push(format!("agent={}", id));
+                    }
+                    if parts.is_empty() {
+                        parts.push("layout updated".to_string());
+                    }
+                    ui_events.push(UiControlEvent {
+                        kind: "navigate".to_string(),
+                        section,
+                        dashboard_subtab,
+                        inspector_tab,
+                        inspector_open,
+                        sidebar_open,
+                        split_view,
+                        session_id,
+                        office_id,
+                        staff_id,
+                        ..Default::default()
+                    });
+                    applied.push(format!("Navigated UI ({})", parts.join(", ")));
+                }
+            }
+            "browser_navigate" => {
+                if let Some(url) = get_non_empty_str(&action_val, &["url"])
+                    .and_then(|u| sanitize_browser_url(&u))
+                {
+                    applied.push(format!("Navigated browser to {}", url));
+                    ui_events.push(UiControlEvent {
+                        kind: "browser_navigate".to_string(),
+                        url: Some(url),
+                        ..Default::default()
+                    });
+                }
+            }
+            "browser_action" => {
+                let op = browser_subaction_override.or_else(|| {
+                    get_non_empty_str(
+                        &action_val,
+                        &[
+                            "browserAction",
+                            "browser_action",
+                            "command",
+                            "op",
+                            "subaction",
+                            "value",
+                        ],
+                    )
+                    .map(|s| s.to_ascii_lowercase())
+                    .filter(|s| is_valid_browser_action(s))
+                });
+                if let Some(op) = op {
+                    applied.push(format!("Browser action: {}", op));
+                    ui_events.push(UiControlEvent {
+                        kind: "browser_action".to_string(),
+                        browser_action: Some(op.clone()),
+                        action: Some(op),
+                        ..Default::default()
+                    });
+                }
+            }
+            "browser_eval" => {
+                if let Some(script) = get_non_empty_str(&action_val, &["script", "code", "js"]) {
+                    if script.len() <= 16_384 {
+                        applied.push("Executed browser script".to_string());
+                        ui_events.push(UiControlEvent {
+                            kind: "browser_eval".to_string(),
+                            script: Some(script),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            "show_toast" => {
+                if let Some(raw_msg) = get_non_empty_str(&action_val, &["message", "text"]) {
+                    let msg: String = raw_msg
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(280)
+                        .collect();
+                    if !msg.is_empty() {
+                        applied.push(format!("Toast: {}", msg));
+                        ui_events.push(UiControlEvent {
+                            kind: "show_toast".to_string(),
+                            message: Some(msg),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            "wake_session" | "sleep_session" => {
+                if let Some(session_id) = get_non_empty_str(&action_val, &["sessionId", "session_id"])
+                {
+                    let verb = if kind == "wake_session" {
+                        "Woke"
+                    } else {
+                        "Slept"
+                    };
+                    applied.push(format!("{} session {}", verb, session_id));
+                    ui_events.push(UiControlEvent {
+                        kind: kind.to_string(),
+                        session_id: Some(session_id),
+                        ..Default::default()
+                    });
+                }
+            }
+            "switch_team" => {
+                let office_id = get_non_empty_str(
+                    &action_val,
+                    &["officeId", "office_id", "teamId", "team_id", "id"],
+                );
+                let staff_id = get_non_empty_str(
+                    &action_val,
+                    &["staffId", "staff_id", "agentId", "agent_id"],
+                );
+                let label = office_id
+                    .as_deref()
+                    .map(|id| format!("Switched to Agent Team {}", id))
+                    .unwrap_or_else(|| "Opened Agent Teams panel".to_string());
+                applied.push(label);
+                ui_events.push(UiControlEvent {
+                    kind: "navigate".to_string(),
+                    section: Some("chat".to_string()),
+                    inspector_tab: Some("team".to_string()),
+                    inspector_open: Some(true),
+                    office_id,
+                    staff_id,
+                    ..Default::default()
+                });
+            }
+            "switch_agent" => {
+                let staff_id = get_non_empty_str(
+                    &action_val,
+                    &["staffId", "staff_id", "agentId", "agent_id", "id"],
+                );
+                let office_id = get_non_empty_str(
+                    &action_val,
+                    &["officeId", "office_id", "teamId", "team_id"],
+                );
+                if let Some(sid) = staff_id {
+                    applied.push(format!("Switched to team agent {}", sid));
+                    ui_events.push(UiControlEvent {
+                        kind: "navigate".to_string(),
+                        section: Some("chat".to_string()),
+                        inspector_tab: Some("team".to_string()),
+                        inspector_open: Some(true),
+                        office_id,
+                        staff_id: Some(sid),
+                        ..Default::default()
+                    });
+                }
+            }
+            "open_browser" => {
+                let url = get_non_empty_str(&action_val, &["url"])
+                    .and_then(|u| sanitize_browser_url(&u));
+                if let Some(u) = url {
+                    applied.push(format!("Opened browser at {}", u));
+                    ui_events.push(UiControlEvent {
+                        kind: "browser_navigate".to_string(),
+                        section: Some("chat".to_string()),
+                        inspector_tab: Some("preview".to_string()),
+                        inspector_open: Some(true),
+                        url: Some(u),
+                        ..Default::default()
+                    });
+                } else {
+                    applied.push("Opened browser preview".to_string());
+                    ui_events.push(UiControlEvent {
+                        kind: "navigate".to_string(),
+                        section: Some("chat".to_string()),
+                        inspector_tab: Some("preview".to_string()),
+                        inspector_open: Some(true),
+                        ..Default::default()
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -549,6 +910,10 @@ pub async fn extract_and_execute_actions(
             db.list_automations().unwrap_or_default()
         };
         crate::platform::emit_app_and_remote(app, "sakana:automations-updated", &items);
+    }
+
+    for ev in &ui_events {
+        crate::platform::emit_app_and_remote(app, "sakana:ui-control", ev);
     }
 
     if !applied.is_empty() {

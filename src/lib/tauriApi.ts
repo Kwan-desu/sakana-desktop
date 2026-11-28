@@ -1074,4 +1074,56 @@ export const tauriApi = {
   onSessionAwakeChanged: (
     handler: (payload: { sessionId: string; awake: boolean }) => void,
   ) => tauriListen<{ sessionId: string; awake: boolean }>('session:awake-changed', handler),
+
+  // Real Native Embedded Browser (Tauri v2 child webview)
+  browserOpenOrNavigate: async (
+    url: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ): Promise<import('../types').BrowserState | null> =>
+    tauriInvoke<import('../types').BrowserState>('browser_open_or_navigate', {
+      url,
+      x,
+      y,
+      width,
+      height,
+    }),
+
+  browserSetBounds: async (
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ): Promise<void> => {
+    await tauriInvoke('browser_set_bounds', { x, y, width, height });
+  },
+
+  browserSetVisible: async (visible: boolean): Promise<void> => {
+    await tauriInvoke('browser_set_visible', { visible });
+  },
+
+  browserNavAction: async (action: 'back' | 'forward' | 'reload'): Promise<void> => {
+    await tauriInvoke('browser_nav_action', { action });
+  },
+
+  browserEvalJs: async (script: string): Promise<void> => {
+    await tauriInvoke('browser_eval_js', { script });
+  },
+
+  browserGetState: async (): Promise<import('../types').BrowserState | null> =>
+    tauriInvoke<import('../types').BrowserState>('browser_get_state'),
+
+  browserClose: async (): Promise<void> => {
+    await tauriInvoke('browser_close');
+  },
+
+  onBrowserNavigated: (
+    handler: (payload: import('../types').BrowserNavigatedEvent) => void,
+  ) => tauriListen<import('../types').BrowserNavigatedEvent>('browser:navigated', handler),
+
+  onUiControl: (
+    handler: (payload: import('../types').UiControlEvent) => void,
+  ) => tauriListen<import('../types').UiControlEvent>('sakana:ui-control', handler),
 };

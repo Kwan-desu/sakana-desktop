@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, Mutex, Semaphore};
 
+use crate::db::Database;
 use crate::harness::{emit_thinking, emit_token, emit_tool, TurnAccumulator};
 use crate::models::{HarnessAccountRow, McpServer, ToolCall};
 use crate::DbState;
@@ -39,8 +40,11 @@ struct AcpWorker {
     dead: bool,
 }
 
+const KEEP_AWAKE_SETTING_KEY: &str = "acp_keep_awake_sessions";
+
 static ACP_POOL: OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<AcpWorker>>>>>> = OnceLock::new();
 static ACP_SPAWN_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static KEEP_AWAKE_SET: OnceLock<Arc<Mutex<HashSet<String>>>> = OnceLock::new();
 
 fn pool() -> &'static Arc<Mutex<HashMap<String, Arc<Mutex<AcpWorker>>>>> {
     ACP_POOL.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
@@ -48,6 +52,63 @@ fn pool() -> &'static Arc<Mutex<HashMap<String, Arc<Mutex<AcpWorker>>>>> {
 
 fn spawn_semaphore() -> &'static Arc<Semaphore> {
     ACP_SPAWN_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1)))
+}
+
+fn keep_awake_set() -> &'static Arc<Mutex<HashSet<String>>> {
+    KEEP_AWAKE_SET.get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
+}
+
+fn load_keep_awake_from_db(db: &Database) -> Vec<String> {
+    let Ok(Some(raw)) = db.get_setting(KEEP_AWAKE_SETTING_KEY) else {
+        return Vec::new();
+    };
+    let Ok(ids) = serde_json::from_str::<Vec<String>>(&raw) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    ids.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+        .collect()
+}
+
+fn save_keep_awake_to_db(db: &Database, set: &HashSet<String>) {
+    let mut ids: Vec<&String> = set.iter().collect();
+    ids.sort();
+    if let Ok(json) = serde_json::to_string(&ids) {
+        if let Err(err) = db.set_setting(KEEP_AWAKE_SETTING_KEY, &json) {
+            eprintln!("[acp_pool] failed to persist {KEEP_AWAKE_SETTING_KEY}: {err}");
+        }
+    }
+}
+
+async fn add_keep_awake(db_arc: &Arc<Mutex<Database>>, session_id: &str) {
+    let snapshot = {
+        let mut set = keep_awake_set().lock().await;
+        if set.insert(session_id.to_string()) {
+            Some(set.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(snapshot) = snapshot {
+        let db = db_arc.lock().await;
+        save_keep_awake_to_db(&db, &snapshot);
+    }
+}
+
+async fn remove_keep_awake(db_arc: Option<&Arc<Mutex<Database>>>, session_id: &str) -> bool {
+    let (removed, snapshot) = {
+        let mut set = keep_awake_set().lock().await;
+        let removed = set.remove(session_id);
+        let snapshot = if removed { Some(set.clone()) } else { None };
+        (removed, snapshot)
+    };
+    if let (Some(snapshot), Some(db_arc)) = (snapshot, db_arc) {
+        let db = db_arc.lock().await;
+        save_keep_awake_to_db(&db, &snapshot);
+    }
+    removed
 }
 
 fn emit_awake(app: Option<&AppHandle>, session_id: &str, awake: bool) {
@@ -668,7 +729,7 @@ pub(crate) async fn run_persistent_agy_turn(
             arc
         } else {
             // Stale or dead worker — evict and respawn cleanly
-            sleep_session_inner(app, session_id).await;
+            evict_worker_inner(app, session_id).await;
             let fresh = tokio::select! {
                 _ = &mut cancel_rx => return Err("Turn cancelled by user".to_string()),
                 res = AcpWorker::spawn_and_init(
@@ -717,7 +778,7 @@ pub(crate) async fn run_persistent_agy_turn(
         let mut w = worker_arc.lock().await;
         if let Err(e) = w.sync_config(model, effort, permission_mode).await {
             drop(w);
-            sleep_session_inner(app, session_id).await;
+            evict_worker_inner(app, session_id).await;
             return Err(e);
         }
         let prompt_to_send = if w.turns_completed == 0 {
@@ -739,41 +800,13 @@ pub(crate) async fn run_persistent_agy_turn(
 
     let is_dead = { worker_arc.lock().await.dead };
     if is_dead {
-        sleep_session_inner(app, session_id).await;
+        evict_worker_inner(app, session_id).await;
     }
 
     res
 }
 
-pub async fn list_awake_sessions_inner() -> Vec<String> {
-    let entries: Vec<(String, Arc<Mutex<AcpWorker>>)> = {
-        let map = pool().lock().await;
-        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
-    let mut alive = Vec::new();
-    let mut dead_ids = Vec::new();
-    for (sid, arc) in entries {
-        if let Ok(mut w) = arc.try_lock() {
-            if w.is_alive() {
-                alive.push(sid);
-            } else {
-                dead_ids.push(sid);
-            }
-        } else {
-            // Currently busy executing a turn -> definitely awake
-            alive.push(sid);
-        }
-    }
-    if !dead_ids.is_empty() {
-        let mut map = pool().lock().await;
-        for sid in dead_ids {
-            map.remove(&sid);
-        }
-    }
-    alive
-}
-
-pub async fn sleep_session_inner(app: Option<&AppHandle>, session_id: &str) -> bool {
+async fn evict_worker_inner(app: Option<&AppHandle>, session_id: &str) -> bool {
     let removed = {
         let mut map = pool().lock().await;
         map.remove(session_id)
@@ -782,11 +815,83 @@ pub async fn sleep_session_inner(app: Option<&AppHandle>, session_id: &str) -> b
         let mut w = arc.lock().await;
         w.dead = true;
         let _ = w.child.kill().await;
+        let keep_awake = { keep_awake_set().lock().await.contains(session_id) };
+        if !keep_awake {
+            emit_awake(app, session_id, false);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+pub async fn list_awake_sessions_inner() -> Vec<String> {
+    let entries: Vec<(String, Arc<Mutex<AcpWorker>>)> = {
+        let map = pool().lock().await;
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let mut awake: HashSet<String> = HashSet::new();
+    let mut dead_ids = Vec::new();
+    for (sid, arc) in entries {
+        if let Ok(mut w) = arc.try_lock() {
+            if w.is_alive() {
+                awake.insert(sid);
+            } else {
+                dead_ids.push(sid);
+            }
+        } else {
+            // Currently busy executing a turn -> definitely awake
+            awake.insert(sid);
+        }
+    }
+    if !dead_ids.is_empty() {
+        let mut map = pool().lock().await;
+        for sid in dead_ids {
+            map.remove(&sid);
+        }
+    }
+    {
+        let keep = keep_awake_set().lock().await;
+        for sid in keep.iter() {
+            awake.insert(sid.clone());
+        }
+    }
+    let mut result: Vec<String> = awake.into_iter().collect();
+    result.sort();
+    result
+}
+
+async fn sleep_session_with_db(
+    app: Option<&AppHandle>,
+    db_arc: Option<&Arc<Mutex<Database>>>,
+    session_id: &str,
+) -> bool {
+    let removed_worker = {
+        let mut map = pool().lock().await;
+        map.remove(session_id)
+    };
+    let had_worker = if let Some(arc) = removed_worker {
+        let mut w = arc.lock().await;
+        w.dead = true;
+        let _ = w.child.kill().await;
+        true
+    } else {
+        false
+    };
+    let removed_keep_awake = remove_keep_awake(db_arc, session_id).await;
+    if had_worker || removed_keep_awake {
         emit_awake(app, session_id, false);
         true
     } else {
         false
     }
+}
+
+pub async fn sleep_session_inner(app: Option<&AppHandle>, session_id: &str) -> bool {
+    let db_arc = app
+        .and_then(|a| a.try_state::<DbState>())
+        .map(|s| Arc::clone(&s.0));
+    sleep_session_with_db(app, db_arc.as_ref(), session_id).await
 }
 
 pub async fn sleep_all_sessions_inner(app: Option<&AppHandle>) -> usize {
@@ -806,7 +911,7 @@ pub async fn sleep_all_sessions_inner(app: Option<&AppHandle>) -> usize {
 
 pub async fn wake_session_inner(
     app: Option<&AppHandle>,
-    db_arc: &Arc<Mutex<crate::db::Database>>,
+    db_arc: &Arc<Mutex<Database>>,
     session_id: &str,
 ) -> Result<bool, String> {
     // Already awake?
@@ -815,6 +920,7 @@ pub async fn wake_session_inner(
         if let Some(arc) = existing {
             let alive = { arc.lock().await.is_alive() };
             if alive {
+                add_keep_awake(db_arc, session_id).await;
                 emit_awake(app, session_id, true);
                 return Ok(true);
             }
@@ -904,8 +1010,125 @@ pub async fn wake_session_inner(
         let mut map = pool().lock().await;
         map.insert(session_id.to_string(), Arc::new(Mutex::new(worker)));
     }
+    add_keep_awake(db_arc, session_id).await;
     emit_awake(app, session_id, true);
     Ok(true)
+}
+
+/// Load persisted `acp_keep_awake_sessions` on startup, populate `KEEP_AWAKE_SET`, emit
+/// `session:awake-changed` (`awake: true`) for valid sessions, then spawn a background task
+/// that waits 1500ms, prunes deleted session IDs from SQLite, and wakes each remaining
+/// session sequentially via `wake_session_inner` (serialized by `ACP_SPAWN_SEMAPHORE`).
+pub fn spawn_auto_wake_task(app: AppHandle, db: Arc<Mutex<Database>>) {
+    let mut preloaded = false;
+    let mut initial_ids: Vec<String> = Vec::new();
+    let mut had_stale = false;
+
+    if let Ok(db_guard) = db.try_lock() {
+        let saved_ids = load_keep_awake_from_db(&db_guard);
+        let mut valid_ids = Vec::new();
+        for sid in saved_ids {
+            match db_guard.get_session(&sid) {
+                Ok(Some(_)) => valid_ids.push(sid),
+                Ok(None) => had_stale = true,
+                Err(_) => valid_ids.push(sid),
+            }
+        }
+        drop(db_guard);
+
+        if let Ok(mut set) = keep_awake_set().try_lock() {
+            for sid in &valid_ids {
+                set.insert(sid.clone());
+            }
+            preloaded = true;
+        }
+        if preloaded {
+            for sid in &valid_ids {
+                emit_awake(Some(&app), sid, true);
+            }
+            initial_ids = valid_ids;
+        }
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let (ids_to_wake, needs_prune) = if preloaded {
+            (initial_ids, had_stale)
+        } else {
+            let (valid_ids, stale) = {
+                let db_guard = db.lock().await;
+                let saved_ids = load_keep_awake_from_db(&db_guard);
+                let mut valid = Vec::new();
+                let mut stale = false;
+                for sid in saved_ids {
+                    match db_guard.get_session(&sid) {
+                        Ok(Some(_)) => valid.push(sid),
+                        Ok(None) => stale = true,
+                        Err(_) => valid.push(sid),
+                    }
+                }
+                (valid, stale)
+            };
+            {
+                let mut set = keep_awake_set().lock().await;
+                for sid in &valid_ids {
+                    set.insert(sid.clone());
+                }
+            }
+            for sid in &valid_ids {
+                emit_awake(Some(&app), sid, true);
+            }
+            (valid_ids, stale)
+        };
+
+        if ids_to_wake.is_empty() && !needs_prune {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Prune deleted session IDs from SQLite and KEEP_AWAKE_SET
+        let (remaining_ids, pruned_ids) = {
+            let db_guard = db.lock().await;
+            let saved_ids = load_keep_awake_from_db(&db_guard);
+            let mut valid = Vec::new();
+            let mut pruned = Vec::new();
+            for sid in saved_ids {
+                match db_guard.get_session(&sid) {
+                    Ok(Some(_)) => valid.push(sid),
+                    Ok(None) => pruned.push(sid),
+                    Err(_) => valid.push(sid),
+                }
+            }
+            if !pruned.is_empty() || needs_prune {
+                let valid_set: HashSet<String> = valid.iter().cloned().collect();
+                save_keep_awake_to_db(&db_guard, &valid_set);
+            }
+            (valid, pruned)
+        };
+
+        if !pruned_ids.is_empty() {
+            {
+                let mut set = keep_awake_set().lock().await;
+                for sid in &pruned_ids {
+                    set.remove(sid);
+                }
+            }
+            for sid in &pruned_ids {
+                emit_awake(Some(&app), sid, false);
+            }
+        }
+
+        // Wake each remaining session sequentially; AcpWorker::spawn_and_init acquires ACP_SPAWN_SEMAPHORE.
+        for sid in remaining_ids {
+            let still_wanted = { keep_awake_set().lock().await.contains(&sid) };
+            if !still_wanted {
+                continue;
+            }
+            if let Err(err) = wake_session_inner(Some(&app), &db, &sid).await {
+                eprintln!("[acp_pool] auto-wake failed for session '{sid}': {err}");
+            }
+        }
+    });
 }
 
 #[tauri::command]
@@ -914,13 +1137,36 @@ pub async fn list_awake_sessions() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-pub async fn sleep_session(app: AppHandle, session_id: String) -> Result<bool, String> {
-    Ok(sleep_session_inner(Some(&app), &session_id).await)
+pub async fn sleep_session(
+    app: AppHandle,
+    db_state: State<'_, DbState>,
+    session_id: String,
+) -> Result<bool, String> {
+    Ok(sleep_session_with_db(Some(&app), Some(&db_state.0), &session_id).await)
 }
 
 #[tauri::command]
-pub async fn sleep_all_sessions(app: AppHandle) -> Result<usize, String> {
-    Ok(sleep_all_sessions_inner(Some(&app)).await)
+pub async fn sleep_all_sessions(
+    app: AppHandle,
+    db_state: State<'_, DbState>,
+) -> Result<usize, String> {
+    let kept_ids: Vec<String> = {
+        let mut set = keep_awake_set().lock().await;
+        if set.is_empty() {
+            Vec::new()
+        } else {
+            set.drain().collect()
+        }
+    };
+    if !kept_ids.is_empty() {
+        let db = db_state.0.lock().await;
+        save_keep_awake_to_db(&db, &HashSet::new());
+    }
+    let pool_count = sleep_all_sessions_inner(Some(&app)).await;
+    for sid in &kept_ids {
+        emit_awake(Some(&app), sid, false);
+    }
+    Ok(pool_count.max(kept_ids.len()))
 }
 
 #[tauri::command]
@@ -952,5 +1198,36 @@ mod tests {
         assert_eq!(sem.available_permits(), before - 1);
         drop(permit);
         assert_eq!(sem.available_permits(), before);
+    }
+
+    #[tokio::test]
+    async fn keep_awake_persists_and_unions_with_list_awake_sessions() {
+        let tmp_dir = std::env::temp_dir().join(format!("sakana-acp-test-{}", uuid::Uuid::new_v4()));
+        let db = Database::open_in_dir(&tmp_dir).expect("open temp db");
+        let db_arc = Arc::new(Mutex::new(db));
+        let test_sid = format!("test-keep-awake-{}", uuid::Uuid::new_v4());
+
+        add_keep_awake(&db_arc, &test_sid).await;
+        {
+            let db_guard = db_arc.lock().await;
+            let saved = load_keep_awake_from_db(&db_guard);
+            assert!(saved.contains(&test_sid));
+        }
+
+        let awake = list_awake_sessions_inner().await;
+        assert!(awake.contains(&test_sid));
+
+        let removed = remove_keep_awake(Some(&db_arc), &test_sid).await;
+        assert!(removed);
+        {
+            let db_guard = db_arc.lock().await;
+            let saved = load_keep_awake_from_db(&db_guard);
+            assert!(!saved.contains(&test_sid));
+        }
+
+        let awake_after = list_awake_sessions_inner().await;
+        assert!(!awake_after.contains(&test_sid));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

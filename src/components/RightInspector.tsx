@@ -41,6 +41,7 @@ import { HarnessIcon } from './HarnessBadge';
 import { CodeMirrorEditor } from './CodeMirrorEditor';
 import { XtermTerminal } from './XtermTerminal';
 import { SimpleMarkdown } from './ChatPane';
+import { NativeBrowserPane, type NativeBrowserCommand } from './NativeBrowserPane';
 
 interface RightInspectorProps {
   open: boolean;
@@ -79,6 +80,8 @@ interface RightInspectorProps {
   threads?: Thread[];
   onSelectThread?: (id: string) => void;
   requestedFile?: { path: string; seq: number } | null;
+  browserOverlayBlocked?: boolean;
+  browserCommand?: NativeBrowserCommand | null;
 }
 
 interface FileTreeNode {
@@ -249,6 +252,8 @@ export function RightInspector({
   threads = [],
   onSelectThread,
   requestedFile,
+  browserOverlayBlocked = false,
+  browserCommand = null,
 }: RightInspectorProps) {
   const effectiveCwd =
     thread.worktreePath && thread.worktreePath !== '.'
@@ -1724,159 +1729,15 @@ export function RightInspector({
           </div>
         )}
 
-        {/* 3. PREVIEW + DESIGN MODE */}
+        {/* 3. REAL NATIVE EMBEDDED BROWSER */}
         {!showLauncher && activeTab === 'preview' && (
-          <div className="flex flex-col h-full">
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                const raw = previewInput.trim() || 'http://localhost:5173';
-                const normalized = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) ? raw : `http://${raw}`;
-                if (!/^https?:\/\//i.test(normalized)) {
-                  onToast('Preview URL must use http:// or https://');
-                  return;
-                }
-                setPreviewInput(normalized);
-                setPreviewUrl(normalized);
-                setPreviewKey((k) => k + 1);
-              }}
-              className="p-2.5 border-b flex items-center gap-2 shrink-0"
-              style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-card)' }}
-            >
-              <button
-                type="button"
-                onClick={() => {
-                  setPreviewKey((k) => k + 1);
-                  onToast('Reloaded preview');
-                }}
-                className="btn-ghost p-1.5 cursor-pointer"
-                title="Reload"
-                aria-label="Reload preview"
-              >
-                <ArrowClockwise size={13} />
-              </button>
-              <input
-                value={previewInput}
-                onChange={(e) => setPreviewInput(e.target.value)}
-                className="flex-1 rounded-[6px] border px-2.5 py-1 font-mono-tech text-[11px] focus:outline-none"
-                style={{
-                  backgroundColor: 'var(--bg-app)',
-                  borderColor: 'var(--border-line)',
-                  color: 'var(--text-main)',
-                }}
-              />
-              <div
-                className="hidden sm:flex items-center p-0.5 rounded-[6px] border"
-                style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-app)' }}
-              >
-                <button
-                  type="button"
-                  onClick={() => setViewport('desktop')}
-                  className="p-1 rounded-[4px] cursor-pointer"
-                  style={viewport === 'desktop' ? { backgroundColor: 'var(--bg-card)' } : undefined}
-                  title="Desktop"
-                  aria-label="Desktop viewport"
-                >
-                  <Desktop size={12} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setViewport('tablet')}
-                  className="p-1 rounded-[4px] cursor-pointer"
-                  style={viewport === 'tablet' ? { backgroundColor: 'var(--bg-card)' } : undefined}
-                  title="Tablet"
-                  aria-label="Tablet viewport"
-                >
-                  <DeviceTablet size={12} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setViewport('mobile')}
-                  className="p-1 rounded-[4px] cursor-pointer"
-                  style={viewport === 'mobile' ? { backgroundColor: 'var(--bg-card)' } : undefined}
-                  title="Mobile"
-                  aria-label="Mobile viewport"
-                >
-                  <DeviceMobile size={12} />
-                </button>
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setDesignMode((v) => !v);
-                  setHoveredEl(null);
-                }}
-                className="px-2.5 py-1 rounded-[6px] border text-[11px] font-medium inline-flex items-center gap-1.5 cursor-pointer shrink-0"
-                style={
-                  designMode
-                    ? {
-                        backgroundColor: 'var(--accent-blue)',
-                        borderColor: 'var(--accent-blue)',
-                        color: '#FFFFFF',
-                      }
-                    : {
-                        backgroundColor: 'var(--bg-elevated)',
-                        borderColor: 'var(--border-line)',
-                        color: 'var(--text-main)',
-                      }
-                }
-              >
-                <Crosshair size={12} />
-                <span>Design Mode</span>
-              </button>
-            </form>
-
-            {designMode && (
-              <div
-                className="px-3 py-1.5 border-b text-[11px] font-mono-tech flex items-center justify-between gap-2 shrink-0"
-                style={{
-                  borderColor: 'var(--border-line)',
-                  backgroundColor: 'var(--accent-blue-bg)',
-                  color: 'var(--accent-blue)',
-                }}
-              >
-                <span className="truncate">
-                  {hoveredEl
-                    ? `<${hoveredEl.tag}> .${hoveredEl.cls} · ${hoveredEl.size}`
-                    : 'Hover & click any same-origin element to attach DOM/CSS to chat'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onAttachChip({
-                      id: `dm-${Date.now()}`,
-                      kind: 'design-element',
-                      label: `Preview (${viewport}) ${previewUrl}`,
-                      payload: `Inspect preview viewport=${viewport} url=${previewUrl}`,
-                    });
-                    setDesignMode(false);
-                  }}
-                  className="underline shrink-0 cursor-pointer"
-                >
-                  Attach Viewport
-                </button>
-              </div>
-            )}
-
-            <div className="flex-1 min-h-0 overflow-auto p-3 flex justify-center items-stretch">
-              <div
-                className="rounded-[10px] border overflow-hidden transition-all w-full h-full bg-white"
-                style={{
-                  borderColor: 'var(--border-line)',
-                  maxWidth:
-                    viewport === 'mobile' ? '375px' : viewport === 'tablet' ? '480px' : '100%',
-                }}
-              >
-                <iframe
-                  key={previewKey}
-                  ref={iframeRef}
-                  src={previewUrl}
-                  title="Sakana Live Preview"
-                  className="w-full h-full border-0"
-                />
-              </div>
-            </div>
-          </div>
+          <NativeBrowserPane
+            visible={open && !showLauncher && activeTab === 'preview'}
+            overlayBlocked={browserOverlayBlocked}
+            initialUrl={previewUrl}
+            command={browserCommand}
+            onToast={onToast}
+          />
         )}
 
         {/* 4. TERMINAL (REAL XTERM.JS + PTY + NATURAL LANGUAGE ASSIST) */}

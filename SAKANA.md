@@ -69,10 +69,11 @@ Place project-only skills in any of these folders inside `<project_cwd>`:
 
 ---
 
-## 4. Cross-Harness Subagent Orchestration
+## 4. Agent Teams & Cross-Harness Orchestration
 
-You can delegate or cross-check work on another installed harness/model inline:
+Sakana supports multi-agent **Agent Teams** (accessible in the `team` inspector tab alongside chat) as well as inline cross-harness delegation:
 
+- **Agent Teams**: Coordinate a lead agent and specialized team agents (`officeId` / `staffId`) with isolated git worktrees, live delegation graphs, and per-agent chat sessions. Switch directly into a team or agent using `sakana-control` shortcuts (`switch_team`, `switch_agent`).
 - **Verify output on another model**: `/verify <target> <what to check>`
   - Example: `/verify claude check backend/auth.py for race conditions`
 - **Delegate a subtask**: `/delegate <target> <subtask>`
@@ -82,7 +83,50 @@ You can delegate or cross-check work on another installed harness/model inline:
 
 ---
 
-## 5. Utilizing Sakana Features & Local API
+## 5. Sakana Desktop Self-Control (`sakana-control`)
+
+When the user asks you to control Sakana's UI, embedded browser, Agent Teams, sessions, appearance, or automations, emit one or more fenced ```` ```sakana-control ```` JSON blocks (single object or array; legacy ```` ```sakana-action ```` blocks remain 100% supported). Sakana executes them automatically when your turn completes and broadcasts live UI updates via the `sakana:ui-control` event. Do not emit control blocks for normal coding questions.
+
+### UI Navigation, Agent Teams & Layout
+| Action | Key Fields | Effect |
+|---|---|---|
+| `navigate` / `ui_navigate` | `section` (`chat` \| `dashboard`), `dashboardSubtab` (`overview` \| `harnesses` \| `mcp` \| `automations` \| `discord` \| `remote`), `inspectorTab` (`changes` \| `files` \| `preview` \| `terminal` \| `traces` \| `team`), `inspectorOpen`, `sidebarOpen`, `splitView`, `sessionId`, `officeId`, `staffId` | Updates Sakana navigation, panels, split view, or active session/team/agent (all fields optional) |
+| `switch_team` | `officeId` (optional), `staffId` (optional) | Opens the Agent Teams inspector tab (`team`) and selects the target team |
+| `switch_agent` | `staffId`, `officeId` (optional) | Opens the Agent Teams inspector tab and focuses the target team agent |
+| `open_browser` | `url` (optional) | Opens the Browser/Preview inspector tab and optionally navigates to `url` |
+
+### Embedded Browser, Sessions & Feedback
+| Action | Key Fields | Effect |
+|---|---|---|
+| `browser_navigate` | `url` | Navigates the embedded browser to `url` |
+| `browser_action` | `browserAction` (`back` \| `forward` \| `reload` \| `hide` \| `show` \| `close`) | Controls embedded browser navigation/visibility (also accepts `command` or `op`) |
+| `browser_eval` | `script` | Evaluates JavaScript inside the embedded browser |
+| `wake_session` | `sessionId` | Wakes a sleeping session |
+| `sleep_session` | `sessionId` | Puts a session to sleep to free resources |
+| `show_toast` | `message` | Displays a toast notification in Sakana Desktop |
+
+### Appearance & Automations
+| Action | Key Fields | Effect |
+|---|---|---|
+| `set_theme` | `theme` (`paper` \| `noir` \| `slate` \| `sand`) | Switches built-in theme |
+| `apply_custom_theme` | `name`, `baseTheme`, `savePreset`, `cssVars`, `customCss` | Applies and optionally saves a custom theme preset |
+| `set_css_vars` | `cssVars` | Updates specific Sakana CSS design tokens |
+| `set_custom_css` | `css`, `append` | Replaces or appends custom CSS rules |
+| `set_ui_scale` | `scale` (`0.85`–`1.25`) | Adjusts UI zoom scale |
+| `reset_appearance` | — | Resets custom theme, CSS overrides, and UI scale to defaults |
+| `toggle_automation` / `delete_automation` | `id`, `enabled` (for toggle) | Enables, pauses, or deletes a saved automation (`create_automation` and `run_automation` are guarded for manual confirmation) |
+
+### Example (`sakana-control`)
+```sakana-control
+[
+  {"action": "open_browser", "url": "http://localhost:5173"},
+  {"action": "show_toast", "message": "Opened live dev preview"}
+]
+```
+
+---
+
+## 6. Utilizing Sakana Features & Local API
 
 When automating or extending Sakana from inside a session:
 
@@ -97,7 +141,7 @@ When automating or extending Sakana from inside a session:
 
 ---
 
-## 6. Inline Interactive Visuals & Images (Chat Canvas)
+## 7. Inline Interactive Visuals & Images (Chat Canvas)
 
 - When the user asks to **visualize data, build a dashboard, show a class/schedule/kanban/chart, or render an interactive UI** (without explicitly asking to create a file on disk), output a self-contained ```` ```sakana-ui ```` fenced block (HTML + inline `<style>` + optional `<script>` + inline SVG). Sakana renders it live inside an auto-resizing sandboxed card in the chat feed with **Preview / Source / Expand / Save / Copy** controls.
 - Use host CSS variables (`var(--bg-app)`, `var(--bg-card)`, `var(--bg-elevated)`, `var(--text-main)`, `var(--text-body)`, `var(--text-muted)`, `var(--border-line)`) so inline widgets automatically adapt to Sakana's Dark and Light themes.
@@ -105,7 +149,7 @@ When automating or extending Sakana from inside a session:
 
 ---
 
-## 7. Project-Specific Instructions
+## 8. Project-Specific Instructions
 
 - To add custom instructions for a single project, create `<project_cwd>/SAKANA.md`. Sakana loads both the global `SAKANA.md` and `<project_cwd>/SAKANA.md` automatically at the start of every new session.
 - Keep secrets strictly in `.env` (never hardcode API keys or Discord tokens into code or markdown files).

@@ -1220,7 +1220,32 @@ export default function App() {
             .then((state) => {
               if (!state) return;
               if (state.projects) setProjects(state.projects);
-              if (state.sessions) setThreads(state.sessions);
+              if (state.sessions) {
+                setThreads((prev) => {
+                  const prevById = new Map(prev.map((t) => [t.id, t]));
+                  return state.sessions.map((s) => {
+                    const existing = prevById.get(s.id);
+                    if (!existing) return s;
+                    // Preserve any live-streamed assistant message (thinking/tools/tokens)
+                    // that arrived before the bootstrap snapshot resolved.
+                    const dbIds = new Set(s.messages.map((m) => m.id));
+                    const inFlight = existing.messages.filter(
+                      (m) => m.role === 'assistant' && !dbIds.has(m.id),
+                    );
+                    if (inFlight.length === 0) {
+                      return {
+                        ...s,
+                        status: existing.status === 'RUNNING' ? 'RUNNING' : s.status,
+                      };
+                    }
+                    return {
+                      ...s,
+                      status: 'RUNNING',
+                      messages: [...s.messages, ...inFlight],
+                    };
+                  });
+                });
+              }
             })
             .catch(() => {});
           showToast(`Discord prompt from ${payload.author} in #${payload.channel}`);
@@ -1751,6 +1776,87 @@ export default function App() {
     }
   };
 
+  const handleCreateAutomation = async (
+    name: string,
+    kind: 'cron' | 'webhook',
+    schedule: string,
+    prompt: string,
+  ) => {
+    if (isTauriRuntime()) {
+      try {
+        const created = await tauriApi.createAutomation(name, kind, schedule, prompt);
+        if (created) setAutomations((prev) => [created, ...prev]);
+        showToast(`Created automation ${name}`);
+      } catch (err) {
+        showToast(`Create automation failed: ${String(err)}`);
+      }
+      return;
+    }
+    setAutomations((prev) => [
+      {
+        id: `auto-${Date.now()}`,
+        name,
+        kind,
+        schedule,
+        prompt,
+        enabled: true,
+        lastRunStatus: 'OK',
+        history: [],
+      },
+      ...prev,
+    ]);
+    showToast(`Created automation ${name}`);
+  };
+
+  const handleToggleAutomation = async (id: string, enabled: boolean) => {
+    if (isTauriRuntime()) {
+      try {
+        const updated = await tauriApi.toggleAutomation(id, enabled);
+        setAutomations((prev) =>
+          prev.map((a) => (a.id === id ? updated ?? { ...a, enabled } : a)),
+        );
+      } catch (err) {
+        showToast(`Toggle automation failed: ${String(err)}`);
+      }
+      return;
+    }
+    setAutomations((prev) => prev.map((a) => (a.id === id ? { ...a, enabled } : a)));
+  };
+
+  const handleRunAutomation = async (id: string) => {
+    if (isTauriRuntime()) {
+      try {
+        const updated = await tauriApi.runAutomationNow(id);
+        if (updated) {
+          setAutomations((prev) => prev.map((a) => (a.id === id ? updated : a)));
+        }
+        showToast('Automation executed');
+      } catch (err) {
+        showToast(`Automation run failed: ${String(err)}`);
+      }
+      return;
+    }
+    setAutomations((prev) =>
+      prev.map((a) =>
+        a.id === id
+          ? {
+              ...a,
+              history: [
+                {
+                  ts: 'Just now',
+                  status: 'OK',
+                  durationMs: 1120,
+                  summary: 'Manual trigger completed.',
+                },
+                ...a.history,
+              ],
+            }
+          : a,
+      ),
+    );
+    showToast('Automation executed');
+  };
+
   return (
     <div className={`h-[100dvh] w-screen flex overflow-hidden ${isResizing ? 'is-resizing' : ''}`}>
       <ErrorBoundary paneName="Sidebar">
@@ -1786,6 +1892,10 @@ export default function App() {
           setDashSubtab(tab);
           setPrimarySection('dashboard');
         }}
+        automations={automations}
+        onCreateAutomation={handleCreateAutomation}
+        onToggleAutomation={handleToggleAutomation}
+        onRunAutomation={handleRunAutomation}
         quotas={quotas}
         onRefreshQuotas={() => void refreshQuotas(true)}
         remoteHosts={remoteHosts}
@@ -2288,53 +2398,8 @@ export default function App() {
           onRefreshSkills={() => void refreshSkills()}
           automations={automations}
           onRefreshAutomations={() => void refreshAutomations()}
-          onCreateAutomation={async (name, kind, schedule, prompt) => {
-            if (isTauriRuntime()) {
-              try {
-                const created = await tauriApi.createAutomation(
-                  name,
-                  kind,
-                  schedule,
-                  prompt,
-                );
-                if (created) setAutomations((prev) => [created, ...prev]);
-                showToast(`Created automation ${name}`);
-              } catch (err) {
-                showToast(`Create automation failed: ${String(err)}`);
-              }
-              return;
-            }
-            setAutomations((prev) => [
-              {
-                id: `auto-${Date.now()}`,
-                name,
-                kind,
-                schedule,
-                prompt,
-                enabled: true,
-                lastRunStatus: 'OK',
-                history: [],
-              },
-              ...prev,
-            ]);
-            showToast(`Created automation ${name}`);
-          }}
-          onToggleAutomation={async (id, enabled) => {
-            if (isTauriRuntime()) {
-              try {
-                const updated = await tauriApi.toggleAutomation(id, enabled);
-                setAutomations((prev) =>
-                  prev.map((a) => (a.id === id ? updated ?? { ...a, enabled } : a)),
-                );
-              } catch (err) {
-                showToast(`Toggle automation failed: ${String(err)}`);
-              }
-              return;
-            }
-            setAutomations((prev) =>
-              prev.map((a) => (a.id === id ? { ...a, enabled } : a)),
-            );
-          }}
+          onCreateAutomation={handleCreateAutomation}
+          onToggleAutomation={handleToggleAutomation}
           onDeleteAutomation={async (id) => {
             if (isTauriRuntime()) {
               try {
@@ -2349,41 +2414,7 @@ export default function App() {
             setAutomations((prev) => prev.filter((a) => a.id !== id));
             showToast('Deleted automation');
           }}
-          onRunAutomation={async (id) => {
-            if (isTauriRuntime()) {
-              try {
-                const updated = await tauriApi.runAutomationNow(id);
-                if (updated) {
-                  setAutomations((prev) =>
-                    prev.map((a) => (a.id === id ? updated : a)),
-                  );
-                }
-                showToast('Automation executed');
-              } catch (err) {
-                showToast(`Automation run failed: ${String(err)}`);
-              }
-              return;
-            }
-            setAutomations((prev) =>
-              prev.map((a) =>
-                a.id === id
-                  ? {
-                      ...a,
-                      history: [
-                        {
-                          ts: 'Just now',
-                          status: 'OK',
-                          durationMs: 1120,
-                          summary: 'Manual trigger completed.',
-                        },
-                        ...a.history,
-                      ],
-                    }
-                  : a,
-              ),
-            );
-            showToast('Automation executed');
-          }}
+          onRunAutomation={handleRunAutomation}
           discordStatus={discordStatus}
           onStartDiscordBot={async (token) => {
             if (isTauriRuntime()) {

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  BellRinging,
   Buildings,
   CaretDown,
   CaretRight,
@@ -18,6 +19,7 @@ import {
   ListChecks,
   MagnifyingGlass,
   PencilSimple,
+  Play,
   Plugs,
   Plus,
   SidebarSimple,
@@ -26,6 +28,7 @@ import {
   X,
 } from '@phosphor-icons/react';
 import type {
+  AutomationItem,
   DashboardSubtab,
   HarnessId,
   Office,
@@ -73,6 +76,15 @@ interface SidebarProps {
   onOpenGitHubClone?: () => void;
   dashSubtab: DashboardSubtab;
   onSelectDashSubtab: (tab: DashboardSubtab) => void;
+  automations?: AutomationItem[];
+  onCreateAutomation?: (
+    name: string,
+    kind: 'cron' | 'webhook',
+    schedule: string,
+    prompt: string,
+  ) => Promise<void> | void;
+  onToggleAutomation?: (id: string, enabled: boolean) => Promise<void> | void;
+  onRunAutomation?: (id: string) => Promise<void> | void;
   quotas: QuotaAccount[];
   onRefreshQuotas?: () => void;
   remoteHosts: RemoteHost[];
@@ -111,6 +123,10 @@ export function Sidebar({
   onOpenGitHubClone,
   dashSubtab,
   onSelectDashSubtab,
+  automations = [],
+  onCreateAutomation,
+  onToggleAutomation,
+  onRunAutomation,
   quotas,
   onRefreshQuotas,
   remoteHosts,
@@ -131,6 +147,12 @@ export function Sidebar({
   const [usageOpen, setUsageOpen] = useState(false);
   const [usageDetailed, setUsageDetailed] = useState(true);
   const [addingProject, setAddingProject] = useState(false);
+  const [automationsExpanded, setAutomationsExpanded] = useState(true);
+  const [addingQuickAuto, setAddingQuickAuto] = useState(false);
+  const [quickAutoName, setQuickAutoName] = useState('');
+  const [quickAutoSchedule, setQuickAutoSchedule] = useState('0 9 * * *');
+  const [quickAutoPrompt, setQuickAutoPrompt] = useState('');
+  const [runningAutoId, setRunningAutoId] = useState<string | null>(null);
   const [newProjName, setNewProjName] = useState('');
   const [newProjCwd, setNewProjCwd] = useState('');
   const [newProjRuntime, setNewProjRuntime] = useState<'native' | 'wsl'>('native');
@@ -507,10 +529,12 @@ export function Sidebar({
     if (t.status === 'DONE' && t.unreadDone) {
       return (
         <span
-          className="h-2 w-2 rounded-full shrink-0"
-          style={{ backgroundColor: 'var(--accent-green)' }}
-          title="Completed"
-        />
+          className="inline-flex items-center justify-center shrink-0"
+          style={{ color: 'var(--accent-green)' }}
+          title="Task done"
+        >
+          <BellRinging size={12} weight="fill" />
+        </span>
       );
     }
     return <span className="h-1.5 w-1.5 rounded-full shrink-0 opacity-30" style={{ backgroundColor: 'var(--text-muted)' }} />;
@@ -1287,9 +1311,23 @@ export function Sidebar({
                                         </span>
                                       )}
                                     </span>
-                                    <span className="font-mono-tech text-[10px] shrink-0 group-hover:opacity-0 transition-opacity" style={{ color: 'var(--text-muted)' }}>
-                                      {t.timeAgo}
-                                    </span>
+                                    {t.status === 'DONE' && t.unreadDone ? (
+                                      <span
+                                        className="inline-flex items-center gap-1 font-mono-tech text-[9.5px] px-1.5 py-0.5 rounded-[5px] shrink-0 group-hover:opacity-0 transition-opacity"
+                                        style={{
+                                          backgroundColor: 'var(--accent-green-bg)',
+                                          color: 'var(--accent-green)',
+                                        }}
+                                        title="Task done"
+                                      >
+                                        <BellRinging size={10} weight="fill" />
+                                        <span>Done</span>
+                                      </span>
+                                    ) : (
+                                      <span className="font-mono-tech text-[10px] shrink-0 group-hover:opacity-0 transition-opacity" style={{ color: 'var(--text-muted)' }}>
+                                        {t.timeAgo}
+                                      </span>
+                                    )}
                                   </div>
 
                                   <div className="flex items-center justify-between gap-2 pl-3.5">

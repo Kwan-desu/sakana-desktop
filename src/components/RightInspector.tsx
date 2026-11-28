@@ -398,7 +398,14 @@ export function RightInspector({
       const list = await tauriApi.listWorkspaceFiles(effectiveCwd, wslDistro);
       if (list) {
         setWorkspacePaths(list);
-        if ((!selectedFilePathRef.current || !list.includes(selectedFilePathRef.current)) && list[0]) {
+        const curPath = selectedFilePathRef.current;
+        const isExternalPath =
+          !!curPath &&
+          (curPath.startsWith('/') ||
+            curPath.startsWith('~/') ||
+            curPath.startsWith('..') ||
+            /^[a-zA-Z]:[\/]/.test(curPath));
+        if ((!curPath || (!isExternalPath && !list.includes(curPath))) && list[0]) {
           setSelectedFilePath(list[0]);
         }
       }
@@ -416,11 +423,15 @@ export function RightInspector({
   // Open file requested from chat links or tool calls
   useEffect(() => {
     if (!requestedFile?.path) return;
-    const raw = requestedFile.path.trim().replace(/^\.[\/]/, '').replace(/\\/g, '/');
+    const raw = requestedFile.path
+      .trim()
+      .replace(/^file:\/\//i, '')
+      .replace(/^\.[\/]/, '')
+      .replace(/\\/g, '/');
     const withoutLine = raw.replace(/:\d+(?::\d+)?$/, '');
     const normalizedCwd = effectiveCwd.replace(/\\/g, '/').replace(/\/+$/, '');
     const rel =
-      normalizedCwd && withoutLine.toLowerCase().startsWith(normalizedCwd.toLowerCase() + '/')
+      normalizedCwd && withoutLine.startsWith(normalizedCwd + '/')
         ? withoutLine.slice(normalizedCwd.length + 1)
         : withoutLine;
     setSelectedFilePath(rel);

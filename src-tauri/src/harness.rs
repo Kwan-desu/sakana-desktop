@@ -3243,99 +3243,56 @@ pub async fn run_one_shot_prompt_with_opts(
         session.permission_mode.as_str()
     };
 
-    let reply_text = if let Some(ref distro) = proj_wsl.filter(|_| effective_harness != "sakana") {
-        let escaped_prompt = crate::platform::shell_escape_single(&full_prompt_with_history);
-        let mut wsl_mcp_setup: Option<String> = None;
-        let mut wsl_mcp_path: Option<String> = None;
-        if effective_harness == "claude-code" {
-            if let Some(mcp_cfg) = build_mcp_config_json(&enabled_mcp_servers) {
-                if let Ok(json_str) = serde_json::to_string_pretty(&mcp_cfg) {
-                    let tmp_path = format!("/tmp/sakana-mcp-oneshot-{}.json", Uuid::new_v4());
-                    let escaped_json = crate::platform::shell_escape_single(&json_str);
-                    let escaped_path = crate::platform::shell_escape_single(&tmp_path);
-                    wsl_mcp_setup = Some(format!(
-                        "printf '%s' {} > {} && trap 'rm -f {}' EXIT",
-                        escaped_json, escaped_path, escaped_path
-                    ));
-                    wsl_mcp_path = Some(tmp_path);
-                }
-            }
-        }
-        let mut cli_cmd = match effective_harness.as_str() {
-            "claude-code" => {
-                let mut parts = vec!["claude".to_string(), "-p".to_string(), escaped_prompt];
-                if !effective_model.is_empty() {
-                    parts.push("--model".to_string());
-                    parts.push(crate::platform::shell_escape_single(&effective_model));
-                }
-                for flag in build_permission_args("claude-code", permission_mode) {
-                    parts.push(flag.to_string());
-                }
-                if let Some(ref mcp_path) = wsl_mcp_path {
-                    parts.push("--mcp-config".to_string());
-                    parts.push(crate::platform::shell_escape_single(mcp_path));
-                }
-                parts.join(" ")
-            }
-            "agy-cli" => {
-                let (resolved_model, resolved_effort) =
-                    resolve_agy_model_and_effort_with_db(&db, &effective_model, &effective_effort)
-                        .await;
-                let mut parts = vec![
-                    "$(command -v agy-cli || command -v agy || echo agy)".to_string(),
-                    "-p".to_string(),
-                    escaped_prompt,
-                ];
-                if let Some(m) = resolved_model {
-                    parts.push("--model".to_string());
-                    parts.push(crate::platform::shell_escape_single(&m));
-                }
-                if let Some(e) = resolved_effort {
-                    parts.push("--effort".to_string());
-                    parts.push(crate::platform::shell_escape_single(&e));
-                }
-                for flag in build_permission_args("agy-cli", permission_mode) {
-                    parts.push(flag.to_string());
-                }
-                parts.join(" ")
-            }
-            "kiro-cli" => format!("kiro-cli chat --no-interactive {}", escaped_prompt),
-            _ => format!("claude -p {}", escaped_prompt),
-        };
-        let mut prefix_cmds = build_wsl_env_exports(&effective_harness, account.as_ref());
-        if let Some(setup) = wsl_mcp_setup {
-            prefix_cmds.push(setup);
-        }
-        if !prefix_cmds.is_empty() {
-            cli_cmd = format!("{}; {}", prefix_cmds.join("; "), cli_cmd);
-        }
-        let posix_cwd = wsl_posix_cwd(&effective_cwd);
-        let mut cmd = crate::platform::wsl_tokio_shell(distro, &posix_cwd, &cli_cmd);
-        cmd.kill_on_drop(true)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+    // Mark session RUNNING so desktop/remote threads immediately display live progress
+    {
+        let db_lock = db.lock().await;
+        let _ = db_lock.update_session_status(session_id, "RUNNING", Some(false));
+    }
 
+    let message_id = format!("msg-{}", Uuid::new_v4());
+    let started = Instant::now();
+    let mut acc = TurnAccumulator::new();
+    let (_cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let mut author_name = effective_harness.clone();
+
+    let run_outcome: Result<(), String> = if let Some(ref distro) =
+        proj_wsl.filter(|_| effective_harness != "sakana")
+    {
+        let (resolved_model, resolved_effort) = if effective_harness == "agy-cli" {
+            let (m, e) =
+                resolve_agy_model_and_effort_with_db(&db, &effective_model, &effective_effort)
+                    .await;
+            (m.unwrap_or_default(), e.unwrap_or_default())
+        } else {
+            (effective_model.clone(), effective_effort.clone())
+        };
         match tokio::time::timeout(
             std::time::Duration::from_secs(one_shot_timeout_secs),
-            cmd.output(),
+            run_wsl_cli_harness(
+                distro,
+                &effective_harness,
+                account.as_ref(),
+                &resolved_model,
+                &resolved_effort,
+                permission_mode,
+                &enabled_mcp_servers,
+                &effective_cwd,
+                &full_prompt_with_history,
+                Some(app),
+                session_id,
+                &message_id,
+                started,
+                &mut acc,
+                cancel_rx,
+            ),
         )
         .await
         {
-            Ok(Ok(out)) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if text.is_empty() {
-                    "Completed with no output.".to_string()
-                } else {
-                    text
-                }
-            }
-            Ok(Ok(out)) => {
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                format!("WSL harness error ({}): {}", out.status, err)
-            }
-            Ok(Err(e)) => format!("Failed to spawn WSL harness: {}", e),
-            Err(_) => format!("WSL harness request timed out after {}s.", one_shot_timeout_secs),
+            Ok(res) => res,
+            Err(_) => Err(format!(
+                "WSL harness request timed out after {}s.",
+                one_shot_timeout_secs
+            )),
         }
     } else if let Some((active_harness, bin)) = (effective_harness != "sakana")
         .then(|| {
@@ -3347,146 +3304,116 @@ pub async fn run_one_shot_prompt_with_opts(
         })
         .flatten()
     {
-        let bin_str = bin.to_string_lossy().to_string();
-        crate::auth::sync_profile_mcp_and_skills(
-            active_harness,
-            account.as_ref(),
-            &enabled_mcp_servers,
-        );
-        let mut cmd = crate::platform::tokio_command(&bin_str);
-        crate::auth::apply_account_env(&mut cmd, active_harness, account.as_ref());
-        if Path::new(&effective_cwd).is_dir() {
-            cmd.current_dir(&effective_cwd);
-        }
-        let mut _mcp_guard: Option<TempFileGuard> = None;
-        if active_harness == "kiro-cli" {
-            cmd.args(["chat", "--no-interactive", &full_prompt_with_history]);
-        } else if active_harness == "agy-cli" {
-            let (resolved_model, resolved_effort) =
-                resolve_agy_model_and_effort_with_db(&db, &effective_model, &effective_effort).await;
-            cmd.args(["-p", &full_prompt_with_history]);
-            if let Some(m) = resolved_model {
-                cmd.args(["--model", &m]);
-            }
-            if let Some(e) = resolved_effort {
-                cmd.args(["--effort", &e]);
-            }
-            cmd.args(build_permission_args(active_harness, permission_mode));
+        author_name = active_harness.to_string();
+        let (resolved_model, resolved_effort) = if active_harness == "agy-cli" {
+            let (m, e) =
+                resolve_agy_model_and_effort_with_db(&db, &effective_model, &effective_effort)
+                    .await;
+            (m.unwrap_or_default(), e.unwrap_or_default())
         } else {
-            cmd.args(["-p", &full_prompt_with_history]);
-            if !effective_model.is_empty() {
-                cmd.args(["--model", &effective_model]);
-            }
-            cmd.args(build_permission_args(active_harness, permission_mode));
-            if active_harness == "claude-code" {
-                if let Some(mcp_cfg) = build_mcp_config_json(&enabled_mcp_servers) {
-                    let cfg_path = std::env::temp_dir().join(format!(
-                        "sakana-mcp-oneshot-{}.json",
-                        Uuid::new_v4()
-                    ));
-                    if let Ok(json_str) = serde_json::to_string_pretty(&mcp_cfg) {
-                        if std::fs::write(&cfg_path, json_str).is_ok() {
-                            cmd.args(["--mcp-config", &cfg_path.to_string_lossy()]);
-                            _mcp_guard = Some(TempFileGuard { path: cfg_path });
-                        }
-                    }
-                }
-            }
-        }
-        cmd.kill_on_drop(true)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
+            (effective_model.clone(), effective_effort.clone())
+        };
+        let run_cwd = if Path::new(&effective_cwd).is_dir() {
+            effective_cwd.clone()
+        } else {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        };
         match tokio::time::timeout(
             std::time::Duration::from_secs(one_shot_timeout_secs),
-            cmd.output(),
+            run_cli_harness(
+                &bin,
+                active_harness,
+                account.as_ref(),
+                &resolved_model,
+                &resolved_effort,
+                permission_mode,
+                &enabled_mcp_servers,
+                &run_cwd,
+                &full_prompt_with_history,
+                Some(app),
+                session_id,
+                &message_id,
+                started,
+                &mut acc,
+                cancel_rx,
+            ),
         )
         .await
         {
-            Ok(Ok(out)) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if text.is_empty() {
-                    "Completed with no output.".to_string()
-                } else {
-                    text
-                }
-            }
-            Ok(Ok(out)) => {
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                format!("Harness error ({}): {}", out.status, err)
-            }
-            Ok(Err(e)) => format!("Failed to spawn harness: {}", e),
-            Err(_) => format!("Harness request timed out after {}s.", one_shot_timeout_secs),
+            Ok(res) => res,
+            Err(_) => Err(format!(
+                "Harness request timed out after {}s.",
+                one_shot_timeout_secs
+            )),
         }
-    } else if let Some(key) = read_env_or_dotenv("OPENROUTER_API_KEY", &effective_cwd)
-        .or_else(|| read_env_or_dotenv("OPENAI_API_KEY", &effective_cwd))
-    {
-        let is_openrouter = read_env_or_dotenv("OPENROUTER_API_KEY", &effective_cwd).is_some();
-        let url = if is_openrouter {
-            "https://openrouter.ai/api/v1/chat/completions"
-        } else {
-            "https://api.openai.com/v1/chat/completions"
-        };
-        let model = if !session.model.trim().is_empty() {
-            if is_openrouter && !session.model.contains('/') {
-                format!("anthropic/{}", session.model.trim())
-            } else {
-                session.model.trim().to_string()
-            }
-        } else if is_openrouter {
-            "openai/gpt-4o-mini".to_string()
+    } else {
+        author_name = "Sakana".to_string();
+        let http_model = if !effective_model.is_empty() {
+            effective_model.clone()
+        } else if !session.model.trim().is_empty() {
+            session.model.trim().to_string()
         } else {
             "gpt-4o-mini".to_string()
         };
-        let http_messages = build_http_messages(&sakana_ctx, &recent_history, prompt);
-        let client = reqwest::Client::new();
-        match client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", key))
-            .json(&serde_json::json!({
-                "model": model,
-                "messages": http_messages,
-            }))
-            .send()
-            .await
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(one_shot_timeout_secs),
+            run_http_sse_fallback(
+                &effective_cwd,
+                &http_model,
+                &sakana_ctx,
+                &recent_history,
+                prompt,
+                Some(app),
+                session_id,
+                &message_id,
+                started,
+                &mut acc,
+                cancel_rx,
+            ),
+        )
+        .await
         {
-            Ok(resp) if resp.status().is_success() => {
-                let val: Value = resp.json().await.unwrap_or_default();
-                val["choices"][0]["message"]["content"]
-                    .as_str()
-                    .unwrap_or("No response content.")
-                    .to_string()
-            }
-            Ok(resp) => format!("API error: HTTP {}", resp.status()),
-            Err(e) => format!("API request failed: {}", e),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(
+                "Prompt queued in Sakana, but no CLI harness or API key is configured on this host."
+                    .to_string(),
+            ),
+            Err(_) => Err(format!(
+                "API request timed out after {}s.",
+                one_shot_timeout_secs
+            )),
         }
-    } else {
-        "Prompt queued in Sakana, but no CLI harness or API key is configured on this host."
-            .to_string()
     };
 
-    let assistant_msg = ChatMessage {
-        id: format!("msg-{}", Uuid::new_v4()),
-        role: "assistant".to_string(),
-        author: Some("Sakana".to_string()),
-        timestamp: Local::now().format("%H:%M").to_string(),
-        text: reply_text.clone(),
-        thinking: None,
-        thinking_duration: None,
-        tools: None,
-        subagent: None,
-        widget: None,
-        checkpoint: None,
-    };
+    if let Err(err_msg) = run_outcome {
+        if acc.text.trim().is_empty() {
+            acc.text = err_msg;
+        } else {
+            acc.text.push_str(&format!("\n\n**Error:** {}", err_msg));
+        }
+    }
+    if acc.text.trim().is_empty() {
+        acc.text = "Completed with no output.".to_string();
+    }
+
+    let reply_text = acc.text.clone();
+    let assistant_msg = acc.into_message(message_id.clone(), author_name);
     {
         let db_lock = db.lock().await;
         let _ = db_lock.append_message(session_id, &assistant_msg);
+        let _ = db_lock.update_session_status(session_id, "DONE", Some(true));
     }
     crate::platform::emit_app_and_remote(
         Some(app),
         "turn:done",
-        serde_json::json!({ "sessionId": session_id, "message": assistant_msg }),
+        TurnDoneEvent {
+            session_id: session_id.to_string(),
+            message_id,
+            message: assistant_msg,
+            status: "DONE".to_string(),
+        },
     );
     Ok(reply_text)
 }

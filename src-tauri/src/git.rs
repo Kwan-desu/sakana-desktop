@@ -1236,27 +1236,46 @@ fn detect_language(rel_path: &str) -> &'static str {
     }
 }
 
-fn safe_resolve_path(cwd: &str, rel_path: &str) -> Result<PathBuf, String> {
-    let root_buf = resolve_fs_root(cwd);
-    let root = root_buf
-        .canonicalize()
-        .map_err(|e| format!("Invalid workspace cwd {}: {}", cwd, e))?;
-    let clean_rel = rel_path.trim_start_matches(['/', '\\']);
-    let joined = root.join(clean_rel);
-    if joined.exists() {
-        let canon = joined
-            .canonicalize()
-            .map_err(|e| format!("Invalid path {}: {}", rel_path, e))?;
-        if !canon.starts_with(&root) {
-            return Err("Path escapes workspace root".to_string());
-        }
-        Ok(canon)
-    } else {
-        for comp in Path::new(clean_rel).components() {
-            if matches!(comp, std::path::Component::ParentDir) {
-                return Err("Path traversal is not allowed".to_string());
+fn expand_tilde_and_uri(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .strip_prefix("file://")
+        .unwrap_or(trimmed);
+    if stripped == "~" || stripped.starts_with("~/") || stripped.starts_with("~\\") {
+        if let Some(home) = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+        {
+            if stripped == "~" {
+                return home.to_string_lossy().to_string();
             }
+            let rest = stripped[2..].trim_start_matches(['/', '\\']);
+            return home.join(rest).to_string_lossy().to_string();
         }
+    }
+    stripped.to_string()
+}
+
+fn safe_resolve_path(cwd: &str, rel_path: &str) -> Result<PathBuf, String> {
+    let expanded = expand_tilde_and_uri(rel_path);
+    if expanded.is_empty() {
+        return Err("File path is empty".to_string());
+    }
+    let candidate = PathBuf::from(&expanded);
+    if candidate.is_absolute() {
+        return if candidate.exists() {
+            candidate.canonicalize().or(Ok(candidate))
+        } else {
+            Ok(candidate)
+        };
+    }
+
+    let root_buf = resolve_fs_root(cwd);
+    let root = root_buf.canonicalize().unwrap_or(root_buf);
+    let joined = root.join(&candidate);
+    if joined.exists() {
+        joined.canonicalize().or(Ok(joined))
+    } else {
         Ok(joined)
     }
 }

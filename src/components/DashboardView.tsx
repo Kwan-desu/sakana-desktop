@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  AuditLogCard,
+  FailoverConfigCard,
+  TelemetryAnalyticsCard,
+  VoiceSettingsCard,
+} from './DashboardExtras';
+import {
   ArrowClockwise,
   ArrowLeft,
   CaretDown,
@@ -878,6 +884,7 @@ export function DashboardView({
                 </div>
               </div>
             </div>
+            <TelemetryAnalyticsCard />
           </>
         )}
 
@@ -1805,6 +1812,7 @@ export function DashboardView({
                 })}
               </div>
             </div>
+            <FailoverConfigCard onToast={onToast} />
           </div>
         )}
 
@@ -3885,6 +3893,8 @@ export function DashboardView({
                   {autostartEnabled ? 'Enabled' : 'Disabled'}
                 </button>
               </div>
+              <VoiceSettingsCard onToast={onToast} />
+              <AuditLogCard />
             </div>
 
             <div className="lg:col-span-7 sakana-card rounded-[12px] p-5 space-y-3.5 h-fit">

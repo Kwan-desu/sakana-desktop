@@ -980,6 +980,7 @@ async fn start_agy_login(
     }
 
     let mut child = cmd
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("Failed to spawn agy login ({}): {}", bin.display(), e))?;
 
@@ -1058,6 +1059,7 @@ async fn start_kiro_login(
     let mut cmd = tokio_command(&bin_str);
     apply_account_env(&mut cmd, "kiro-cli", Some(acc));
     cmd.args(["login", "--license", "free", "--use-device-flow"])
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1166,6 +1168,7 @@ async fn start_claude_login(
     let mut cmd = tokio_command(&bin_str);
     apply_account_env(&mut cmd, "claude-code", Some(acc));
     cmd.args(["auth", "login"])
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1306,18 +1309,23 @@ pub async fn submit_harness_login_code_inner(
     }
 
     // Loopback callback forwarding (e.g. http://127.0.0.1:xxxxx/?code=...&state=...)
-    let lower = raw.to_ascii_lowercase();
-    if lower.starts_with("http://127.0.0.1:") || lower.starts_with("http://localhost:") {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let resp = client
-            .get(&raw)
-            .send()
-            .await
-            .map_err(|e| format!("Loopback callback forward failed: {e}"))?;
+    if let Ok(parsed) = reqwest::Url::parse(&raw) {
+        let is_loopback_http = parsed.scheme() == "http"
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && matches!(parsed.host_str(), Some("127.0.0.1") | Some("localhost"))
+            && parsed.port().is_some();
+        if is_loopback_http {
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let resp = client
+                .get(parsed)
+                .send()
+                .await
+                .map_err(|e| format!("Loopback callback forward failed: {e}"))?;
         let status_code = resp.status().as_u16();
         tokio::time::sleep(Duration::from_millis(600)).await;
         let authed = is_account_authenticated(&acc);
@@ -1336,8 +1344,9 @@ pub async fn submit_harness_login_code_inner(
             auth_url: String::new(),
             device_code: String::new(),
             email: acc.email,
-            message: format!("Forwarded loopback callback (HTTP {status_code})."),
-        });
+                message: format!("Forwarded loopback callback (HTTP {status_code})."),
+            });
+        }
     }
 
     // Feed code to running login process stdin

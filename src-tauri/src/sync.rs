@@ -190,17 +190,26 @@ pub fn list_project_file_manifest(
             if entries.len() >= MAX_SYNC_FILES {
                 break;
             }
-            let path = item.path();
-            let name = item.file_name().to_string_lossy().to_string();
-            let Ok(meta) = item.metadata() else {
+            let Ok(ft) = item.file_type() else {
                 continue;
             };
-            if meta.is_dir() {
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = item.path();
+            let name = item.file_name().to_string_lossy().to_string();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
                 if IGNORED_DIRS.iter().any(|&d| d.eq_ignore_ascii_case(&name)) {
                     continue;
                 }
                 stack.push(path);
-            } else if meta.is_file() {
+            } else if ft.is_file() {
                 if name == ".DS_Store" || name.ends_with(".tmp") || meta.len() > MAX_SYNC_FILE_BYTES {
                     continue;
                 }
@@ -291,14 +300,26 @@ pub fn read_project_file_b64(
     wsl_distro: Option<&str>,
 ) -> Result<Value, String> {
     let root = resolve_project_root(cwd, wsl_distro);
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("Invalid project root: {e}"))?;
     let clean = validate_rel_path(rel_path)?;
-    let full = root.join(clean);
-    let meta = std::fs::metadata(&full).map_err(|e| format!("Stat failed: {e}"))?;
-    if meta.len() > MAX_SYNC_FILE_BYTES {
+    let full = canon_root.join(clean);
+    let sym_meta = std::fs::symlink_metadata(&full).map_err(|e| format!("Stat failed: {e}"))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err("Symlinks are not allowed in sync".to_string());
+    }
+    let canon = full
+        .canonicalize()
+        .map_err(|e| format!("Invalid path: {e}"))?;
+    if !canon.starts_with(&canon_root) {
+        return Err("Path escapes project root".to_string());
+    }
+    if sym_meta.len() > MAX_SYNC_FILE_BYTES {
         return Err("File exceeds 15MB sync limit".to_string());
     }
-    let bytes = std::fs::read(&full).map_err(|e| format!("Read failed: {e}"))?;
-    let mtime_ms = meta
+    let bytes = std::fs::read(&canon).map_err(|e| format!("Read failed: {e}"))?;
+    let mtime_ms = sym_meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -318,14 +339,62 @@ pub fn write_project_file_b64(
     content_b64: &str,
     wsl_distro: Option<&str>,
 ) -> Result<bool, String> {
+    let max_b64_len = ((MAX_SYNC_FILE_BYTES as usize) * 4) / 3 + 8;
+    if content_b64.len() > max_b64_len {
+        return Err("Encoded payload exceeds 15MB sync limit".to_string());
+    }
     let root = resolve_project_root(cwd, wsl_distro);
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("Invalid project root: {e}"))?;
     let clean = validate_rel_path(rel_path)?;
-    let full = root.join(clean);
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Create dir failed: {e}"))?;
+    let full = canon_root.join(clean);
+    if let Ok(meta) = std::fs::symlink_metadata(&full) {
+        if meta.file_type().is_symlink() {
+            return Err("Refusing to write through symlink".to_string());
+        }
     }
     let bytes = b64_decode(content_b64)?;
-    std::fs::write(&full, bytes).map_err(|e| format!("Write failed: {e}"))?;
+    if bytes.len() as u64 > MAX_SYNC_FILE_BYTES {
+        return Err("Decoded file exceeds 15MB sync limit".to_string());
+    }
+    if let Some(parent) = full.parent() {
+        // Walk up to the nearest existing ancestor and verify it stays within canon_root
+        // BEFORE creating any directories, preventing symlink traversal.
+        let mut probe = parent;
+        while !probe.exists() {
+            match probe.parent() {
+                Some(p) => probe = p,
+                None => break,
+            }
+        }
+        let canon_ancestor = probe
+            .canonicalize()
+            .map_err(|e| format!("Invalid ancestor dir: {e}"))?;
+        if !canon_ancestor.starts_with(&canon_root) {
+            return Err("Target path escapes project root".to_string());
+        }
+        std::fs::create_dir_all(parent).map_err(|e| format!("Create dir failed: {e}"))?;
+        let canon_parent = parent
+            .canonicalize()
+            .map_err(|e| format!("Invalid parent dir: {e}"))?;
+        if !canon_parent.starts_with(&canon_root) {
+            return Err("Target path escapes project root".to_string());
+        }
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let tmp_path = canon_parent.join(format!(
+            ".sakana-sync-{}-{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&tmp_path, &bytes).map_err(|e| format!("Temp write failed: {e}"))?;
+        if let Err(e) = std::fs::rename(&tmp_path, &full) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Atomic replace failed: {e}"));
+        }
+    } else {
+        std::fs::write(&full, &bytes).map_err(|e| format!("Write failed: {e}"))?;
+    }
     Ok(true)
 }
 
@@ -407,6 +476,8 @@ pub async fn run_sync_cycle(
     http_client: &reqwest::Client,
     app: Option<&AppHandle>,
 ) -> Result<SyncStatus, String> {
+    static SYNC_CYCLE_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    let _cycle_guard = SYNC_CYCLE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
     let (cfg, peer) = {
         let db = db_arc.lock().await;
         let cfg = load_sync_config(&db);

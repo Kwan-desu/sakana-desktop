@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  BookmarkSimple,
   Buildings,
   CaretDown,
   FolderOpen,
   GitBranch,
   Plus,
   SidebarSimple,
+  Sparkle,
   Stop,
   Trash,
   UserPlus,
@@ -16,6 +18,7 @@ import type {
   HarnessId,
   HarnessModelOption,
   Office,
+  OfficeBlueprint,
   OfficeDelegationEdge,
   OfficeStaff,
   PermissionMode,
@@ -1014,6 +1017,46 @@ export function OfficeView({
     [onRefreshOffices, onToast],
   );
 
+  const [blueprints, setBlueprints] = useState<OfficeBlueprint[]>([]);
+  const [blueprintMenuOpen, setBlueprintMenuOpen] = useState(false);
+
+  useEffect(() => {
+    tauriApi.listOfficeBlueprints().then(setBlueprints).catch(() => {});
+  }, []);
+
+  const handleSaveBlueprint = async () => {
+    if (!selectedOffice) return;
+    const bpName = `${selectedOffice.name} Blueprint`;
+    try {
+      const saved = await tauriApi.saveOfficeBlueprint(selectedOffice.id, bpName);
+      if (saved) {
+        setBlueprints((prev) => [saved, ...prev.filter((b) => b.id !== saved.id)]);
+        onToast(`Saved blueprint "${saved.name}"`);
+      }
+    } catch (err) {
+      onToast(`Failed to save blueprint: ${String(err)}`);
+    }
+  };
+
+  const handleCreateFromBlueprint = async (bp: OfficeBlueprint) => {
+    const projectId = selectedOffice?.projectId || projects[0]?.id;
+    if (!projectId) {
+      onToast('Create a project first before using a blueprint');
+      return;
+    }
+    setBlueprintMenuOpen(false);
+    try {
+      const created = await tauriApi.createOfficeFromBlueprint(bp.id, projectId);
+      if (created) {
+        onToast(`Created office from "${bp.name}"`);
+        await onRefreshOffices();
+        onSelectOffice(created.id);
+      }
+    } catch (err) {
+      onToast(`Failed to create from blueprint: ${String(err)}`);
+    }
+  };
+
   const handleDeleteOffice = async () => {
     if (!selectedOffice) return;
     try {
@@ -1217,6 +1260,59 @@ export function OfficeView({
               <span>Stop Run</span>
             </button>
           )}
+
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setBlueprintMenuOpen((v) => !v)}
+              className="btn-ghost px-2.5 py-1 text-[11.5px] font-medium inline-flex items-center gap-1 cursor-pointer"
+              title="Create office from a saved or built-in blueprint"
+            >
+              <Sparkle size={13} />
+              <span>Blueprints</span>
+            </button>
+            {blueprintMenuOpen && (
+              <div
+                className="sakana-popover pop-enter absolute right-0 top-full mt-1.5 w-64 rounded-[10px] p-1.5 z-50 space-y-1"
+              >
+                <div className="px-2 py-1 text-[10px] font-mono-tech uppercase" style={{ color: 'var(--text-muted)' }}>
+                  Office Blueprints ({blueprints.length})
+                </div>
+                {blueprints.length === 0 ? (
+                  <div className="px-2 py-2 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                    No blueprints yet.
+                  </div>
+                ) : (
+                  blueprints.map((bp) => (
+                    <button
+                      key={bp.id}
+                      type="button"
+                      onClick={() => void handleCreateFromBlueprint(bp)}
+                      className="w-full px-2 py-1.5 rounded-[6px] text-left hover:bg-[var(--bg-hover)] cursor-pointer"
+                    >
+                      <div className="text-[12px] font-medium truncate" style={{ color: 'var(--text-main)' }}>
+                        {bp.name}
+                      </div>
+                      <div className="text-[10.5px] truncate" style={{ color: 'var(--text-muted)' }}>
+                        {bp.description || `${bp.config.staff.length} staff`}
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void handleSaveBlueprint()}
+            aria-label="Save as Blueprint"
+            title="Save current office as reusable blueprint"
+            className="btn-ghost p-1.5 cursor-pointer"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <BookmarkSimple size={14} />
+          </button>
 
           <button
             type="button"

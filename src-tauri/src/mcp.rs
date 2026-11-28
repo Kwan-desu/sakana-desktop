@@ -111,8 +111,55 @@ async fn ping_http_endpoint(endpoint: &str) -> (String, Option<i64>) {
     }
 }
 
+fn quote_arg_if_needed(s: &str) -> String {
+    if s.contains(char::is_whitespace) && !(s.starts_with('"') && s.ends_with('"')) {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn split_command_args(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = '"';
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    if next == quote_char || next == '\\' {
+                        cur.push(next);
+                        chars.next();
+                        continue;
+                    }
+                }
+            }
+            if c == quote_char {
+                in_quotes = false;
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' || c == '\'' {
+            in_quotes = true;
+            quote_char = c;
+        } else if c.is_whitespace() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 async fn ping_stdio_endpoint(endpoint: &str) -> (String, Option<i64>) {
-    let parts: Vec<&str> = endpoint.split_whitespace().collect();
+    let parts = split_command_args(endpoint);
     let Some(program) = parts.first() else {
         return ("error".to_string(), None);
     };
@@ -120,6 +167,7 @@ async fn ping_stdio_endpoint(endpoint: &str) -> (String, Option<i64>) {
     let start = Instant::now();
     let mut cmd = crate::platform::tokio_command(program);
     cmd.args(&parts[1..])
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -135,23 +183,18 @@ async fn ping_stdio_endpoint(endpoint: &str) -> (String, Option<i64>) {
         if let Some(stdout) = child.stdout.take() {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stdout).lines();
-            if let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_millis(800), lines.next_line()).await {
+            if let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_millis(1500), lines.next_line()).await {
                 let elapsed = start.elapsed().as_millis().max(1) as i64;
                 let _ = child.kill().await;
                 if line.contains("jsonrpc") || line.contains("protocolVersion") || line.contains("result") {
                     return ("connected".to_string(), Some(elapsed));
                 }
+                return ("error".to_string(), Some(elapsed));
             }
         }
         let elapsed = start.elapsed().as_millis().max(1) as i64;
-        match child.try_wait() {
-            Ok(Some(status)) if !status.success() => return ("error".to_string(), Some(elapsed)),
-            Ok(_) => {
-                let _ = child.kill().await;
-                return ("connected".to_string(), Some(elapsed));
-            }
-            Err(_) => return ("error".to_string(), None),
-        }
+        let _ = child.kill().await;
+        return ("error".to_string(), Some(elapsed));
     }
 
     #[cfg(target_os = "windows")]
@@ -231,10 +274,28 @@ fn parse_agy_mcp_list(raw: &str) -> Vec<(String, String, String)> {
                         let endpoint = item
                             .get("url")
                             .or_else(|| item.get("endpoint"))
-                            .or_else(|| item.get("command"))
                             .and_then(|v| v.as_str())
-                            .unwrap_or("agy-mcp")
-                            .to_string();
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                let cmd = item.get("command").and_then(|v| v.as_str()).unwrap_or("agy-mcp");
+                                let args = item
+                                    .get("args")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|x| x.as_str())
+                                            .map(quote_arg_if_needed)
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
+                                    })
+                                    .unwrap_or_default();
+                                let qcmd = quote_arg_if_needed(cmd);
+                                if args.is_empty() {
+                                    qcmd
+                                } else {
+                                    format!("{} {}", qcmd, args)
+                                }
+                            });
                         let transport = if endpoint.starts_with("http") {
                             "sse".to_string()
                         } else {
@@ -260,11 +321,17 @@ fn parse_agy_mcp_list(raw: &str) -> Vec<(String, String, String)> {
                                 .map(|a| {
                                     a.iter()
                                         .filter_map(|x| x.as_str())
+                                        .map(quote_arg_if_needed)
                                         .collect::<Vec<_>>()
                                         .join(" ")
                                 })
                                 .unwrap_or_default();
-                            format!("{} {}", cmd, args).trim().to_string()
+                            let qcmd = quote_arg_if_needed(cmd);
+                            if args.is_empty() {
+                                qcmd
+                            } else {
+                                format!("{} {}", qcmd, args)
+                            }
                         });
                     let transport = if endpoint.starts_with("http") {
                         "sse".to_string()

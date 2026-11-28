@@ -135,32 +135,52 @@ export function XtermTerminal({ sessionKey, cwd, wslDistro, theme, onToast }: Xt
         return;
       }
 
-      unlistenData = await tauriApi.onPtyData((ev) => {
+      const uData = await tauriApi.onPtyData((ev) => {
         if (!disposed && ev.sessionId === sessionKey) {
           term.write(ev.data);
         }
       });
-      unlistenExit = await tauriApi.onPtyExit((ev) => {
+      if (disposed) {
+        uData();
+        return;
+      }
+      unlistenData = uData;
+
+      const uExit = await tauriApi.onPtyExit((ev) => {
         if (!disposed && ev.sessionId === sessionKey) {
           term.writeln(`\r\n\x1b[90m[process exited with code ${ev.code}]\x1b[0m`);
         }
       });
+      if (disposed) {
+        uExit();
+        return;
+      }
+      unlistenExit = uExit;
 
       const cols = Math.max(20, term.cols || 80);
       const rows = Math.max(6, term.rows || 24);
       try {
         await tauriApi.ptySpawn(sessionKey, cwd, cols, rows, wslDistro);
+        if (disposed) {
+          void tauriApi.ptyKill(sessionKey).catch(() => {});
+          return;
+        }
       } catch (err) {
-        term.writeln(`\x1b[31mFailed to spawn PTY:\x1b[0m ${String(err)}`);
+        if (!disposed) {
+          term.writeln(`\x1b[31mFailed to spawn PTY:\x1b[0m ${String(err)}`);
+        }
       }
+      if (disposed) return;
 
       term.onData((data) => {
+        if (disposed) return;
         void tauriApi.ptyWrite(sessionKey, data).catch((err) => {
           console.error('pty_write failed:', err);
         });
       });
 
       term.onResize(({ cols: nextCols, rows: nextRows }) => {
+        if (disposed) return;
         void tauriApi.ptyResize(sessionKey, nextCols, nextRows).catch(() => {});
       });
     };

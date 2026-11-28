@@ -115,6 +115,7 @@ export interface ChatMessage {
   };
   widget?: InlineWidgetData;
   checkpoint?: TurnCheckpoint;
+  failoverNotice?: string;
 }
 
 export interface PendingApproval {
@@ -644,4 +645,176 @@ export interface UpdateStaffInput {
   isolatedWorktree?: boolean;
   worktreePath?: string;
   branch?: string;
+}
+
+// ── Feature 1: Voice Mode ──────────────────────────────────────────
+export interface VoiceConfig {
+  engine: 'auto' | 'browser' | 'whisper' | string;
+  language: string;
+  whisperUrl: string;
+  whisperModel: string;
+  whisperCliPath: string;
+  autoSend: boolean;
+  silenceMs: number;
+  ttsEnabled: boolean;
+  ttsVoice: string;
+  ttsRate: number;
+}
+
+export interface TranscribeResult {
+  text: string;
+  engine: string;
+  durationMs: number;
+}
+
+// ── Feature 2: Auto-Failover & Smart Quota Routing ─────────────────
+export interface FailoverTarget {
+  harness: HarnessId | string;
+  model: string;
+  account?: string | null;
+}
+
+export interface FailoverConfig {
+  enabled: boolean;
+  quotaThresholdPct: number;
+  rotateAccountsSameHarness: boolean;
+  fallbackChain: FailoverTarget[];
+}
+
+export interface TurnFailoverEvent {
+  sessionId: string;
+  messageId: string;
+  fromHarness: string;
+  fromAccount: string;
+  toHarness: string;
+  toAccount: string;
+  toModel: string;
+  reason: string;
+  hop: number;
+  notice: string;
+}
+
+// ── Feature 3: Checkpoint Rewind ───────────────────────────────────
+export interface RewindResult {
+  session: Thread;
+  stashed: boolean;
+  stashRef?: string | null;
+  removedMessages: number;
+  resetGit: boolean;
+}
+
+// ── Feature 4: Multi-Harness Parallel Race Mode ────────────────────
+export interface RaceContestantInput {
+  harness: HarnessId | string;
+  model?: string;
+  account?: string | null;
+}
+
+export interface RaceContestant {
+  sessionId: string;
+  harness: string;
+  model: string;
+  branch: string;
+  worktreePath: string;
+  status: 'running' | 'done' | 'error' | 'merged' | string;
+  output: string;
+  durationMs: number;
+  filesChanged: number;
+  additions: number;
+  deletions: number;
+  verifyOk?: boolean | null;
+  verifyOutput?: string | null;
+  error?: string | null;
+}
+
+export interface RaceRun {
+  id: string;
+  projectId: string;
+  baseBranch: string;
+  baseCwd: string;
+  prompt: string;
+  status: 'running' | 'completed' | 'merged' | string;
+  winnerSessionId?: string | null;
+  verifyCmd?: string | null;
+  createdAt: string;
+  contestants: RaceContestant[];
+}
+
+// ── Feature 5: Global Full-Text Search (FTS5) ──────────────────────
+export interface SearchHit {
+  kind: 'message' | 'office' | string;
+  entityId: string;
+  sessionId: string;
+  projectId: string;
+  projectName: string;
+  sessionTitle: string;
+  harness: string;
+  snippet: string;
+  timestamp: string;
+  isDiscord: boolean;
+}
+
+// ── Feature 6: Office Blueprints & Telemetry ───────────────────────
+export interface OfficeBlueprintStaff {
+  name: string;
+  role: string;
+  isMaster: boolean;
+  harness: HarnessId | string;
+  model: string;
+  effort?: string;
+  permissionMode?: string;
+  systemPrompt?: string;
+  isolatedWorktree?: boolean;
+  avatarColor?: string;
+}
+
+export interface OfficeBlueprintConfig {
+  maxRounds: number;
+  staff: OfficeBlueprintStaff[];
+}
+
+export interface OfficeBlueprint {
+  id: string;
+  name: string;
+  description: string;
+  isBuiltin: boolean;
+  config: OfficeBlueprintConfig;
+  createdAt: string;
+}
+
+export interface TelemetryBucket {
+  key: string;
+  label: string;
+  spans: number;
+  totalTokens: number;
+  totalDurationMs: number;
+  avgDurationMs: number;
+}
+
+export interface TelemetryDayPoint {
+  day: string;
+  spans: number;
+  totalTokens: number;
+  totalDurationMs: number;
+}
+
+export interface TelemetrySummary {
+  totalSpans: number;
+  totalTokens: number;
+  avgDurationMs: number;
+  totalDurationMs: number;
+  byHarness: TelemetryBucket[];
+  byProject: TelemetryBucket[];
+  byDay: TelemetryDayPoint[];
+}
+
+// ── Feature 7: Security & Audit Log ────────────────────────────────
+export interface AuditLogEntry {
+  id: string;
+  timestamp: string;
+  source: 'desktop' | 'remote' | 'discord' | 'automation' | string;
+  action: string;
+  status: 'allowed' | 'blocked' | 'approved' | 'denied' | string;
+  summary: string;
+  payloadJson?: string | null;
 }

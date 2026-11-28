@@ -306,7 +306,20 @@ async fn download_discord_attachments(
     saved
 }
 
-fn extract_output_files(reply: &str) -> (String, Vec<PathBuf>) {
+fn extract_output_files(
+    reply: &str,
+    workspace_cwd: Option<&str>,
+    allow_files: bool,
+) -> (String, Vec<PathBuf>) {
+    let wsl_info = workspace_cwd.and_then(crate::platform::parse_wsl_path);
+    let fs_root = workspace_cwd.map(|cwd| {
+        if let Some((ref distro, ref linux_path)) = wsl_info {
+            crate::platform::wsl_to_unc_path(distro, linux_path)
+        } else {
+            PathBuf::from(cwd)
+        }
+    });
+    let canon_root = fs_root.and_then(|r| r.canonicalize().ok());
     let mut files = Vec::new();
     let mut kept_lines = Vec::new();
     for line in reply.lines() {
@@ -320,16 +333,43 @@ fn extract_output_files(reply: &str) -> (String, Vec<PathBuf>) {
             None
         };
         if let Some(raw_path) = extracted {
+            if !allow_files {
+                continue;
+            }
             let cleaned = raw_path.trim_matches(|c| c == '"' || c == '\'' || c == '`');
-            let p = PathBuf::from(cleaned);
-            if p.is_file() && files.len() < 5 {
-                if let Ok(meta) = std::fs::metadata(&p) {
-                    if meta.len() <= MAX_DISCORD_ATTACHMENT_BYTES {
-                        files.push(p);
-                        continue;
+            let Some(ref root) = canon_root else {
+                continue;
+            };
+            let resolved = if let Some((ref distro, ref linux_root)) = wsl_info {
+                let linux_target = if cleaned.starts_with('/') {
+                    cleaned.to_string()
+                } else {
+                    format!(
+                        "{}/{}",
+                        linux_root.trim_end_matches('/'),
+                        cleaned.trim_start_matches("./")
+                    )
+                };
+                crate::platform::wsl_to_unc_path(distro, &linux_target)
+            } else {
+                let candidate = PathBuf::from(cleaned);
+                if candidate.is_absolute() {
+                    candidate
+                } else {
+                    root.join(candidate)
+                }
+            };
+            if let Ok(canon) = resolved.canonicalize() {
+                if canon.starts_with(root) && canon.is_file() && files.len() < 5 {
+                    if let Ok(meta) = std::fs::metadata(&canon) {
+                        if meta.len() <= MAX_DISCORD_ATTACHMENT_BYTES {
+                            files.push(canon);
+                            continue;
+                        }
                     }
                 }
             }
+            continue;
         }
         kept_lines.push(line);
     }
@@ -400,8 +440,10 @@ async fn send_discord_reply(
     ctx: &serenity::Context,
     target_msg: &serenity::Message,
     raw_reply: &str,
+    workspace_cwd: Option<&str>,
+    allow_files: bool,
 ) {
-    let (cleaned, files) = extract_output_files(raw_reply);
+    let (cleaned, files) = extract_output_files(raw_reply, workspace_cwd, allow_files);
     let chunks = if cleaned.is_empty() {
         Vec::new()
     } else {
@@ -465,8 +507,8 @@ async fn dispatch_discord_prompt(
     is_dm: bool,
     channel_label: &str,
     prompt: &str,
-) -> Result<(String, String), String> {
-    let (session_id, target_label) = {
+) -> Result<(String, String, Option<String>), String> {
+    let (session_id, target_label, workspace_cwd) = {
         let db_lock = db.lock().await;
         let dc_cfg = load_discord_settings(&db_lock);
         let default_harness = resolve_effective_discord_harness(&dc_cfg);
@@ -606,12 +648,22 @@ async fn dispatch_discord_prompt(
             subagent: None,
             widget: None,
             checkpoint: None,
+            failover_notice: None,
         };
         db_lock
             .append_message(&session.id, &user_msg)
             .map_err(|e| e.to_string())?;
 
-        (session.id, label)
+        let proj_opt = projects.iter().find(|p| p.id == session.project_id);
+        let wsl_distro = proj_opt.and_then(|p| p.wsl_distro.as_deref());
+        let raw_cwd = if !session.worktree_path.is_empty() && session.worktree_path != "." {
+            Some(session.worktree_path.clone())
+        } else {
+            proj_opt.map(|p| p.cwd.clone())
+        };
+        let workspace_cwd = raw_cwd.map(|c| crate::platform::encode_wsl_path(wsl_distro, &c));
+
+        (session.id, label, workspace_cwd)
     };
 
     let _ = app.emit(
@@ -625,11 +677,11 @@ async fn dispatch_discord_prompt(
     );
 
     let read_only = role != "owner" && role != "friend";
-    let discord_file_hint = "[Discord Output Hint: If the user asks you to send an image or file back in Discord, include a line `[SEND_FILE: /absolute/path/to/file]` in your response.]";
+    let discord_file_hint = "[Discord Output Hint: If the user asks you to send an image or file back in Discord, include a line `[SEND_FILE: /path/inside/workspace]` in your response.]";
     let effective_prompt = if read_only {
         format!(
-            "[READ-ONLY DISCORD ROLE ({})]: Answer questions and inspect status/code only. Do NOT modify files, run mutating shell commands, or perform destructive actions.\n{}\n\n{}",
-            role, discord_file_hint, prompt
+            "[READ-ONLY DISCORD ROLE ({})]: Answer questions and inspect status/code only. Do NOT modify files, run mutating shell commands, or perform destructive actions.\n\n{}",
+            role, prompt
         )
     } else {
         format!("{}\n\n{}", discord_file_hint, prompt)
@@ -644,7 +696,7 @@ async fn dispatch_discord_prompt(
     )
     .await?;
 
-    Ok((target_label, reply))
+    Ok((target_label, reply, workspace_cwd))
 }
 
 #[poise::command(slash_command, description_localized("en-US", "Show Sakana workspace status"))]
@@ -729,6 +781,17 @@ async fn bind(
         return Ok(());
     }
 
+    let resolved_channel_name = if is_dm {
+        None
+    } else {
+        Some(
+            ctx.guild_channel()
+                .await
+                .map(|c| format!("#{}", c.name))
+                .unwrap_or_else(|| format!("#{}", ctx.channel_id())),
+        )
+    };
+
     let result = {
         let db_lock = ctx.data().db.lock().await;
         let projs = db_lock.list_projects().unwrap_or_default();
@@ -737,11 +800,7 @@ async fn bind(
                 let _ = db_lock.set_setting(&dm_project_setting_key(ctx.author().id.get()), &target.id);
                 Ok(format!("Private DM is now switched to project **{}** (`{}`).", target.name, target.cwd))
             } else {
-                let channel_name = ctx
-                    .guild_channel()
-                    .await
-                    .map(|c| format!("#{}", c.name))
-                    .unwrap_or_else(|| format!("#{}", ctx.channel_id()));
+                let channel_name = resolved_channel_name.unwrap_or_else(|| format!("#{}", ctx.channel_id()));
                 let _ = db_lock.set_project_discord_channel(&target.id, Some(&channel_name));
                 Ok(format!("Linked Discord channel `{}` to project **{}**.", channel_name, target.name))
             }
@@ -792,8 +851,9 @@ async fn ask(
     )
     .await
     {
-        Ok((_target_label, raw_reply)) => {
-            let (cleaned, files) = extract_output_files(&raw_reply);
+        Ok((_target_label, raw_reply, workspace_cwd)) => {
+            let allow_files = role == "owner" || role == "friend";
+            let (cleaned, files) = extract_output_files(&raw_reply, workspace_cwd.as_deref(), allow_files);
             let mut reply_builder = poise::CreateReply::default();
             if !cleaned.is_empty() {
                 reply_builder = reply_builder.content(truncate_discord_reply(&cleaned));
@@ -982,8 +1042,9 @@ async fn handle_event(
                 )
                 .await
                 {
-                    Ok((_, reply)) => {
-                        send_discord_reply(ctx, new_message, &reply).await;
+                    Ok((_, reply, workspace_cwd)) => {
+                        let allow_files = role == "owner" || role == "friend";
+                        send_discord_reply(ctx, new_message, &reply, workspace_cwd.as_deref(), allow_files).await;
                         finish_reaction(ctx, new_message, react_enabled, !is_harness_error_reply(&reply)).await;
                     }
                     Err(err) => {
@@ -1099,8 +1160,9 @@ async fn handle_event(
                 )
                 .await
                 {
-                    Ok((_, reply)) => {
-                        send_discord_reply(ctx, new_message, &reply).await;
+                    Ok((_, reply, workspace_cwd)) => {
+                        let allow_files = role == "owner" || role == "friend";
+                        send_discord_reply(ctx, new_message, &reply, workspace_cwd.as_deref(), allow_files).await;
                         finish_reaction(ctx, new_message, react_enabled, !is_harness_error_reply(&reply)).await;
                     }
                     Err(err) => {

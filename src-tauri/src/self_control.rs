@@ -113,11 +113,45 @@ pub fn load_customization(db: &Database) -> AppCustomization {
     cfg
 }
 
-pub fn save_customization(db: &Database, cfg: &AppCustomization) -> Result<(), String> {
-    if is_valid_builtin_theme(&cfg.theme) {
-        db.set_theme(&cfg.theme).map_err(|e| e.to_string())?;
+pub fn sanitize_customization(cfg: &AppCustomization) -> Result<AppCustomization, String> {
+    let mut clean = cfg.clone();
+    if !is_valid_builtin_theme(&clean.theme) {
+        clean.theme = "paper".to_string();
     }
-    let json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
+    clean.custom_theme_name = clean.custom_theme_name.and_then(|n| {
+        let s: String = n.trim().chars().filter(|c| !c.is_control()).take(80).collect();
+        if s.is_empty() { None } else { Some(s) }
+    });
+    clean.css_vars = clean
+        .css_vars
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let k2 = sanitize_css_var_name(&k)?;
+            let v2 = sanitize_css_var_value(&v)?;
+            Some((k2, v2))
+        })
+        .collect();
+    if clean.custom_css.len() > 16_384 {
+        return Err("Custom CSS exceeds 16KB limit".to_string());
+    }
+    let lower_css = clean.custom_css.to_ascii_lowercase();
+    if lower_css.contains("</style")
+        || lower_css.contains("@import")
+        || lower_css.contains("javascript:")
+        || lower_css.contains("expression(")
+    {
+        return Err("Custom CSS contains disallowed directives".to_string());
+    }
+    clean.ui_scale = clean.ui_scale.map(|s| s.clamp(0.5, 2.0));
+    Ok(clean)
+}
+
+pub fn save_customization(db: &Database, cfg: &AppCustomization) -> Result<(), String> {
+    let clean = sanitize_customization(cfg)?;
+    if is_valid_builtin_theme(&clean.theme) {
+        db.set_theme(&clean.theme).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string(&clean).map_err(|e| e.to_string())?;
     db.set_setting(CUSTOMIZATION_KEY, &json)
         .map_err(|e| e.to_string())
 }
@@ -249,7 +283,6 @@ pub async fn extract_and_execute_actions(
     let mut applied: Vec<String> = Vec::new();
     let mut customization_changed = false;
     let mut automations_changed = false;
-    let mut to_run_ids: Vec<String> = Vec::new();
 
     for action_val in actions {
         let Some(kind) = action_val.get("action").and_then(|v| v.as_str()) else {
@@ -444,12 +477,12 @@ pub async fn extract_and_execute_actions(
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if !name.is_empty() && !schedule.is_empty() && !prompt.is_empty() {
-                    let db = db_arc.lock().await;
-                    if db.create_automation(&name, kind, &schedule, &prompt).is_ok() {
-                        automations_changed = true;
-                        applied.push(format!("Created automation \"{}\" ({})", name, schedule));
-                    }
+                if !name.is_empty() || !prompt.is_empty() {
+                    let _ = (kind, schedule);
+                    applied.push(format!(
+                        "Blocked auto-creation of automation \"{}\" from model output (create manually in Automations)",
+                        if name.is_empty() { "unnamed" } else { &name }
+                    ));
                 }
             }
             "toggle_automation" => {
@@ -483,7 +516,10 @@ pub async fn extract_and_execute_actions(
             "run_automation" => {
                 let id = action_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 if !id.is_empty() {
-                    to_run_ids.push(id.to_string());
+                    applied.push(format!(
+                        "Blocked auto-execution of automation {} (run manually from Automations)",
+                        id
+                    ));
                 }
             }
             _ => {}
@@ -513,12 +549,6 @@ pub async fn extract_and_execute_actions(
             db.list_automations().unwrap_or_default()
         };
         crate::platform::emit_app_and_remote(app, "sakana:automations-updated", &items);
-    }
-
-    for id in to_run_ids {
-        if let Ok(item) = crate::automation::execute_automation(db_arc, app, &id).await {
-            applied.push(format!("Ran automation \"{}\" ({})", item.name, item.last_run_status));
-        }
     }
 
     if !applied.is_empty() {

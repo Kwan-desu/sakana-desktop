@@ -126,6 +126,7 @@ pub async fn execute_automation(
         app,
         &auto.name,
         &auto.prompt,
+        None,
         cwd.as_deref(),
         claude_acc.as_ref(),
         agy_acc.as_ref(),
@@ -296,6 +297,7 @@ async fn run_automation_prompt(
     app: Option<&AppHandle>,
     name: &str,
     prompt: &str,
+    webhook_payload: Option<&str>,
     project_cwd: Option<&str>,
     claude_acc: Option<&crate::models::HarnessAccountRow>,
     agy_acc: Option<&crate::models::HarnessAccountRow>,
@@ -391,25 +393,33 @@ async fn run_automation_prompt(
     {
         let cmd_str = cmd_str.trim();
         #[cfg(target_os = "windows")]
-        let output = {
-            let mut cmd = Command::new("cmd");
-            if let Some(cwd) = project_cwd.filter(|c| std::path::Path::new(c).is_dir()) {
-                cmd.current_dir(cwd);
-            }
-            cmd.args(["/C", cmd_str]).stdin(Stdio::null());
-            cmd.creation_flags(0x0800_0000);
-            cmd.output().await
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", cmd_str]);
+            c.creation_flags(0x0800_0000);
+            c
         };
         #[cfg(not(target_os = "windows"))]
-        let output = {
-            let mut cmd = Command::new("sh");
-            if let Some(cwd) = project_cwd.filter(|c| std::path::Path::new(c).is_dir()) {
-                cmd.current_dir(cwd);
-            }
-            cmd.args(["-c", cmd_str])
-                .stdin(Stdio::null())
-                .output()
-                .await
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.args(["-c", cmd_str]);
+            c
+        };
+        if let Some(cwd) = project_cwd.filter(|c| std::path::Path::new(c).is_dir()) {
+            cmd.current_dir(cwd);
+        }
+        if let Some(body) = webhook_payload {
+            cmd.env("SAKANA_WEBHOOK_PAYLOAD", body);
+        }
+        cmd.kill_on_drop(true).stdin(Stdio::null());
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            cmd.output(),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => return ("ERR".to_string(), "Shell automation timed out after 120s".to_string()),
         };
 
         return match output {
@@ -470,11 +480,19 @@ pub async fn trigger_webhook_by_path(
     let (cwd, claude_acc, agy_acc) = load_automation_context(&db).await;
     let mut triggered = Vec::new();
     for auto in matching {
-        let prompt = match &payload {
-            Some(body) if !body.trim().is_empty() => {
-                format!("{}\n\nWebhook payload:\n{}", auto.prompt, body)
-            }
-            _ => auto.prompt.clone(),
+        let trimmed_auto = auto.prompt.trim().to_ascii_lowercase();
+        let is_shell = trimmed_auto.starts_with("shell:") || trimmed_auto.starts_with("cmd:");
+        let webhook_body = payload
+            .as_deref()
+            .filter(|body| !body.trim().is_empty());
+        // Never concatenate untrusted webhook payloads onto shell:/cmd: commands;
+        // pass them safely via SAKANA_WEBHOOK_PAYLOAD env var instead.
+        let prompt = if is_shell {
+            auto.prompt.clone()
+        } else if let Some(body) = webhook_body {
+            format!("{}\n\nWebhook payload:\n{}", auto.prompt, body)
+        } else {
+            auto.prompt.clone()
         };
         let start = Instant::now();
         let (status, summary) = run_automation_prompt(
@@ -482,6 +500,7 @@ pub async fn trigger_webhook_by_path(
             app.as_ref(),
             &auto.name,
             &prompt,
+            if is_shell { webhook_body } else { None },
             cwd.as_deref(),
             claude_acc.as_ref(),
             agy_acc.as_ref(),

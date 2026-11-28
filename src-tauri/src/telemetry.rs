@@ -512,6 +512,9 @@ pub async fn set_env_secret_inner(key: String, value: String) -> Result<Vec<EnvS
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err("Secret key must be non-empty alphanumeric/underscore".to_string());
     }
+    if value.contains('\n') || value.contains('\r') || value.contains('\0') {
+        return Err("Secret value must not contain newlines or null bytes".to_string());
+    }
 
     let mut entries = read_env_entries();
     if let Some((_, existing_val)) = entries.iter_mut().find(|(k, _)| k == &key) {
@@ -664,4 +667,108 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
             )
         })?;
     app.restart();
+}
+
+// ── Feature 5: Global Full-Text Search ─────────────────────────────
+pub async fn search_history_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
+    query: String,
+    project_id: Option<String>,
+    harness: Option<String>,
+    source: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::models::SearchHit>, String> {
+    let lock = db.lock().await;
+    lock.search_history(
+        &query,
+        project_id.as_deref(),
+        harness.as_deref(),
+        source.as_deref(),
+        limit.unwrap_or(30),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn search_history(
+    state: State<'_, DbState>,
+    query: String,
+    project_id: Option<String>,
+    harness: Option<String>,
+    source: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::models::SearchHit>, String> {
+    search_history_inner(&state.0, query, project_id, harness, source, limit).await
+}
+
+// ── Feature 6: Telemetry Aggregation ───────────────────────────────
+pub async fn get_telemetry_summary_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
+    days: Option<i64>,
+) -> Result<crate::models::TelemetrySummary, String> {
+    let lock = db.lock().await;
+    lock.get_telemetry_summary(days.unwrap_or(7))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_telemetry_summary(
+    state: State<'_, DbState>,
+    days: Option<i64>,
+) -> Result<crate::models::TelemetrySummary, String> {
+    get_telemetry_summary_inner(&state.0, days).await
+}
+
+// ── Feature 7: Security & Audit Log ────────────────────────────────
+pub async fn list_audit_logs_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
+    query: Option<String>,
+    source: Option<String>,
+    status: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::models::AuditLogEntry>, String> {
+    let lock = db.lock().await;
+    lock.list_audit_logs(
+        query.as_deref(),
+        source.as_deref(),
+        status.as_deref(),
+        limit.unwrap_or(100),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_audit_logs(
+    state: State<'_, DbState>,
+    query: Option<String>,
+    source: Option<String>,
+    status: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::models::AuditLogEntry>, String> {
+    list_audit_logs_inner(&state.0, query, source, status, limit).await
+}
+
+pub async fn record_audit_log_inner(
+    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
+    source: String,
+    action: String,
+    status: String,
+    summary: String,
+    payload_json: Option<String>,
+) -> Result<crate::models::AuditLogEntry, String> {
+    let lock = db.lock().await;
+    lock.insert_audit_log(&source, &action, &status, &summary, payload_json.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn record_audit_log(
+    state: State<'_, DbState>,
+    source: String,
+    action: String,
+    status: String,
+    summary: String,
+    payload_json: Option<String>,
+) -> Result<crate::models::AuditLogEntry, String> {
+    record_audit_log_inner(&state.0, source, action, status, summary, payload_json).await
 }

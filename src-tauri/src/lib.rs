@@ -9,11 +9,13 @@ pub mod models;
 pub mod office;
 pub mod platform;
 pub mod pty;
+pub mod race;
 pub mod remote;
 pub mod self_control;
 pub mod sync;
 pub mod telemetry;
 pub mod tray;
+pub mod voice;
 
 use std::sync::Arc;
 
@@ -106,26 +108,12 @@ async fn open_file_external(
     rel_path: String,
     wsl_distro: Option<String>,
 ) -> Result<(), String> {
-    let trimmed = rel_path.trim();
-    if trimmed.is_empty() {
+    let raw_trimmed = rel_path.trim();
+    if raw_trimmed.is_empty() {
         return Err("File path is empty".to_string());
     }
     let encoded_cwd = crate::platform::encode_wsl_path(wsl_distro.as_deref(), &cwd);
-    let full_path = if let Some((distro, linux_cwd)) = crate::platform::parse_wsl_path(&encoded_cwd) {
-        let linux_target = if trimmed.starts_with('/') {
-            trimmed.to_string()
-        } else {
-            format!("{}/{}", linux_cwd.trim_end_matches('/'), trimmed.trim_start_matches("./"))
-        };
-        crate::platform::wsl_to_unc_path(&distro, &linux_target)
-    } else {
-        let p = std::path::PathBuf::from(trimmed);
-        if p.is_absolute() {
-            p
-        } else {
-            std::path::PathBuf::from(&cwd).join(trimmed.trim_start_matches("./"))
-        }
-    };
+    let full_path = crate::git::resolve_path_for_open(&encoded_cwd, raw_trimmed)?;
     if !full_path.exists() {
         return Err(format!("File not found: {}", full_path.display()));
     }
@@ -133,8 +121,9 @@ async fn open_file_external(
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &target])
+        // Avoid `cmd /C start` which interprets shell metacharacters (&, |, %, ^).
+        std::process::Command::new("explorer.exe")
+            .arg(&target)
             .creation_flags(0x0800_0000)
             .spawn()
             .map_err(|e| format!("Failed to open file externally: {e}"))?;
@@ -448,6 +437,7 @@ pub fn run() {
         .manage(remote::RemoteState::default())
         .manage(office::OfficeState::default())
         .manage(sync::SyncState::default())
+        .manage(race::RaceState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -624,6 +614,25 @@ pub fn run() {
             self_control::get_app_customization,
             self_control::update_app_customization,
             self_control::reset_app_customization,
+            voice::get_voice_config,
+            voice::update_voice_config,
+            voice::transcribe_audio,
+            harness::get_failover_config,
+            harness::update_failover_config,
+            git::rewind_checkpoint,
+            git::fork_from_checkpoint,
+            race::start_race,
+            race::list_races,
+            race::get_race,
+            race::merge_race_winner,
+            telemetry::search_history,
+            telemetry::get_telemetry_summary,
+            telemetry::list_audit_logs,
+            telemetry::record_audit_log,
+            office::list_office_blueprints,
+            office::save_office_blueprint,
+            office::delete_office_blueprint,
+            office::create_office_from_blueprint,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Sakana");

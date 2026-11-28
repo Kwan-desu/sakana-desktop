@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static NEXT_OFFICE_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 use chrono::Local;
 use futures_util::future::join_all;
@@ -20,7 +23,7 @@ use crate::DbState;
 
 #[derive(Default)]
 pub struct OfficeState {
-    pub active_runs: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    pub active_runs: Arc<Mutex<HashMap<String, (u64, watch::Sender<bool>)>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,13 +659,13 @@ pub async fn create_office(
 pub async fn delete_office_inner(
     app: Option<&AppHandle>,
     db_arc: &Arc<Mutex<Database>>,
-    active_runs: &Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    active_runs: &Arc<Mutex<HashMap<String, (u64, watch::Sender<bool>)>>>,
     active_turns: &Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     id: String,
 ) -> Result<bool, String> {
     {
         let mut runs = active_runs.lock().await;
-        if let Some(tx) = runs.remove(&id) {
+        if let Some((_, tx)) = runs.remove(&id) {
             let _ = tx.send(true);
         }
     }
@@ -845,7 +848,7 @@ pub async fn send_office_message_inner(
     app: Option<AppHandle>,
     db_arc: Arc<Mutex<Database>>,
     active_turns: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    active_runs: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    active_runs: Arc<Mutex<HashMap<String, (u64, watch::Sender<bool>)>>>,
     office_id: String,
     target_staff_id: String,
     prompt: String,
@@ -867,10 +870,11 @@ pub async fn send_office_message_inner(
     };
 
     if target.is_master {
+        let run_id = NEXT_OFFICE_RUN_ID.fetch_add(1, Ordering::Relaxed);
         let (abort_tx, mut abort_rx) = watch::channel(false);
         {
             let mut runs = active_runs.lock().await;
-            if let Some(prev_tx) = runs.insert(office_id.clone(), abort_tx) {
+            if let Some((_, prev_tx)) = runs.insert(office_id.clone(), (run_id, abort_tx)) {
                 let _ = prev_tx.send(true);
             }
         }
@@ -1227,9 +1231,17 @@ pub async fn send_office_message_inner(
                 round += 1;
             }
 
-            {
+            let is_current_run = {
                 let mut runs = active_runs.lock().await;
-                runs.remove(&office_id);
+                if runs.get(&office_id).map(|(id, _)| *id) == Some(run_id) {
+                    runs.remove(&office_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !is_current_run {
+                return;
             }
             emit_office_delegation(app_clone.as_ref(), &office_id, Vec::new());
 
@@ -1299,6 +1311,7 @@ pub async fn send_office_message_inner(
                                 subagent: None,
                                 widget: None,
                                 checkpoint: None,
+                                failover_notice: None,
                             };
                             let _ = db.append_message(&master.session_id, &report_msg);
                             let evt = OfficeEvent {
@@ -1417,6 +1430,7 @@ pub async fn report_staff_to_master_inner(
         subagent: None,
         widget: None,
         checkpoint: None,
+        failover_notice: None,
     };
     db.append_message(&master.session_id, &report_msg)
         .map_err(|e| e.to_string())?;
@@ -1464,12 +1478,12 @@ pub async fn stop_office_run_inner(
     app: Option<&AppHandle>,
     db_arc: &Arc<Mutex<Database>>,
     active_turns: &Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    active_runs: &Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    active_runs: &Arc<Mutex<HashMap<String, (u64, watch::Sender<bool>)>>>,
     office_id: String,
 ) -> Result<(), String> {
     {
         let mut runs = active_runs.lock().await;
-        if let Some(tx) = runs.remove(&office_id) {
+        if let Some((_, tx)) = runs.remove(&office_id) {
             let _ = tx.send(true);
         }
     }
@@ -1520,6 +1534,182 @@ pub async fn stop_office_run(
         office_id,
     )
     .await
+}
+
+// ── Feature 6: Office Blueprints ───────────────────────────────────
+pub async fn list_office_blueprints_inner(
+    db_arc: &Arc<Mutex<Database>>,
+) -> Result<Vec<crate::models::OfficeBlueprint>, String> {
+    let db = db_arc.lock().await;
+    db.list_office_blueprints().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_office_blueprints(
+    db_state: State<'_, DbState>,
+) -> Result<Vec<crate::models::OfficeBlueprint>, String> {
+    list_office_blueprints_inner(&db_state.0).await
+}
+
+pub async fn save_office_blueprint_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    office_id: String,
+    name: String,
+    description: String,
+) -> Result<crate::models::OfficeBlueprint, String> {
+    let db = db_arc.lock().await;
+    let office = db
+        .get_office(&office_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Office '{}' not found", office_id))?;
+    let staff = office
+        .staff
+        .iter()
+        .map(|s| crate::models::OfficeBlueprintStaff {
+            name: s.name.clone(),
+            role: s.role.clone(),
+            is_master: s.is_master,
+            harness: s.harness.clone(),
+            model: s.model.clone(),
+            effort: s.effort.clone(),
+            permission_mode: s.permission_mode.clone(),
+            system_prompt: s.system_prompt.clone(),
+            isolated_worktree: s.isolated_worktree,
+            avatar_color: s.avatar_color.clone(),
+        })
+        .collect();
+    let config = crate::models::OfficeBlueprintConfig {
+        max_rounds: office.max_rounds,
+        staff,
+    };
+    let bp = db
+        .save_office_blueprint(&name, &description, &config)
+        .map_err(|e| e.to_string())?;
+    let _ = db.insert_audit_log(
+        "desktop",
+        "save_office_blueprint",
+        "allowed",
+        &format!("Saved office blueprint '{}' from office '{}'", bp.name, office.name),
+        None,
+    );
+    Ok(bp)
+}
+
+#[tauri::command]
+pub async fn save_office_blueprint(
+    db_state: State<'_, DbState>,
+    office_id: String,
+    name: String,
+    description: Option<String>,
+) -> Result<crate::models::OfficeBlueprint, String> {
+    save_office_blueprint_inner(&db_state.0, office_id, name, description.unwrap_or_default()).await
+}
+
+pub async fn delete_office_blueprint_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    id: String,
+) -> Result<bool, String> {
+    let db = db_arc.lock().await;
+    db.delete_office_blueprint(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_office_blueprint(
+    db_state: State<'_, DbState>,
+    id: String,
+) -> Result<bool, String> {
+    delete_office_blueprint_inner(&db_state.0, id).await
+}
+
+pub async fn create_office_from_blueprint_inner(
+    app: Option<&AppHandle>,
+    db_arc: &Arc<Mutex<Database>>,
+    blueprint_id: String,
+    name: Option<String>,
+    project_id: Option<String>,
+    cwd: Option<String>,
+) -> Result<Office, String> {
+    let bp = {
+        let db = db_arc.lock().await;
+        db.get_office_blueprint(&blueprint_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Office blueprint '{}' not found", blueprint_id))?
+    };
+
+    let master = bp
+        .config
+        .staff
+        .iter()
+        .find(|s| s.is_master)
+        .or_else(|| bp.config.staff.first())
+        .cloned()
+        .ok_or_else(|| "Blueprint has no staff defined".to_string())?;
+
+    let office_name = name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| bp.name.clone());
+
+    let created = create_office_inner(
+        app,
+        db_arc,
+        CreateOfficeInput {
+            name: office_name,
+            project_id,
+            cwd,
+            runtime: None,
+            wsl_distro: None,
+            master_name: Some(master.name.clone()),
+            master_harness: master.harness.clone(),
+            master_model: master.model.clone(),
+            master_effort: if master.effort.is_empty() { None } else { Some(master.effort.clone()) },
+            master_account: None,
+            master_permission_mode: if master.permission_mode.is_empty() { None } else { Some(master.permission_mode.clone()) },
+            max_rounds: Some(bp.config.max_rounds.max(1)),
+        },
+    )
+    .await?;
+
+    for s in bp.config.staff.iter().filter(|s| !s.is_master) {
+        let _ = hire_staff_internal(
+            app,
+            db_arc,
+            HireStaffInput {
+                office_id: created.id.clone(),
+                name: s.name.clone(),
+                role: s.role.clone(),
+                harness: s.harness.clone(),
+                model: s.model.clone(),
+                effort: if s.effort.is_empty() { None } else { Some(s.effort.clone()) },
+                account: None,
+                permission_mode: if s.permission_mode.is_empty() { None } else { Some(s.permission_mode.clone()) },
+                system_prompt: if s.system_prompt.is_empty() { None } else { Some(s.system_prompt.clone()) },
+                isolated_worktree: Some(s.isolated_worktree),
+                avatar_color: if s.avatar_color.is_empty() { None } else { Some(s.avatar_color.clone()) },
+                is_dynamic: Some(false),
+            },
+        )
+        .await;
+    }
+
+    let db = db_arc.lock().await;
+    let final_office = db
+        .get_office(&created.id)
+        .map_err(|e| e.to_string())?
+        .unwrap_or(created);
+    emit_office_updated(app, &final_office);
+    Ok(final_office)
+}
+
+#[tauri::command]
+pub async fn create_office_from_blueprint(
+    app: AppHandle,
+    db_state: State<'_, DbState>,
+    blueprint_id: String,
+    name: Option<String>,
+    project_id: Option<String>,
+    cwd: Option<String>,
+) -> Result<Office, String> {
+    create_office_from_blueprint_inner(Some(&app), &db_state.0, blueprint_id, name, project_id, cwd).await
 }
 
 #[cfg(test)]

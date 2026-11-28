@@ -413,6 +413,7 @@ struct TurnAccumulator {
     input_tokens: i64,
     output_tokens: i64,
     cost_usd: f64,
+    failover_notice: Option<String>,
 }
 
 impl TurnAccumulator {
@@ -427,6 +428,7 @@ impl TurnAccumulator {
             input_tokens: 0,
             output_tokens: 0,
             cost_usd: 0.0,
+            failover_notice: None,
         }
     }
 
@@ -456,8 +458,59 @@ impl TurnAccumulator {
             subagent: self.subagent,
             widget,
             checkpoint: None,
+            failover_notice: self.failover_notice,
         }
     }
+}
+
+fn is_rate_limit_or_quota_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("usage limit")
+        || lower.contains("quota exceeded")
+        || lower.contains("quota_exceeded")
+        || lower.contains("too many requests")
+        || lower.contains("overloaded")
+}
+
+pub async fn get_failover_config_inner(
+    db_arc: &Arc<Mutex<crate::db::Database>>,
+    project_id: Option<String>,
+) -> Result<crate::models::FailoverConfig, String> {
+    let db = db_arc.lock().await;
+    db.get_failover_config(project_id.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+pub async fn update_failover_config_inner(
+    db_arc: &Arc<Mutex<crate::db::Database>>,
+    project_id: Option<String>,
+    mut config: crate::models::FailoverConfig,
+) -> Result<crate::models::FailoverConfig, String> {
+    config.quota_threshold_pct = config.quota_threshold_pct.clamp(10, 100);
+    let db = db_arc.lock().await;
+    db.save_failover_config(project_id.as_deref(), &config)
+        .map_err(|e| e.to_string())?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub async fn get_failover_config(
+    db_state: State<'_, DbState>,
+    project_id: Option<String>,
+) -> Result<crate::models::FailoverConfig, String> {
+    get_failover_config_inner(&db_state.0, project_id).await
+}
+
+#[tauri::command]
+pub async fn update_failover_config(
+    db_state: State<'_, DbState>,
+    project_id: Option<String>,
+    config: crate::models::FailoverConfig,
+) -> Result<crate::models::FailoverConfig, String> {
+    update_failover_config_inner(&db_state.0, project_id, config).await
 }
 
 fn emit_token(app: Option<&AppHandle>, session_id: &str, message_id: &str, token: &str, acc: &mut TurnAccumulator) {
@@ -818,6 +871,7 @@ async fn run_cli_harness(
     let mut cmd = crate::platform::tokio_command(&bin_str);
     crate::auth::apply_account_env(&mut cmd, harness, account);
     cmd.current_dir(cwd)
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1097,7 +1151,7 @@ async fn run_wsl_cli_harness(
     let posix_cwd = wsl_posix_cwd(cwd);
     let mut cmd = crate::platform::wsl_tokio_shell(distro, &posix_cwd, &cli_cmd);
     crate::auth::apply_account_env(&mut cmd, harness, account);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn {} in WSL ({}): {}", harness, distro, e))?;
@@ -1410,6 +1464,7 @@ pub async fn compact_session_inner(
         subagent: None,
         widget: None,
         checkpoint: None,
+        failover_notice: None,
     };
 
     {
@@ -1815,6 +1870,7 @@ pub async fn send_turn_with_options(
             subagent: None,
             widget: None,
             checkpoint: None,
+            failover_notice: None,
         };
         db.append_message(&session_id, &user_msg)
             .map_err(|e| e.to_string())?;
@@ -1952,36 +2008,176 @@ pub async fn send_turn_with_options(
         let full_prompt_with_ctx =
             build_cli_prompt_with_history(&sakana_ctx, &recent_history, &effective_prompt);
 
-        let (resolved_model, resolved_effort) = if active_harness == "agy-cli" {
-            let (m, e) =
-                resolve_agy_model_and_effort_with_db(&db_arc, &session.model, &session.effort)
-                    .await;
-            (m.unwrap_or_default(), e.unwrap_or_default())
-        } else {
-            (session.model.clone(), session.effort.clone())
+        // Auto-Failover & Smart Quota Routing (pre-check + up to 3 retry hops)
+        let failover_cfg = {
+            let db = db_arc.lock().await;
+            db.get_failover_config(Some(&session.project_id)).unwrap_or_default()
         };
 
-        let run_result = if let Some(ref distro) = project_wsl_distro {
-            if active_harness == "sakana" {
-                run_http_sse_fallback(
-                    &effective_cwd,
-                    &session.model,
-                    &sakana_ctx,
-                    &recent_history,
-                    &effective_prompt,
-                    app_handle.as_ref(),
-                    &sid,
-                    &msg_id_clone,
-                    started,
-                    &mut acc,
-                    cancel_rx,
-                )
-                .await
+        let mut cur_harness = active_harness.clone();
+        let mut cur_model = session.model.clone();
+        let mut cur_account = active_account.clone();
+        let mut tried_accounts: Vec<String> = cur_account
+            .as_ref()
+            .map(|a| vec![a.id.clone()])
+            .unwrap_or_default();
+        let mut fallback_idx: usize = 0;
+        let mut failover_hops: u8 = 0;
+
+        // Pre-check cached QuotaAccount percentages before spawning
+        if failover_cfg.enabled {
+            let quota_exceeded_reason: Option<String> = {
+                let db = db_arc.lock().await;
+                let quotas = db.list_accounts().unwrap_or_default();
+                let cur_label = cur_account.as_ref().map(|a| a.label.as_str()).unwrap_or("");
+                let cur_email = cur_account.as_ref().map(|a| a.email.as_str()).unwrap_or("");
+                quotas.iter().find(|q| {
+                    q.harness == cur_harness
+                        && ((!cur_label.is_empty() && q.label.eq_ignore_ascii_case(cur_label))
+                            || (!cur_email.is_empty() && q.email.eq_ignore_ascii_case(cur_email))
+                            || q.is_default.unwrap_or(false))
+                }).and_then(|q| {
+                    let threshold = failover_cfg.quota_threshold_pct as f64;
+                    if q.five_hour_pct >= threshold {
+                        Some(format!("5h limit {:.0}%", q.five_hour_pct))
+                    } else if q.weekly_pct >= threshold {
+                        Some(format!("weekly limit {:.0}%", q.weekly_pct))
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(reason) = quota_exceeded_reason {
+                let from_h = cur_harness.clone();
+                let from_acc_label = cur_account
+                    .as_ref()
+                    .map(|a| a.label.clone())
+                    .unwrap_or_else(|| "default".to_string());
+                let mut switched = false;
+                if failover_cfg.rotate_accounts_same_harness {
+                    let next_acc = {
+                        let db = db_arc.lock().await;
+                        db.list_harness_accounts(Some(&cur_harness))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|a| a.status == "authenticated" && !tried_accounts.contains(&a.id))
+                    };
+                    if let Some(na) = next_acc {
+                        tried_accounts.push(na.id.clone());
+                        cur_account = Some(na);
+                        switched = true;
+                    }
+                }
+                if !switched && fallback_idx < failover_cfg.fallback_chain.len() {
+                    let target = &failover_cfg.fallback_chain[fallback_idx];
+                    fallback_idx += 1;
+                    cur_harness = target.harness.clone();
+                    if !target.model.trim().is_empty() {
+                        cur_model = target.model.clone();
+                    }
+                    cur_account = {
+                        let db = db_arc.lock().await;
+                        target
+                            .account
+                            .as_deref()
+                            .and_then(|aid| db.get_harness_account(aid).ok().flatten())
+                            .or_else(|| db.get_default_harness_account(&cur_harness).ok().flatten())
+                    };
+                    switched = true;
+                }
+                if switched {
+                    failover_hops += 1;
+                    let to_acc_label = cur_account
+                        .as_ref()
+                        .map(|a| a.label.clone())
+                        .unwrap_or_else(|| "default".to_string());
+                    let notice = if from_h == cur_harness {
+                        format!("Switched account: {} -> {} ({})", from_acc_label, to_acc_label, reason)
+                    } else {
+                        format!("Failover: {}/{} -> {}/{} ({})", from_h, from_acc_label, cur_harness, to_acc_label, reason)
+                    };
+                    acc.failover_notice = Some(notice.clone());
+                    crate::platform::emit_app_and_remote(
+                        app_handle.as_ref(),
+                        "turn:failover",
+                        crate::models::TurnFailoverEvent {
+                            session_id: sid.clone(),
+                            message_id: msg_id_clone.clone(),
+                            from_harness: from_h,
+                            from_account: from_acc_label,
+                            to_harness: cur_harness.clone(),
+                            to_account: to_acc_label,
+                            to_model: cur_model.clone(),
+                            reason,
+                            hop: failover_hops,
+                            notice,
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut cancel_rx_opt = Some(cancel_rx);
+        let run_result = loop {
+            let (resolved_model, resolved_effort) = if cur_harness == "agy-cli" {
+                let (m, e) =
+                    resolve_agy_model_and_effort_with_db(&db_arc, &cur_model, &session.effort)
+                        .await;
+                (m.unwrap_or_default(), e.unwrap_or_default())
             } else {
-                run_wsl_cli_harness(
-                    distro,
-                    &active_harness,
-                    active_account.as_ref(),
+                (cur_model.clone(), session.effort.clone())
+            };
+            let attempt_cancel_rx = match cancel_rx_opt.take() {
+                Some(rx) => rx,
+                None => {
+                    let (retry_tx, retry_rx) = oneshot::channel::<()>();
+                    let mut active = active_arc.lock().await;
+                    active.insert(sid.clone(), retry_tx);
+                    retry_rx
+                }
+            };
+
+            let attempt_res = if let Some(ref distro) = project_wsl_distro {
+                if cur_harness == "sakana" {
+                    run_http_sse_fallback(
+                        &effective_cwd,
+                        &cur_model,
+                        &sakana_ctx,
+                        &recent_history,
+                        &effective_prompt,
+                        app_handle.as_ref(),
+                        &sid,
+                        &msg_id_clone,
+                        started,
+                        &mut acc,
+                        attempt_cancel_rx,
+                    )
+                    .await
+                } else {
+                    run_wsl_cli_harness(
+                        distro,
+                        &cur_harness,
+                        cur_account.as_ref(),
+                        &resolved_model,
+                        &resolved_effort,
+                        &session.permission_mode,
+                        &enabled_mcp_servers,
+                        &effective_cwd,
+                        &full_prompt_with_ctx,
+                        app_handle.as_ref(),
+                        &sid,
+                        &msg_id_clone,
+                        started,
+                        &mut acc,
+                        attempt_cancel_rx,
+                    )
+                    .await
+                }
+            } else if let Some(bin) = resolve_harness_binary(&cur_harness) {
+                run_cli_harness(
+                    &bin,
+                    &cur_harness,
+                    cur_account.as_ref(),
                     &resolved_model,
                     &resolved_effort,
                     &session.permission_mode,
@@ -1993,67 +2189,126 @@ pub async fn send_turn_with_options(
                     &msg_id_clone,
                     started,
                     &mut acc,
-                    cancel_rx,
+                    attempt_cancel_rx,
                 )
                 .await
-            }
-        } else if let Some(bin) = resolve_harness_binary(&active_harness) {
-            run_cli_harness(
-                &bin,
-                &active_harness,
-                active_account.as_ref(),
-                &resolved_model,
-                &resolved_effort,
-                &session.permission_mode,
-                &enabled_mcp_servers,
-                &effective_cwd,
-                &full_prompt_with_ctx,
-                app_handle.as_ref(),
-                &sid,
-                &msg_id_clone,
-                started,
-                &mut acc,
-                cancel_rx,
-            )
-            .await
-        } else if active_harness == "sakana" {
-            run_http_sse_fallback(
-                &effective_cwd,
-                &session.model,
-                &sakana_ctx,
-                &recent_history,
-                &effective_prompt,
-                app_handle.as_ref(),
-                &sid,
-                &msg_id_clone,
-                started,
-                &mut acc,
-                cancel_rx,
-            )
-            .await
-        } else {
-            match run_http_sse_fallback(
-                &effective_cwd,
-                &session.model,
-                &sakana_ctx,
-                &recent_history,
-                &effective_prompt,
-                app_handle.as_ref(),
-                &sid,
-                &msg_id_clone,
-                started,
-                &mut acc,
-                cancel_rx,
-            )
-            .await
-            {
-                Ok(()) => Ok(()),
-                Err(_) => Err(format!(
-                    "Harness '{}' CLI binary not found in PATH and no LLM API key (OPENROUTER_API_KEY / OPENAI_API_KEY / OLLAMA_BASE_URL) is configured.",
-                    active_harness
-                )),
+            } else if cur_harness == "sakana" {
+                run_http_sse_fallback(
+                    &effective_cwd,
+                    &cur_model,
+                    &sakana_ctx,
+                    &recent_history,
+                    &effective_prompt,
+                    app_handle.as_ref(),
+                    &sid,
+                    &msg_id_clone,
+                    started,
+                    &mut acc,
+                    attempt_cancel_rx,
+                )
+                .await
+            } else {
+                match run_http_sse_fallback(
+                    &effective_cwd,
+                    &cur_model,
+                    &sakana_ctx,
+                    &recent_history,
+                    &effective_prompt,
+                    app_handle.as_ref(),
+                    &sid,
+                    &msg_id_clone,
+                    started,
+                    &mut acc,
+                    attempt_cancel_rx,
+                )
+                .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(format!(
+                        "Harness '{}' CLI binary not found in PATH and no LLM API key (OPENROUTER_API_KEY / OPENAI_API_KEY / OLLAMA_BASE_URL) is configured.",
+                        cur_harness
+                    )),
+                }
+            };
+
+            match attempt_res {
+                Ok(()) => break Ok(()),
+                Err(err_msg) if failover_cfg.enabled && failover_hops < 3 && is_rate_limit_or_quota_error(&err_msg) => {
+                    let from_h = cur_harness.clone();
+                    let from_acc_label = cur_account
+                        .as_ref()
+                        .map(|a| a.label.clone())
+                        .unwrap_or_else(|| "default".to_string());
+                    let mut switched = false;
+                    if failover_cfg.rotate_accounts_same_harness {
+                        let next_acc = {
+                            let db = db_arc.lock().await;
+                            db.list_harness_accounts(Some(&cur_harness))
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|a| a.status == "authenticated" && !tried_accounts.contains(&a.id))
+                        };
+                        if let Some(na) = next_acc {
+                            tried_accounts.push(na.id.clone());
+                            cur_account = Some(na);
+                            switched = true;
+                        }
+                    }
+                    if !switched && fallback_idx < failover_cfg.fallback_chain.len() {
+                        let target = &failover_cfg.fallback_chain[fallback_idx];
+                        fallback_idx += 1;
+                        cur_harness = target.harness.clone();
+                        if !target.model.trim().is_empty() {
+                            cur_model = target.model.clone();
+                        }
+                        cur_account = {
+                            let db = db_arc.lock().await;
+                            target
+                                .account
+                                .as_deref()
+                                .and_then(|aid| db.get_harness_account(aid).ok().flatten())
+                                .or_else(|| db.get_default_harness_account(&cur_harness).ok().flatten())
+                        };
+                        switched = true;
+                    }
+                    if !switched {
+                        break Err(err_msg);
+                    }
+                    failover_hops += 1;
+                    acc.text.clear();
+                    acc.thinking.clear();
+                    acc.stream_error = None;
+                    let to_acc_label = cur_account
+                        .as_ref()
+                        .map(|a| a.label.clone())
+                        .unwrap_or_else(|| "default".to_string());
+                    let notice = if from_h == cur_harness {
+                        format!("Switched account: {} -> {} (rate limit)", from_acc_label, to_acc_label)
+                    } else {
+                        format!("Failover: {}/{} -> {}/{} (rate limit)", from_h, from_acc_label, cur_harness, to_acc_label)
+                    };
+                    acc.failover_notice = Some(notice.clone());
+                    crate::platform::emit_app_and_remote(
+                        app_handle.as_ref(),
+                        "turn:failover",
+                        crate::models::TurnFailoverEvent {
+                            session_id: sid.clone(),
+                            message_id: msg_id_clone.clone(),
+                            from_harness: from_h,
+                            from_account: from_acc_label,
+                            to_harness: cur_harness.clone(),
+                            to_account: to_acc_label,
+                            to_model: cur_model.clone(),
+                            reason: "rate limit".to_string(),
+                            hop: failover_hops,
+                            notice,
+                        },
+                    );
+                }
+                Err(err_msg) => break Err(err_msg),
             }
         };
+        let active_harness = cur_harness;
 
         let elapsed_ms = started.elapsed().as_millis() as i64;
         if let Some(ref mut sub) = acc.subagent {
@@ -3557,6 +3812,7 @@ mod tests {
                 subagent: None,
                 widget: None,
                 checkpoint: None,
+                failover_notice: None,
             },
             ChatMessage {
                 id: "2".to_string(),
@@ -3570,6 +3826,7 @@ mod tests {
                 subagent: None,
                 widget: None,
                 checkpoint: None,
+                failover_notice: None,
             },
             ChatMessage {
                 id: "3".to_string(),
@@ -3583,6 +3840,7 @@ mod tests {
                 subagent: None,
                 widget: None,
                 checkpoint: None,
+                failover_notice: None,
             },
         ];
         let msgs = build_http_messages("sys", &history, "Next\n\nAttached Context:\n- file.rs");
@@ -3682,6 +3940,7 @@ mod tests {
                 subagent: None,
                 widget: None,
                 checkpoint: None,
+                failover_notice: None,
             },
             ChatMessage {
                 id: "2".to_string(),
@@ -3695,6 +3954,7 @@ mod tests {
                 subagent: None,
                 widget: None,
                 checkpoint: None,
+                failover_notice: None,
             },
             ChatMessage {
                 id: "3".to_string(),
@@ -3708,6 +3968,7 @@ mod tests {
                 subagent: None,
                 widget: None,
                 checkpoint: None,
+                failover_notice: None,
             },
         ];
 

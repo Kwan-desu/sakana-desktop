@@ -11,6 +11,7 @@ import {
   GitPullRequest,
   Globe,
   ListChecks,
+  FlagCheckered,
   MagnifyingGlass,
   Palette,
   Plugs,
@@ -22,9 +23,11 @@ import type {
   DashboardSubtab,
   InspectorTab,
   Project,
+  SearchHit,
   ThemeId,
   Thread,
 } from '../types';
+import { tauriApi } from '../lib/tauriApi';
 import { DiscordIcon, THEME_META } from './HarnessBadge';
 
 interface CommandPaletteProps {
@@ -40,6 +43,7 @@ interface CommandPaletteProps {
   onToggleSplit: () => void;
   onOpenNewWorktree: () => void;
   onOpenCreatePr: () => void;
+  onOpenRace?: () => void;
 }
 
 export function CommandPalette({
@@ -55,8 +59,11 @@ export function CommandPalette({
   onToggleSplit,
   onOpenNewWorktree,
   onOpenCreatePr,
+  onOpenRace,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
+  const [ftsHits, setFtsHits] = useState<SearchHit[]>([]);
+  const [ftsLoading, setFtsLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -71,6 +78,32 @@ export function CommandPalette({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    const trimmed = query.trim();
+    if (trimmed.length < 2) {
+      setFtsHits([]);
+      setFtsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setFtsLoading(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const hits = await tauriApi.searchHistory(trimmed, undefined, undefined, 15);
+        if (!cancelled) setFtsHits(hits);
+      } catch {
+        if (!cancelled) setFtsHits([]);
+      } finally {
+        if (!cancelled) setFtsLoading(false);
+      }
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [open, query]);
 
   if (!open) return null;
 
@@ -114,6 +147,20 @@ export function CommandPalette({
         onOpenCreatePr();
       },
     },
+    ...(onOpenRace
+      ? [
+          {
+            id: 'start-race',
+            label: 'Start Multi-Harness Parallel Race',
+            hint: 'Race Mode',
+            icon: <FlagCheckered size={14} />,
+            run: () => {
+              onClose();
+              onOpenRace();
+            },
+          },
+        ]
+      : []),
     {
       id: 'split',
       label: 'Toggle 2-Thread Split View',
@@ -213,29 +260,67 @@ export function CommandPalette({
           </button>
         </div>
 
-        <div className="max-h-[380px] overflow-y-auto p-1.5 space-y-0.5">
-          {actions.length === 0 ? (
+        <div className="max-h-[420px] overflow-y-auto p-1.5 space-y-0.5">
+          {actions.length === 0 && ftsHits.length === 0 && !ftsLoading ? (
             <div className="py-6 text-center text-[12px]" style={{ color: 'var(--text-muted)' }}>
-              No matching commands, projects, or threads.
+              No matching commands, projects, threads, or history.
             </div>
           ) : (
-            actions.map((a) => (
-              <button
-                key={a.id}
-                type="button"
-                onClick={a.run}
-                className="w-full px-3 py-2 rounded-[8px] flex items-center justify-between gap-3 text-[12.5px] hover:bg-[var(--bg-hover)] cursor-pointer text-left"
-                style={{ color: 'var(--text-main)' }}
-              >
-                <span className="inline-flex items-center gap-2.5 min-w-0">
-                  <span style={{ color: 'var(--text-muted)' }}>{a.icon}</span>
-                  <span className="truncate">{a.label}</span>
-                </span>
-                <span className="font-mono-tech text-[10.5px] shrink-0 max-w-[180px] truncate" style={{ color: 'var(--text-muted)' }}>
-                  {a.hint}
-                </span>
-              </button>
-            ))
+            <>
+              {actions.map((a) => (
+                <button
+                  key={a.id}
+                  type="button"
+                  onClick={a.run}
+                  className="w-full px-3 py-2 rounded-[8px] flex items-center justify-between gap-3 text-[12.5px] hover:bg-[var(--bg-hover)] cursor-pointer text-left"
+                  style={{ color: 'var(--text-main)' }}
+                >
+                  <span className="inline-flex items-center gap-2.5 min-w-0">
+                    <span style={{ color: 'var(--text-muted)' }}>{a.icon}</span>
+                    <span className="truncate">{a.label}</span>
+                  </span>
+                  <span className="font-mono-tech text-[10.5px] shrink-0 max-w-[180px] truncate" style={{ color: 'var(--text-muted)' }}>
+                    {a.hint}
+                  </span>
+                </button>
+              ))}
+              {(ftsLoading || ftsHits.length > 0) && (
+                <div className="pt-2 mt-1 border-t" style={{ borderColor: 'var(--border-line)' }}>
+                  <div className="px-3 py-1 text-[10px] font-mono-tech uppercase tracking-wider flex items-center justify-between" style={{ color: 'var(--text-muted)' }}>
+                    <span>History Full-Text Search (FTS5)</span>
+                    {ftsLoading && <span>Searching...</span>}
+                  </div>
+                  {ftsHits.map((hit) => (
+                    <button
+                      key={`${hit.kind}-${hit.entityId}`}
+                      type="button"
+                      onClick={() => {
+                        if (hit.sessionId) {
+                          onSelectThread(hit.sessionId);
+                        } else if (hit.projectId) {
+                          onSelectProject(hit.projectId);
+                        }
+                        onClose();
+                      }}
+                      className="w-full px-3 py-2 rounded-[8px] flex flex-col gap-0.5 hover:bg-[var(--bg-hover)] cursor-pointer text-left"
+                      style={{ color: 'var(--text-main)' }}
+                    >
+                      <div className="flex items-center justify-between gap-2 text-[11.5px]">
+                        <span className="font-medium truncate">
+                          {hit.sessionTitle || hit.projectName || 'Session'}
+                        </span>
+                        <span className="font-mono-tech text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>
+                          {hit.projectName} · {hit.harness} · {hit.timestamp}
+                        </span>
+                      </div>
+                      <div className="text-[11px] line-clamp-2" style={{ color: 'var(--text-muted)' }}>
+                        {hit.snippet}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>

@@ -86,11 +86,25 @@ fn run_git(cwd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 fn run_git_with_env(cwd: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
-    let mut cmd = git_cmd(cwd);
-    cmd.args(args);
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
+    let mut cmd = if let Some((distro, linux_path)) = crate::platform::parse_wsl_path(cwd) {
+        let env_pairs: Vec<String> = envs.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        let mut wsl_args: Vec<&str> = Vec::with_capacity(env_pairs.len() + 3 + args.len());
+        for pair in &env_pairs {
+            wsl_args.push(pair.as_str());
+        }
+        wsl_args.push("git");
+        wsl_args.push("-C");
+        wsl_args.push(&linux_path);
+        wsl_args.extend_from_slice(args);
+        crate::platform::wsl_std_command(&distro, None, "env", &wsl_args)
+    } else {
+        let mut c = git_cmd(cwd);
+        c.args(args);
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c
+    };
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to run git {}: {}", args.join(" "), e))?;
@@ -138,23 +152,13 @@ fn link_shared_dep(src: &Path, dst: &Path) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let src_str = src.to_string_lossy().to_string();
-        let dst_str = dst.to_string_lossy().to_string();
-        let mut cmd = Command::new("cmd");
-        cmd.creation_flags(CREATE_NO_WINDOW);
         if src.is_dir() {
-            cmd.args(["/C", "mklink", "/J", &dst_str, &src_str]);
+            // Native Win32 directory junction — no cmd.exe, no Admin/Developer Mode required.
+            junction::create(src, dst)
+                .map_err(|e| format!("Failed to create directory junction {} -> {}: {}", dst.display(), src.display(), e))?;
         } else {
-            cmd.args(["/C", "mklink", &dst_str, &src_str]);
-        }
-        let out = cmd
-            .output()
-            .map_err(|e| format!("Failed to run mklink for {}: {}", dst_str, e))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err(format!("mklink failed for {}: {}", dst_str, err));
+            std::os::windows::fs::symlink_file(src, dst)
+                .map_err(|e| format!("Failed to link file {} -> {}: {}", dst.display(), src.display(), e))?;
         }
     }
 
@@ -167,6 +171,47 @@ fn link_shared_dep(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_worktree_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!("Invalid worktree session_id: '{}'.", session_id));
+    }
+    Ok(())
+}
+
+fn validate_git_branch_name(branch: &str) -> Result<(), String> {
+    let b = branch.trim();
+    if b.is_empty()
+        || b.starts_with('-')
+        || b.contains("..")
+        || b.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!("Invalid git branch name: '{}'.", branch));
+    }
+    Ok(())
+}
+
+fn validate_relative_dep(dep: &str) -> Result<PathBuf, String> {
+    let p = Path::new(dep);
+    if p.is_absolute() {
+        return Err(format!("Shared dep '{}' must be a relative path", dep));
+    }
+    for comp in p.components() {
+        if matches!(
+            comp,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        ) {
+            return Err(format!("Shared dep '{}' escapes workspace root", dep));
+        }
+    }
+    Ok(p.to_path_buf())
+}
+
 pub async fn create_worktree_inner(
     db_arc: &Arc<Mutex<Database>>,
     session_id: String,
@@ -174,6 +219,8 @@ pub async fn create_worktree_inner(
     branch: String,
     shared_deps: Vec<String>,
 ) -> Result<String, String> {
+    validate_worktree_session_id(&session_id)?;
+    validate_git_branch_name(&branch)?;
     let wsl_distro = resolve_session_wsl_distro(db_arc, &session_id).await;
     let effective_cwd = resolve_effective_cwd(db_arc, &project_cwd, wsl_distro.as_deref()).await;
     let fs_root = resolve_fs_root(&effective_cwd);
@@ -209,8 +256,9 @@ pub async fn create_worktree_inner(
         if trimmed.is_empty() {
             continue;
         }
-        let src = fs_root.join(trimmed);
-        let dst = wt_dir.join(trimmed);
+        let rel_dep = validate_relative_dep(trimmed)?;
+        let src = fs_root.join(&rel_dep);
+        let dst = wt_dir.join(&rel_dep);
         link_shared_dep(&src, &dst)?;
     }
 
@@ -233,6 +281,7 @@ pub async fn remove_worktree_inner(
     session_id: String,
     project_cwd: String,
 ) -> Result<(), String> {
+    validate_worktree_session_id(&session_id)?;
     let wsl_distro = resolve_session_wsl_distro(db_arc, &session_id).await;
     let effective_cwd = resolve_effective_cwd(db_arc, &project_cwd, wsl_distro.as_deref()).await;
     let fs_root = resolve_fs_root(&effective_cwd);
@@ -317,6 +366,7 @@ pub async fn checkout_branch_inner(
     branch: String,
     wsl_distro: Option<String>,
 ) -> Result<(), String> {
+    validate_git_branch_name(&branch)?;
     let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
     run_git(&cwd, &["checkout", &branch])?;
@@ -599,28 +649,47 @@ pub async fn create_checkpoint_inner(
 ) -> Result<Option<TurnCheckpoint>, String> {
     let wsl_distro = resolve_session_wsl_distro(db_arc, &session_id).await;
     let cwd = crate::platform::encode_wsl_path(wsl_distro.as_deref(), &cwd);
-    let git_dir = resolve_git_dir(&cwd)?;
-    let orig_index = git_dir.join("index");
-    let temp_index = std::env::temp_dir().join(format!("sakana-idx-{}", Uuid::new_v4()));
+    let idx_name = format!("sakana-idx-{}", Uuid::new_v4());
+    let (temp_index_host, temp_idx_env) = if let Some((distro, linux_path)) = crate::platform::parse_wsl_path(&cwd) {
+        let raw_git_dir = run_git(&cwd, &["rev-parse", "--git-dir"])?;
+        let trimmed = raw_git_dir.trim();
+        let linux_git_dir = if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("{}/{}", linux_path.trim_end_matches('/'), trimmed)
+        };
+        let orig_index_host = crate::platform::wsl_to_unc_path(&distro, &format!("{}/index", linux_git_dir.trim_end_matches('/')));
+        let linux_temp = format!("/tmp/{}", idx_name);
+        let host_temp = crate::platform::wsl_to_unc_path(&distro, &linux_temp);
+        if orig_index_host.exists() {
+            std::fs::copy(&orig_index_host, &host_temp)
+                .map_err(|e| format!("Failed to copy WSL git index: {}", e))?;
+        }
+        (host_temp, linux_temp)
+    } else {
+        let git_dir = resolve_git_dir(&cwd)?;
+        let orig_index = git_dir.join("index");
+        let host_temp = std::env::temp_dir().join(&idx_name);
+        if orig_index.exists() {
+            std::fs::copy(&orig_index, &host_temp)
+                .map_err(|e| format!("Failed to copy git index: {}", e))?;
+        }
+        let env_str = host_temp.to_string_lossy().to_string();
+        (host_temp, env_str)
+    };
 
-    if orig_index.exists() {
-        std::fs::copy(&orig_index, &temp_index)
-            .map_err(|e| format!("Failed to copy git index: {}", e))?;
-    }
-
-    let temp_idx_str = temp_index.to_string_lossy().to_string();
-    let add_res = run_git_with_env(&cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &temp_idx_str)]);
+    let add_res = run_git_with_env(&cwd, &["add", "-A"], &[("GIT_INDEX_FILE", &temp_idx_env)]);
     if let Err(e) = add_res {
-        let _ = std::fs::remove_file(&temp_index);
+        let _ = std::fs::remove_file(&temp_index_host);
         return Err(e);
     }
 
     let tree_res = run_git_with_env(
         &cwd,
         &["write-tree"],
-        &[("GIT_INDEX_FILE", &temp_idx_str)],
+        &[("GIT_INDEX_FILE", &temp_idx_env)],
     );
-    let _ = std::fs::remove_file(&temp_index);
+    let _ = std::fs::remove_file(&temp_index_host);
     let tree_hash = tree_res?.trim().to_string();
 
     let base_ref = if turn_number > 1 {
@@ -776,6 +845,142 @@ pub async fn revert_to_checkpoint(
     checkpoint_id: String,
 ) -> Result<(), String> {
     revert_to_checkpoint_inner(&state.0, session_id, checkpoint_id).await
+}
+
+pub async fn rewind_checkpoint_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    session_id: String,
+    checkpoint_id: String,
+    reset_git: bool,
+    auto_stash: bool,
+) -> Result<crate::models::RewindResult, String> {
+    let (cwd, cp) = {
+        let db = db_arc.lock().await;
+        let session = db
+            .get_session(&session_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Session {} not found", session_id))?;
+        let wsl_distro = db
+            .get_project(&session.project_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|p| p.wsl_distro);
+        let cp = db
+            .get_checkpoint(&session_id, &checkpoint_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Checkpoint {} not found", checkpoint_id))?;
+        let effective_cwd =
+            crate::platform::encode_wsl_path(wsl_distro.as_deref(), &session.worktree_path);
+        (effective_cwd, cp)
+    };
+
+    let mut stashed = false;
+    let mut stash_ref: Option<String> = None;
+    let mut did_reset_git = false;
+
+    if reset_git && is_git_repo(&cwd) {
+        if auto_stash {
+            let status = run_git(&cwd, &["status", "--porcelain"]).unwrap_or_default();
+            if !status.trim().is_empty() {
+                let label = format!("sakana-rewind-turn-{}", cp.turn_number);
+                if run_git(&cwd, &["stash", "push", "-u", "-m", &label]).is_ok() {
+                    stashed = true;
+                    stash_ref = run_git(&cwd, &["rev-parse", "--short", "stash@{0}"])
+                        .ok()
+                        .map(|s| s.trim().to_string());
+                }
+            }
+        }
+        run_git(&cwd, &["read-tree", "--reset", "-u", &cp.commit_hash])?;
+        did_reset_git = true;
+    }
+
+    let db = db_arc.lock().await;
+    let removed_messages = db
+        .truncate_after_checkpoint_counted(&session_id, &checkpoint_id, cp.turn_number)
+        .map_err(|e| e.to_string())?;
+    let _ = db.insert_audit_log(
+        "desktop",
+        "checkpoint_rewind",
+        "allowed",
+        &format!(
+            "Rewound session {} to Turn {} (reset_git={}, stashed={}, removed={})",
+            session_id, cp.turn_number, did_reset_git, stashed, removed_messages
+        ),
+        None,
+    );
+    let session = db
+        .get_session(&session_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Session not found after rewind".to_string())?;
+
+    Ok(crate::models::RewindResult {
+        session,
+        stashed,
+        stash_ref,
+        removed_messages,
+        reset_git: did_reset_git,
+    })
+}
+
+#[tauri::command]
+pub async fn rewind_checkpoint(
+    state: State<'_, DbState>,
+    session_id: String,
+    checkpoint_id: String,
+    reset_git: Option<bool>,
+    auto_stash: Option<bool>,
+) -> Result<crate::models::RewindResult, String> {
+    rewind_checkpoint_inner(
+        &state.0,
+        session_id,
+        checkpoint_id,
+        reset_git.unwrap_or(true),
+        auto_stash.unwrap_or(true),
+    )
+    .await
+}
+
+pub async fn fork_from_checkpoint_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    session_id: String,
+    checkpoint_id: String,
+    title: Option<String>,
+) -> Result<crate::models::Session, String> {
+    let db = db_arc.lock().await;
+    let session = db
+        .get_session(&session_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Session {} not found", session_id))?;
+    let cp = db
+        .get_checkpoint(&session_id, &checkpoint_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Checkpoint {} not found", checkpoint_id))?;
+    let upto = db
+        .find_message_index_for_checkpoint(&session_id, &checkpoint_id, cp.turn_number)
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
+    let fork_title = title.unwrap_or_else(|| format!("Fork @ Turn {}", cp.turn_number));
+    let forked = db
+        .fork_session(&session_id, &fork_title, &session.branch, upto)
+        .map_err(|e| e.to_string())?;
+    let _ = db.insert_audit_log(
+        "desktop",
+        "checkpoint_fork",
+        "allowed",
+        &format!("Forked session {} at Turn {} -> {}", session_id, cp.turn_number, forked.id),
+        None,
+    );
+    Ok(forked)
+}
+
+#[tauri::command]
+pub async fn fork_from_checkpoint(
+    state: State<'_, DbState>,
+    session_id: String,
+    checkpoint_id: String,
+    title: Option<String>,
+) -> Result<crate::models::Session, String> {
+    fork_from_checkpoint_inner(&state.0, session_id, checkpoint_id, title).await
 }
 
 pub async fn get_git_diffs_inner(
@@ -950,7 +1155,7 @@ pub async fn discard_hunk_inner(
             run_git(&cwd, &["ls-files", "--others", "--exclude-standard", "--", &file_path])
                 .unwrap_or_default();
         if !untracked.trim().is_empty() {
-            let full = safe_resolve_path(&cwd, &file_path)?;
+            let full = safe_resolve_confined_path(&cwd, &file_path)?;
             if full.exists() {
                 std::fs::remove_file(&full)
                     .map_err(|e| format!("Failed to remove untracked file {}: {}", file_path, e))?;
@@ -1089,15 +1294,24 @@ pub async fn create_pr_inner(
 ) -> Result<String, String> {
     let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
     ensure_git_repo(&cwd)?;
-    let mut gh_cmd = Command::new("gh");
-    gh_cmd
-        .current_dir(&cwd)
-        .args(["pr", "create", "--title", &title, "--body", &body, "--base", &base_branch]);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        gh_cmd.creation_flags(0x0800_0000);
-    }
+    let mut gh_cmd = if let Some((distro, linux_path)) = crate::platform::parse_wsl_path(&cwd) {
+        crate::platform::wsl_std_command(
+            &distro,
+            Some(&linux_path),
+            "gh",
+            &["pr", "create", "--title", &title, "--body", &body, "--base", &base_branch],
+        )
+    } else {
+        let mut c = Command::new("gh");
+        c.current_dir(&cwd)
+            .args(["pr", "create", "--title", &title, "--body", &body, "--base", &base_branch]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000);
+        }
+        c
+    };
 
     if let Ok(out) = gh_cmd.output() {
         if out.status.success() {
@@ -1236,16 +1450,23 @@ fn detect_language(rel_path: &str) -> &'static str {
     }
 }
 
-fn expand_tilde_and_uri(raw: &str) -> String {
+fn strip_file_uri(raw: &str) -> &str {
     let trimmed = raw.trim();
-    let stripped = trimmed
-        .strip_prefix("file://")
-        .unwrap_or(trimmed);
+    let stripped = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    // On Windows, file:///C:/foo leaves a leading slash before the drive letter.
+    if cfg!(target_os = "windows")
+        && stripped.starts_with('/')
+        && stripped.as_bytes().get(2) == Some(&b':')
+    {
+        &stripped[1..]
+    } else {
+        stripped
+    }
+}
+
+fn expand_native_tilde(stripped: &str) -> String {
     if stripped == "~" || stripped.starts_with("~/") || stripped.starts_with("~\\") {
-        if let Some(home) = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-        {
+        if let Some(home) = dirs::home_dir() {
             if stripped == "~" {
                 return home.to_string_lossy().to_string();
             }
@@ -1256,11 +1477,50 @@ fn expand_tilde_and_uri(raw: &str) -> String {
     stripped.to_string()
 }
 
-fn safe_resolve_path(cwd: &str, rel_path: &str) -> Result<PathBuf, String> {
-    let expanded = expand_tilde_and_uri(rel_path);
-    if expanded.is_empty() {
+fn resolve_wsl_home(distro: &str) -> Option<String> {
+    let out = crate::platform::wsl_std_command(distro, Some("/"), "sh", &["-lc", "printf '%s' \"$HOME\""])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Resolve a path for local desktop inspection/opening (supports WSL `~/` and external local paths).
+pub fn resolve_path_for_open(cwd: &str, rel_path: &str) -> Result<PathBuf, String> {
+    let stripped = strip_file_uri(rel_path);
+    if stripped.is_empty() {
         return Err("File path is empty".to_string());
     }
+    if let Some((distro, linux_cwd)) = crate::platform::parse_wsl_path(cwd) {
+        let linux_target = if stripped == "~" || stripped.starts_with("~/") {
+            let home = resolve_wsl_home(&distro)
+                .ok_or_else(|| format!("Failed to resolve WSL home directory for {}", distro))?;
+            if stripped == "~" {
+                home
+            } else {
+                format!("{}/{}", home.trim_end_matches('/'), &stripped[2..])
+            }
+        } else if stripped.starts_with('/') {
+            stripped.to_string()
+        } else {
+            format!(
+                "{}/{}",
+                linux_cwd.trim_end_matches('/'),
+                stripped.trim_start_matches("./")
+            )
+        };
+        let unc = crate::platform::wsl_to_unc_path(&distro, &linux_target);
+        return if unc.exists() {
+            unc.canonicalize().or(Ok(unc))
+        } else {
+            Ok(unc)
+        };
+    }
+
+    let expanded = expand_native_tilde(stripped);
     let candidate = PathBuf::from(&expanded);
     if candidate.is_absolute() {
         return if candidate.exists() {
@@ -1280,6 +1540,72 @@ fn safe_resolve_path(cwd: &str, rel_path: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Strictly resolve a path confined within the workspace root (for Remote RPC & git discard).
+fn safe_resolve_confined_path(cwd: &str, rel_path: &str) -> Result<PathBuf, String> {
+    let stripped = strip_file_uri(rel_path);
+    if stripped.is_empty() {
+        return Err("File path is empty".to_string());
+    }
+    if stripped == "~" || stripped.starts_with("~/") || stripped.starts_with("~\\") {
+        return Err("Path escapes workspace root".to_string());
+    }
+    let root_buf = resolve_fs_root(cwd);
+    let root = root_buf
+        .canonicalize()
+        .map_err(|e| format!("Invalid workspace cwd {}: {}", cwd, e))?;
+    let candidate = Path::new(stripped);
+    if candidate.is_absolute() {
+        return Err("Absolute paths are not allowed outside workspace".to_string());
+    }
+    for comp in candidate.components() {
+        if matches!(
+            comp,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        ) {
+            return Err("Path traversal is not allowed".to_string());
+        }
+    }
+    let joined = root.join(candidate);
+    if let Ok(meta) = joined.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            let canon = joined
+                .canonicalize()
+                .map_err(|_| "Dangling or invalid symlink is not allowed".to_string())?;
+            if !canon.starts_with(&root) {
+                return Err("Path escapes workspace root".to_string());
+            }
+            return Ok(canon);
+        }
+    }
+    if joined.exists() {
+        let canon = joined
+            .canonicalize()
+            .map_err(|e| format!("Invalid path {}: {}", rel_path, e))?;
+        if !canon.starts_with(&root) {
+            return Err("Path escapes workspace root".to_string());
+        }
+        Ok(canon)
+    } else {
+        // Verify nearest existing ancestor does not escape root via symlink
+        let mut ancestor = joined.parent();
+        while let Some(p) = ancestor {
+            if p.exists() {
+                let canon_parent = p
+                    .canonicalize()
+                    .map_err(|e| format!("Invalid parent path for {}: {}", rel_path, e))?;
+                if !canon_parent.starts_with(&root) {
+                    return Err("Path escapes workspace root".to_string());
+                }
+                break;
+            }
+            ancestor = p.parent();
+        }
+        Ok(joined)
+    }
+}
+
 pub async fn read_workspace_file_inner(
     db_arc: &Arc<Mutex<Database>>,
     cwd: String,
@@ -1287,7 +1613,26 @@ pub async fn read_workspace_file_inner(
     wsl_distro: Option<String>,
 ) -> Result<WorkspaceFile, String> {
     let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
-    let full = safe_resolve_path(&cwd, &rel_path)?;
+    let full = resolve_path_for_open(&cwd, &rel_path)?;
+    let bytes = std::fs::read(&full)
+        .map_err(|e| format!("Failed to read {}: {}", rel_path, e))?;
+    let content = String::from_utf8_lossy(&bytes);
+    let lines = content.lines().map(ToString::to_string).collect();
+    Ok(WorkspaceFile {
+        path: rel_path.replace('\\', "/"),
+        language: detect_language(&rel_path).to_string(),
+        lines,
+    })
+}
+
+pub async fn read_workspace_file_confined_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    rel_path: String,
+    wsl_distro: Option<String>,
+) -> Result<WorkspaceFile, String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
+    let full = safe_resolve_confined_path(&cwd, &rel_path)?;
     let bytes = std::fs::read(&full)
         .map_err(|e| format!("Failed to read {}: {}", rel_path, e))?;
     let content = String::from_utf8_lossy(&bytes);
@@ -1317,7 +1662,25 @@ pub async fn write_workspace_file_inner(
     wsl_distro: Option<String>,
 ) -> Result<(), String> {
     let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
-    let full = safe_resolve_path(&cwd, &rel_path)?;
+    let full = resolve_path_for_open(&cwd, &rel_path)?;
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent dirs for {}: {}", rel_path, e))?;
+    }
+    std::fs::write(&full, content.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {}", rel_path, e))?;
+    Ok(())
+}
+
+pub async fn write_workspace_file_confined_inner(
+    db_arc: &Arc<Mutex<Database>>,
+    cwd: String,
+    rel_path: String,
+    content: String,
+    wsl_distro: Option<String>,
+) -> Result<(), String> {
+    let cwd = resolve_effective_cwd(db_arc, &cwd, wsl_distro.as_deref()).await;
+    let full = safe_resolve_confined_path(&cwd, &rel_path)?;
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create parent dirs for {}: {}", rel_path, e))?;
@@ -1598,6 +1961,9 @@ pub async fn github_clone_repo(
     if clean_url.is_empty() {
         return Err("Repository clone URL is required.".to_string());
     }
+    if !(clean_url.starts_with("https://") || clean_url.starts_with("git@")) {
+        return Err("Repository clone URL must start with https:// or git@".to_string());
+    }
     let clean_name: String = repo_name
         .trim()
         .chars()
@@ -1634,13 +2000,12 @@ pub async fn github_clone_repo(
         if let Some(tok) = token_opt {
             if clean_url.starts_with("https://github.com/") {
                 let basic = base64_encode_bytes(format!("x-access-token:{tok}").as_bytes());
-                cmd.args([
-                    "-c",
-                    &format!("http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"),
-                ]);
+                cmd.env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+                    .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {basic}"));
             }
         }
-        cmd.args(["clone", &clean_url, &dest_str])
+        cmd.args(["clone", "--", &clean_url, &dest_str])
             .env("GIT_TERMINAL_PROMPT", "0");
         #[cfg(target_os = "windows")]
         {

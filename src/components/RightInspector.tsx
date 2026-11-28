@@ -360,23 +360,45 @@ export function RightInspector({
   const [liveTraces, setLiveTraces] = useState<TraceSpan[]>(traces);
   const [loadingTraces, setLoadingTraces] = useState(false);
 
+  // Reset stale file selection when switching workspaces/projects
+  const workspaceKey = `${effectiveCwd}|${wslDistro || ''}`;
+  const prevWorkspaceKeyRef = useRef(workspaceKey);
+  useEffect(() => {
+    if (prevWorkspaceKeyRef.current !== workspaceKey) {
+      prevWorkspaceKeyRef.current = workspaceKey;
+      selectedFilePathRef.current = '';
+      setSelectedFilePath('');
+      setLoadedFile(null);
+      setEditingFile(false);
+      setLineSelection(null);
+    }
+  }, [workspaceKey]);
+
+  const branchesReqRef = useRef(0);
+  const filesReqRef = useRef(0);
+  const tracesReqRef = useRef(0);
+
   // Sync branches when Changes tab is active
   const loadBranches = useCallback(async () => {
+    const reqId = ++branchesReqRef.current;
     if (!isTauriRuntime()) {
       setBranches(thread.branch ? [thread.branch] : []);
       return;
     }
     try {
-      const list = await tauriApi.listBranches(effectiveCwd);
+      const list = await tauriApi.listBranches(effectiveCwd, wslDistro);
+      if (reqId !== branchesReqRef.current) return;
       if (list && list.length > 0) {
         setBranches(list);
       } else {
         setBranches(thread.branch ? [thread.branch] : []);
       }
     } catch {
-      setBranches(thread.branch ? [thread.branch] : []);
+      if (reqId === branchesReqRef.current) {
+        setBranches(thread.branch ? [thread.branch] : []);
+      }
     }
-  }, [effectiveCwd, thread.branch]);
+  }, [effectiveCwd, wslDistro, thread.branch]);
 
   useEffect(() => {
     if (open && activeTab === 'changes') {
@@ -386,6 +408,7 @@ export function RightInspector({
 
   // Sync workspace file list when Files tab is active
   const loadWorkspaceFiles = useCallback(async () => {
+    const reqId = ++filesReqRef.current;
     if (!isTauriRuntime()) {
       const mockPaths = files.map((f) => f.path);
       setWorkspacePaths(mockPaths);
@@ -396,21 +419,18 @@ export function RightInspector({
     }
     try {
       const list = await tauriApi.listWorkspaceFiles(effectiveCwd, wslDistro);
+      if (reqId !== filesReqRef.current) return;
       if (list) {
         setWorkspacePaths(list);
-        const curPath = selectedFilePathRef.current;
-        const isExternalPath =
-          !!curPath &&
-          (curPath.startsWith('/') ||
-            curPath.startsWith('~/') ||
-            curPath.startsWith('..') ||
-            /^[a-zA-Z]:[\/]/.test(curPath));
-        if ((!curPath || (!isExternalPath && !list.includes(curPath))) && list[0]) {
+        if (!selectedFilePathRef.current && list[0]) {
+          selectedFilePathRef.current = list[0];
           setSelectedFilePath(list[0]);
         }
       }
     } catch (err) {
-      onToast(`Failed to list files: ${String(err)}`);
+      if (reqId === filesReqRef.current) {
+        onToast(`Failed to list files: ${String(err)}`);
+      }
     }
   }, [effectiveCwd, wslDistro, files, onToast]);
 
@@ -434,6 +454,7 @@ export function RightInspector({
       normalizedCwd && withoutLine.startsWith(normalizedCwd + '/')
         ? withoutLine.slice(normalizedCwd.length + 1)
         : withoutLine;
+    selectedFilePathRef.current = rel;
     setSelectedFilePath(rel);
     setEditingFile(false);
     setLineSelection(null);
@@ -465,13 +486,17 @@ export function RightInspector({
     }
     let cancelled = false;
     setLoadingFile(true);
+    setLoadedFile((prev) => (prev && prev.path === selectedFilePath ? prev : null));
     void tauriApi
       .readWorkspaceFile(effectiveCwd, selectedFilePath, wslDistro)
       .then((wf) => {
         if (!cancelled && wf) setLoadedFile(wf);
       })
       .catch((err) => {
-        if (!cancelled) onToast(`Failed to read ${selectedFilePath}: ${String(err)}`);
+        if (!cancelled) {
+          setLoadedFile(null);
+          onToast(`Failed to read ${selectedFilePath}: ${String(err)}`);
+        }
       })
       .finally(() => {
         if (!cancelled) setLoadingFile(false);
@@ -479,10 +504,11 @@ export function RightInspector({
     return () => {
       cancelled = true;
     };
-  }, [open, activeTab, selectedFilePath, effectiveCwd, files, onToast]);
+  }, [open, activeTab, selectedFilePath, effectiveCwd, wslDistro, files, onToast]);
 
   // Load traces when Traces tab is active
   const loadTraces = useCallback(async () => {
+    const reqId = ++tracesReqRef.current;
     if (!isTauriRuntime()) {
       setLiveTraces(traces);
       return;
@@ -490,11 +516,17 @@ export function RightInspector({
     setLoadingTraces(true);
     try {
       const list = await tauriApi.listTraceSpans(thread.id);
-      setLiveTraces(list ?? []);
+      if (reqId === tracesReqRef.current) {
+        setLiveTraces(list ?? []);
+      }
     } catch {
-      setLiveTraces([]);
+      if (reqId === tracesReqRef.current) {
+        setLiveTraces([]);
+      }
     } finally {
-      setLoadingTraces(false);
+      if (reqId === tracesReqRef.current) {
+        setLoadingTraces(false);
+      }
     }
   }, [thread.id, traces]);
 
@@ -602,7 +634,9 @@ export function RightInspector({
         ? diffs.filter((d) => d.turnId === turnScopeFilter)
         : diffs;
 
-  const activeFile = loadedFile || files.find((f) => f.path === selectedFilePath) || files[0];
+  const activeFile = isTauriRuntime()
+    ? loadedFile
+    : loadedFile || files.find((f) => f.path === selectedFilePath) || files[0];
 
   const handleLineClick = (lineNo: number, shiftKey: boolean) => {
     if (shiftKey && lineSelection) {
@@ -619,7 +653,7 @@ export function RightInspector({
     if (!nextBranch || nextBranch === thread.branch) return;
     setGitBusy(true);
     try {
-      await tauriApi.checkoutBranch(effectiveCwd, nextBranch);
+      await tauriApi.checkoutBranch(effectiveCwd, nextBranch, wslDistro);
       onBranchChanged?.(nextBranch);
       await onRefreshDiffs(turnScopeFilter);
       onToast(`Checked out ${nextBranch}`);
@@ -633,7 +667,7 @@ export function RightInspector({
   const handlePull = async () => {
     setGitBusy(true);
     try {
-      const res = await tauriApi.gitPull(effectiveCwd);
+      const res = await tauriApi.gitPull(effectiveCwd, wslDistro);
       await onRefreshDiffs(turnScopeFilter);
       onToast(res ? `Pull: ${res.split('\n')[0]}` : `Pulled ${thread.branch}`);
     } catch (err) {
@@ -646,7 +680,7 @@ export function RightInspector({
   const handlePush = async () => {
     setGitBusy(true);
     try {
-      const res = await tauriApi.gitPush(effectiveCwd);
+      const res = await tauriApi.gitPush(effectiveCwd, wslDistro);
       onToast(res ? `Push: ${res.split('\n')[0]}` : `Pushed ${thread.branch}`);
     } catch (err) {
       onToast(`Push failed: ${String(err)}`);
@@ -658,7 +692,7 @@ export function RightInspector({
   const handleDraftCommit = async () => {
     setGitBusy(true);
     try {
-      const msg = await tauriApi.draftCommitMessage(effectiveCwd);
+      const msg = await tauriApi.draftCommitMessage(effectiveCwd, wslDistro);
       if (msg) {
         setCommitMsg(msg);
         onToast('Drafted AI commit message');
@@ -677,7 +711,7 @@ export function RightInspector({
     if (!msg) return;
     setGitBusy(true);
     try {
-      await tauriApi.gitCommit(effectiveCwd, msg);
+      await tauriApi.gitCommit(effectiveCwd, msg, wslDistro);
       setCommitMsg('');
       await onRefreshDiffs(turnScopeFilter);
       onToast(`Committed to ${thread.branch}`);
@@ -1573,9 +1607,62 @@ export function RightInspector({
               )}
             </div>
 
+            {(activeFile || selectedFilePath) && (() => {
+              const shownPath = activeFile?.path || selectedFilePath;
+              const fileName = shownPath.split('/').pop() || shownPath;
+              const isInWorkspace = workspacePaths.includes(shownPath);
+              return (
+                <div
+                  className="px-3 py-1.5 border-b flex items-center justify-between gap-2 shrink-0"
+                  style={{ borderColor: 'var(--border-line)', backgroundColor: 'var(--bg-card)' }}
+                  title={shownPath}
+                >
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <FileCode size={12} className="shrink-0" style={{ color: 'var(--accent-blue)' }} />
+                    <span
+                      className="font-mono-tech text-[11.5px] font-semibold shrink-0"
+                      style={{ color: 'var(--text-main)' }}
+                    >
+                      {fileName}
+                    </span>
+                    {shownPath !== fileName && (
+                      <span
+                        className="font-mono-tech text-[10.5px] truncate"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        {shownPath}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {!isInWorkspace && workspacePaths.length > 0 && (
+                      <span
+                        className="font-mono-tech text-[9.5px] px-1.5 py-0.5 rounded-[4px]"
+                        style={{
+                          backgroundColor: 'var(--accent-blue-bg)',
+                          color: 'var(--accent-blue)',
+                        }}
+                        title="Opened from outside the current workspace tree"
+                      >
+                        External
+                      </span>
+                    )}
+                    {activeFile?.language && (
+                      <span
+                        className="font-mono-tech text-[9.5px] uppercase"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        {activeFile.language}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
             {!activeFile ? (
               <div className="p-6 text-center text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                {loadingFile ? 'Loading file...' : 'Select a file to inspect'}
+                {loadingFile ? `Loading ${selectedFilePath || 'file'}...` : 'Select a file to inspect'}
               </div>
             ) : editingFile ? (
               <div className="flex-1 min-h-0 p-3">
@@ -1643,7 +1730,14 @@ export function RightInspector({
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                setPreviewUrl(previewInput.trim() || 'http://localhost:5173');
+                const raw = previewInput.trim() || 'http://localhost:5173';
+                const normalized = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) ? raw : `http://${raw}`;
+                if (!/^https?:\/\//i.test(normalized)) {
+                  onToast('Preview URL must use http:// or https://');
+                  return;
+                }
+                setPreviewInput(normalized);
+                setPreviewUrl(normalized);
                 setPreviewKey((k) => k + 1);
               }}
               className="p-2.5 border-b flex items-center gap-2 shrink-0"

@@ -73,10 +73,11 @@ impl Default for RemoteState {
 pub struct ServerContext {
     pub db: Arc<Mutex<Database>>,
     pub harness_active: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    pub office_active: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    pub office_active: Arc<Mutex<HashMap<String, (u64, tokio::sync::watch::Sender<bool>)>>>,
     pub pty_state: Arc<PtyState>,
     pub auth_state: Arc<AuthState>,
     pub discord_state: Arc<crate::discord::DiscordState>,
+    pub race_state: Arc<crate::race::RaceState>,
     pub app: Option<AppHandle>,
     pub token: String,
     pub port: u16,
@@ -763,7 +764,7 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             let wsl_distro = get_opt_str(&args, "wslDistro").or_else(|| get_opt_str(&args, "wsl_distro"));
             let cwd = get_str(&args, "cwd")?;
             let rel_path = get_str(&args, "relPath").or_else(|_| get_str(&args, "rel_path"))?;
-            let file = crate::git::read_workspace_file_inner(&ctx.db, cwd, rel_path, wsl_distro).await?;
+            let file = crate::git::read_workspace_file_confined_inner(&ctx.db, cwd, rel_path, wsl_distro).await?;
             serde_json::to_value(file).map_err(|e| e.to_string())
         }
         "write_workspace_file" => {
@@ -771,7 +772,7 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             let cwd = get_str(&args, "cwd")?;
             let rel_path = get_str(&args, "relPath").or_else(|_| get_str(&args, "rel_path"))?;
             let content = get_str(&args, "content")?;
-            crate::git::write_workspace_file_inner(&ctx.db, cwd, rel_path, content, wsl_distro).await?;
+            crate::git::write_workspace_file_confined_inner(&ctx.db, cwd, rel_path, content, wsl_distro).await?;
             Ok(Value::Null)
         }
         "pty_spawn" => {
@@ -922,8 +923,9 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
         }
         "update_app_customization" => {
             let raw = args.get("customization").cloned().unwrap_or(args);
-            let cfg: crate::self_control::AppCustomization =
+            let raw_cfg: crate::self_control::AppCustomization =
                 serde_json::from_value(raw).map_err(|e| e.to_string())?;
+            let cfg = crate::self_control::sanitize_customization(&raw_cfg)?;
             {
                 let db = ctx.db.lock().await;
                 crate::self_control::save_customization(&db, &cfg)?;
@@ -1343,6 +1345,147 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             let saved = crate::discord::update_discord_settings_inner(&ctx.db, cfg).await?;
             serde_json::to_value(saved).map_err(|e| e.to_string())
         }
+        "get_voice_config" => {
+            let cfg = crate::voice::get_voice_config_inner(&ctx.db).await?;
+            serde_json::to_value(cfg).map_err(|e| e.to_string())
+        }
+        "update_voice_config" => {
+            let raw = args.get("config").cloned().unwrap_or(args);
+            let cfg: crate::models::VoiceConfig =
+                serde_json::from_value(raw).map_err(|e| e.to_string())?;
+            let saved = crate::voice::update_voice_config_inner(&ctx.db, cfg, true).await?;
+            serde_json::to_value(saved).map_err(|e| e.to_string())
+        }
+        "transcribe_audio" => {
+            let audio_b64 = get_str(&args, "audioB64").or_else(|_| get_str(&args, "audio_b64"))?;
+            let mime_type = get_opt_str(&args, "mimeType").or_else(|| get_opt_str(&args, "mime_type"));
+            let language = get_opt_str(&args, "language");
+            let res = crate::voice::transcribe_audio_inner(&ctx.db, audio_b64, mime_type, language).await?;
+            serde_json::to_value(res).map_err(|e| e.to_string())
+        }
+        "get_failover_config" => {
+            let project_id = get_opt_str(&args, "projectId").or_else(|| get_opt_str(&args, "project_id"));
+            let cfg = crate::harness::get_failover_config_inner(&ctx.db, project_id).await?;
+            serde_json::to_value(cfg).map_err(|e| e.to_string())
+        }
+        "update_failover_config" => {
+            let project_id = get_opt_str(&args, "projectId").or_else(|| get_opt_str(&args, "project_id"));
+            let raw = args.get("config").cloned().unwrap_or(args);
+            let cfg: crate::models::FailoverConfig =
+                serde_json::from_value(raw).map_err(|e| e.to_string())?;
+            let saved = crate::harness::update_failover_config_inner(&ctx.db, project_id, cfg).await?;
+            serde_json::to_value(saved).map_err(|e| e.to_string())
+        }
+        "rewind_checkpoint" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let checkpoint_id = get_str(&args, "checkpointId").or_else(|_| get_str(&args, "checkpoint_id"))?;
+            let reset_git = args.get("resetGit").or_else(|| args.get("reset_git")).and_then(|v| v.as_bool()).unwrap_or(true);
+            let auto_stash = args.get("autoStash").or_else(|| args.get("auto_stash")).and_then(|v| v.as_bool()).unwrap_or(true);
+            let res = crate::git::rewind_checkpoint_inner(&ctx.db, session_id, checkpoint_id, reset_git, auto_stash).await?;
+            serde_json::to_value(res).map_err(|e| e.to_string())
+        }
+        "fork_from_checkpoint" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let checkpoint_id = get_str(&args, "checkpointId").or_else(|_| get_str(&args, "checkpoint_id"))?;
+            let title = get_opt_str(&args, "title");
+            let sess = crate::git::fork_from_checkpoint_inner(&ctx.db, session_id, checkpoint_id, title).await?;
+            serde_json::to_value(sess).map_err(|e| e.to_string())
+        }
+        "start_race" => {
+            let project_id = get_str(&args, "projectId").or_else(|_| get_str(&args, "project_id"))?;
+            let prompt = get_str(&args, "prompt")?;
+            let contestants_val = args.get("contestants").cloned().ok_or_else(|| "Missing 'contestants'".to_string())?;
+            let contestants: Vec<crate::models::RaceContestantInput> =
+                serde_json::from_value(contestants_val).map_err(|e| e.to_string())?;
+            let verify_cmd = get_opt_str(&args, "verifyCmd").or_else(|| get_opt_str(&args, "verify_cmd"));
+            let run = crate::race::start_race_inner(
+                ctx.app.clone(),
+                Arc::clone(&ctx.db),
+                Arc::clone(&ctx.harness_active),
+                Arc::clone(&ctx.race_state.runs),
+                project_id,
+                prompt,
+                contestants,
+                verify_cmd,
+            ).await?;
+            serde_json::to_value(run).map_err(|e| e.to_string())
+        }
+        "list_races" => {
+            let runs = crate::race::list_races_inner(&ctx.race_state.runs).await;
+            serde_json::to_value(runs).map_err(|e| e.to_string())
+        }
+        "get_race" => {
+            let race_id = get_str(&args, "raceId").or_else(|_| get_str(&args, "race_id"))?;
+            let run = crate::race::get_race_inner(&ctx.race_state.runs, &race_id).await;
+            serde_json::to_value(run).map_err(|e| e.to_string())
+        }
+        "merge_race_winner" => {
+            let race_id = get_str(&args, "raceId").or_else(|_| get_str(&args, "race_id"))?;
+            let winner_session_id = get_str(&args, "winnerSessionId").or_else(|_| get_str(&args, "winner_session_id"))?;
+            let run = crate::race::merge_race_winner_inner(
+                ctx.app.as_ref(),
+                &ctx.db,
+                &ctx.race_state.runs,
+                race_id,
+                winner_session_id,
+            ).await?;
+            serde_json::to_value(run).map_err(|e| e.to_string())
+        }
+        "search_history" => {
+            let query = get_str(&args, "query")?;
+            let project_id = get_opt_str(&args, "projectId").or_else(|| get_opt_str(&args, "project_id"));
+            let harness = get_opt_str(&args, "harness");
+            let source = get_opt_str(&args, "source");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let hits = crate::telemetry::search_history_inner(&ctx.db, query, project_id, harness, source, limit).await?;
+            serde_json::to_value(hits).map_err(|e| e.to_string())
+        }
+        "get_telemetry_summary" => {
+            let days = args.get("days").and_then(|v| v.as_i64());
+            let summary = crate::telemetry::get_telemetry_summary_inner(&ctx.db, days).await?;
+            serde_json::to_value(summary).map_err(|e| e.to_string())
+        }
+        "list_audit_logs" => {
+            let query = get_opt_str(&args, "query");
+            let source = get_opt_str(&args, "source");
+            let status = get_opt_str(&args, "status");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let logs = crate::telemetry::list_audit_logs_inner(&ctx.db, query, source, status, limit).await?;
+            serde_json::to_value(logs).map_err(|e| e.to_string())
+        }
+        "record_audit_log" => {
+            let source = get_str(&args, "source")?;
+            let action = get_str(&args, "action")?;
+            let status = get_str(&args, "status")?;
+            let summary = get_str(&args, "summary")?;
+            let payload_json = get_opt_str(&args, "payloadJson").or_else(|| get_opt_str(&args, "payload_json"));
+            let entry = crate::telemetry::record_audit_log_inner(&ctx.db, source, action, status, summary, payload_json).await?;
+            serde_json::to_value(entry).map_err(|e| e.to_string())
+        }
+        "list_office_blueprints" => {
+            let list = crate::office::list_office_blueprints_inner(&ctx.db).await?;
+            serde_json::to_value(list).map_err(|e| e.to_string())
+        }
+        "save_office_blueprint" => {
+            let office_id = get_str(&args, "officeId").or_else(|_| get_str(&args, "office_id"))?;
+            let name = get_str(&args, "name")?;
+            let description = get_opt_str(&args, "description").unwrap_or_default();
+            let bp = crate::office::save_office_blueprint_inner(&ctx.db, office_id, name, description).await?;
+            serde_json::to_value(bp).map_err(|e| e.to_string())
+        }
+        "delete_office_blueprint" => {
+            let id = get_str(&args, "id")?;
+            let ok = crate::office::delete_office_blueprint_inner(&ctx.db, id).await?;
+            Ok(json!(ok))
+        }
+        "create_office_from_blueprint" => {
+            let blueprint_id = get_str(&args, "blueprintId").or_else(|_| get_str(&args, "blueprint_id"))?;
+            let name = get_opt_str(&args, "name");
+            let project_id = get_opt_str(&args, "projectId").or_else(|| get_opt_str(&args, "project_id"));
+            let cwd = get_opt_str(&args, "cwd");
+            let off = crate::office::create_office_from_blueprint_inner(ctx.app.as_ref(), &ctx.db, blueprint_id, name, project_id, cwd).await?;
+            serde_json::to_value(off).map_err(|e| e.to_string())
+        }
         other => Err(format!("Unsupported remote RPC command: '{}'", other)),
     }
 }
@@ -1407,26 +1550,7 @@ async fn api_webhook(
     }
 }
 
-fn is_private_or_tailscale_host(host: &str) -> bool {
-    if host == "localhost" || host == "127.0.0.1" || host.ends_with(".ts.net") {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        let [a, b, _, _] = ip.octets();
-        // Loopback, Tailscale CGNAT (100.64.0.0/10), RFC1918 LAN ranges
-        if a == 127
-            || (a == 100 && (64..=127).contains(&b))
-            || a == 10
-            || (a == 192 && b == 168)
-            || (a == 172 && (16..=31).contains(&b))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_allowed_origin(origin: &HeaderValue) -> bool {
+fn is_allowed_origin(origin: &HeaderValue, allowed_hosts: &[String]) -> bool {
     let Ok(s) = origin.to_str() else {
         return false;
     };
@@ -1441,11 +1565,25 @@ fn is_allowed_origin(origin: &HeaderValue) -> bool {
         .strip_prefix("http://")
         .or_else(|| lower.strip_prefix("https://"));
     if let Some(authority) = rest {
-        let (host, port_ok) = match authority.split_once(':') {
-            Some((h, p)) => (h, !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
-            None => (authority, true),
+        if authority.contains('/') || authority.contains('@') {
+            return false;
+        }
+        let (host, port_ok) = if let Some(bracket_end) = authority.strip_prefix('[').and_then(|r| r.find(']')) {
+            let h = &authority[..=bracket_end + 1];
+            let after = &authority[bracket_end + 2..];
+            let ok = after.is_empty()
+                || after
+                    .strip_prefix(':')
+                    .map(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false);
+            (h, ok)
+        } else {
+            match authority.split_once(':') {
+                Some((h, p)) => (h, !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+                None => (authority, true),
+            }
         };
-        if port_ok && is_private_or_tailscale_host(host) {
+        if port_ok && allowed_hosts.iter().any(|h| h == host) {
             return true;
         }
     }
@@ -1453,9 +1591,33 @@ fn is_allowed_origin(origin: &HeaderValue) -> bool {
 }
 
 pub fn build_remote_router(ctx: ServerContext) -> Router {
+    let mut allowed_hosts: Vec<String> = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "[::1]".to_string(),
+    ];
+    let lan_ip = detect_lan_ip().trim().to_ascii_lowercase();
+    if !lan_ip.is_empty() && !allowed_hosts.contains(&lan_ip) {
+        allowed_hosts.push(lan_ip);
+    }
+    let (ts_ip, ts_dns) = detect_tailscale_info();
+    if let Some(ip) = ts_ip {
+        let ip = ip.trim().to_ascii_lowercase();
+        if !ip.is_empty() && !allowed_hosts.contains(&ip) {
+            allowed_hosts.push(ip);
+        }
+    }
+    if let Some(dns) = ts_dns {
+        let dns = dns.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !dns.is_empty() && !allowed_hosts.contains(&dns) {
+            allowed_hosts.push(dns);
+        }
+    }
+    let allowed_hosts = Arc::new(allowed_hosts);
+
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin, _req| {
-            is_allowed_origin(origin)
+        .allow_origin(AllowOrigin::predicate(move |origin, _req| {
+            is_allowed_origin(origin, &allowed_hosts)
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
@@ -1497,6 +1659,7 @@ pub async fn serve_remote_daemon(
         pty_state: Arc::new(PtyState::default()),
         auth_state: Arc::new(AuthState::default()),
         discord_state: Arc::new(crate::discord::DiscordState::default()),
+        race_state: Arc::new(crate::race::RaceState::default()),
         app: None,
         token,
         port,
@@ -1532,10 +1695,13 @@ pub async fn start_remote_server(
     pty_state: State<'_, PtyState>,
     auth_state: State<'_, AuthState>,
     discord_state: State<'_, crate::discord::DiscordState>,
+    race_state: State<'_, crate::race::RaceState>,
     port: Option<u16>,
     lan_enabled: Option<bool>,
 ) -> Result<RemoteStatus, String> {
-    if *state.running.lock().await {
+    let mut running_guard = state.running.lock().await;
+    if *running_guard {
+        drop(running_guard);
         return Ok(build_remote_status(&state).await);
     }
     let target_port = port.unwrap_or(DEFAULT_REMOTE_PORT);
@@ -1575,6 +1741,9 @@ pub async fn start_remote_server(
             last_error: Arc::clone(&discord_state.last_error),
             shard_manager: Arc::clone(&discord_state.shard_manager),
         }),
+        race_state: Arc::new(crate::race::RaceState {
+            runs: Arc::clone(&race_state.runs),
+        }),
         app: Some(app.clone()),
         token,
         port: target_port,
@@ -1585,8 +1754,9 @@ pub async fn start_remote_server(
     let (tx, rx) = oneshot::channel::<()>();
     *state.shutdown_tx.lock().await = Some(tx);
     *state.port.lock().await = target_port;
-    *state.running.lock().await = true;
+    *running_guard = true;
     *state.last_error.lock().await = None;
+    drop(running_guard);
 
     let running_flag = Arc::clone(&state.running);
     let last_err = Arc::clone(&state.last_error);
@@ -1701,6 +1871,9 @@ pub async fn remote_rpc(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Remote host '{}' not found", host_id))?
     };
+    if cmd.is_empty() || !cmd.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!("Invalid RPC command name: '{}'", cmd));
+    }
     let url = format!("{}/api/rpc/{}", host.url.trim_end_matches('/'), cmd);
     let resp = remote_state
         .http_client
@@ -2022,12 +2195,21 @@ mod tests {
 
     #[test]
     fn cors_origin_predicate_allows_only_localhost_and_tauri() {
-        assert!(is_allowed_origin(&HeaderValue::from_static("http://localhost:5173")));
-        assert!(is_allowed_origin(&HeaderValue::from_static("http://127.0.0.1:4317")));
-        assert!(is_allowed_origin(&HeaderValue::from_static("tauri://localhost")));
-        assert!(is_allowed_origin(&HeaderValue::from_static("https://tauri.localhost")));
-        assert!(!is_allowed_origin(&HeaderValue::from_static("https://evil.example.com")));
-        assert!(!is_allowed_origin(&HeaderValue::from_static("http://localhost.evil.com")));
+        let allowed = vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "[::1]".to_string(),
+            "192.168.1.50".to_string(),
+        ];
+        assert!(is_allowed_origin(&HeaderValue::from_static("http://localhost:5173"), &allowed));
+        assert!(is_allowed_origin(&HeaderValue::from_static("http://127.0.0.1:4317"), &allowed));
+        assert!(is_allowed_origin(&HeaderValue::from_static("http://192.168.1.50:4317"), &allowed));
+        assert!(is_allowed_origin(&HeaderValue::from_static("tauri://localhost"), &allowed));
+        assert!(is_allowed_origin(&HeaderValue::from_static("https://tauri.localhost"), &allowed));
+        assert!(!is_allowed_origin(&HeaderValue::from_static("http://192.168.1.99:4317"), &allowed));
+        assert!(!is_allowed_origin(&HeaderValue::from_static("https://evil.ts.net"), &allowed));
+        assert!(!is_allowed_origin(&HeaderValue::from_static("https://evil.example.com"), &allowed));
+        assert!(!is_allowed_origin(&HeaderValue::from_static("http://localhost.evil.com"), &allowed));
     }
 
     #[test]
@@ -2071,6 +2253,7 @@ mod tests {
             pty_state: Arc::new(PtyState::default()),
             auth_state: Arc::new(AuthState::default()),
             discord_state: Arc::new(crate::discord::DiscordState::default()),
+            race_state: Arc::new(crate::race::RaceState::default()),
             app: None,
             token: "test-token".to_string(),
             port: 0,

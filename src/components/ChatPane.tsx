@@ -13,13 +13,18 @@ import {
   File,
   FilePdf,
   FileText,
+  ArrowsLeftRight,
   GitBranch,
   GitFork,
+  Microphone,
+  MicrophoneSlash,
   Paperclip,
   PencilSimple,
   Plus,
   Robot,
   SidebarSimple,
+  SpeakerHigh,
+  SpeakerSlash,
   Stop,
   Trash,
   User,
@@ -64,6 +69,8 @@ interface ChatPaneProps {
     patch: Partial<Pick<Thread, 'harness' | 'model' | 'effort' | 'account'>>,
   ) => void;
   onRevertToCheckpoint: (threadId: string, checkpointId: string) => void;
+  onRewindCheckpoint?: (threadId: string, checkpointId: string) => void;
+  onForkFromCheckpoint?: (threadId: string, checkpointId: string) => void;
   onViewCheckpointDiff: (checkpointId: string) => void;
   onForkAtMessage: (threadId: string, msgIndex: number) => void;
   attachedChips: AttachedContextChip[];
@@ -281,7 +288,7 @@ function renderInline(line: string, onOpenFile?: (path: string) => void): ReactN
               {label}
             </button>,
           );
-        } else {
+        } else if (/^(https?:|mailto:|#)/i.test(url)) {
           out.push(
             <a
               key={key++}
@@ -293,6 +300,17 @@ function renderInline(line: string, onOpenFile?: (path: string) => void): ReactN
             >
               {label}
             </a>,
+          );
+        } else {
+          out.push(
+            <span
+              key={key++}
+              className="underline decoration-dotted underline-offset-2 opacity-75"
+              style={{ color: 'var(--text-muted)' }}
+              title="Blocked unsafe link scheme"
+            >
+              {label}
+            </span>,
           );
         }
       } else {
@@ -797,16 +815,23 @@ function buildWidgetSrcDoc(w: InlineWidgetData, theme: ThemeId): string {
     .fill { height: 100%; border-radius: 999px; }
   `;
 
+  const resizeScript = `<script>(function(){function r(){try{var h=Math.max(document.body?document.body.scrollHeight:0,document.documentElement?document.documentElement.scrollHeight:0);if(h>0){window.parent.postMessage({type:'sakana-widget-height',height:h},'*');}}catch(e){}}window.addEventListener('load',r);if(typeof ResizeObserver!=='undefined'&&document.body){new ResizeObserver(r).observe(document.body);}setTimeout(r,50);})();<\/script>`;
   const trimmed = (w.sourceCode || '').trim();
   const isRawHtml = /<(?:!doctype|html|body|div|svg|canvas|section|main|script)\b/i.test(trimmed);
   if (isRawHtml) {
     if (/<html\b/i.test(trimmed)) {
-      if (/<head\b[^>]*>/i.test(trimmed)) {
-        return trimmed.replace(/<head\b[^>]*>/i, (m) => `${m}<style>${themeVarsCss}</style>`);
+      let doc = trimmed;
+      if (/<head\b[^>]*>/i.test(doc)) {
+        doc = doc.replace(/<head\b[^>]*>/i, (m) => `${m}<style>${themeVarsCss}</style>`);
+      } else {
+        doc = doc.replace(/<html\b[^>]*>/i, (m) => `${m}<head><style>${themeVarsCss}</style></head>`);
       }
-      return trimmed.replace(/<html\b[^>]*>/i, (m) => `${m}<head><style>${themeVarsCss}</style></head>`);
+      if (/<\/body>/i.test(doc)) {
+        return doc.replace(/<\/body>/i, `${resizeScript}</body>`);
+      }
+      return `${doc}${resizeScript}`;
     }
-    return `<!doctype html><html><head><meta charset="utf-8" /><style>${baseCss}</style></head><body>${trimmed}</body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8" /><style>${baseCss}</style></head><body>${trimmed}${resizeScript}</body></html>`;
   }
 
   const metricsHtml = (w.metrics || [])
@@ -838,13 +863,28 @@ function buildWidgetSrcDoc(w: InlineWidgetData, theme: ThemeId): string {
   return `<!doctype html><html><head><meta charset="utf-8" /><style>${baseCss}</style></head><body>
     <div class="metrics">${metricsHtml}</div>
     <div class="bars">${barsHtml}</div>
+    ${resizeScript}
   </body></html>`;
 }
 
 function SakanaUiCard({ msg, theme = 'paper' }: { msg: ChatMessage; theme?: ThemeId }) {
   const [viewMode, setViewMode] = useState<'preview' | 'source'>('preview');
   const [iframeHeight, setIframeHeight] = useState(210);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const w = msg.widget;
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== iframeRef.current?.contentWindow) return;
+      const data = event.data as { type?: string; height?: number } | null;
+      if (data?.type === 'sakana-widget-height' && typeof data.height === 'number' && data.height > 0) {
+        setIframeHeight(Math.max(140, Math.min(420, Math.ceil(data.height) + 4)));
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+
   if (!w) return null;
 
   return (
@@ -899,19 +939,10 @@ function SakanaUiCard({ msg, theme = 'paper' }: { msg: ChatMessage; theme?: Them
 
       {viewMode === 'preview' ? (
         <iframe
-          sandbox="allow-scripts allow-same-origin"
+          ref={iframeRef}
+          sandbox="allow-scripts"
           srcDoc={buildWidgetSrcDoc(w, theme)}
           title={w.title}
-          onLoad={(e) => {
-            try {
-              const h = e.currentTarget.contentDocument?.body?.scrollHeight;
-              if (typeof h === 'number' && h > 0) {
-                setIframeHeight(Math.max(140, Math.min(420, h + 4)));
-              }
-            } catch {
-              // Ignore cross-origin access errors
-            }
-          }}
           className="w-full border-0 block"
           style={{ backgroundColor: 'var(--bg-card)', height: `${iframeHeight}px` }}
         />
@@ -977,6 +1008,8 @@ interface MessageRowProps {
   onForkAtMessage: (threadId: string, msgIndex: number) => void;
   onViewCheckpointDiff: (checkpointId: string) => void;
   onRevertToCheckpoint: (threadId: string, checkpointId: string) => void;
+  onRewindCheckpoint?: (threadId: string, checkpointId: string) => void;
+  onForkFromCheckpoint?: (threadId: string, checkpointId: string) => void;
   onToast: (msg: string) => void;
   onOpenFile?: (path: string) => void;
 }
@@ -993,6 +1026,8 @@ const MessageRow = memo(function MessageRow({
   onForkAtMessage,
   onViewCheckpointDiff,
   onRevertToCheckpoint,
+  onRewindCheckpoint,
+  onForkFromCheckpoint,
   onToast,
   onOpenFile,
 }: MessageRowProps) {
@@ -1184,6 +1219,20 @@ const MessageRow = memo(function MessageRow({
         </div>
       )}
 
+      {m.failoverNotice && (
+        <div
+          className="rounded-[7px] border px-2.5 py-1 text-[11px] font-mono-tech flex items-center gap-1.5"
+          style={{
+            borderColor: 'rgba(245, 158, 11, 0.35)',
+            backgroundColor: 'rgba(245, 158, 11, 0.1)',
+            color: 'var(--accent-yellow)',
+          }}
+        >
+          <ArrowsLeftRight size={12} className="shrink-0" />
+          <span>{m.failoverNotice}</span>
+        </div>
+      )}
+
       <SimpleMarkdown text={m.text} stripSakanaUi={Boolean(m.widget)} onOpenFile={onOpenFile} />
 
       {/* Inline sakana-ui Widget */}
@@ -1217,6 +1266,28 @@ const MessageRow = memo(function MessageRow({
             >
               View Diff
             </button>
+            {onRewindCheckpoint && (
+              <button
+                type="button"
+                onClick={() => onRewindCheckpoint(threadId, m.checkpoint!.id)}
+                className="btn-ghost px-2 py-0.5 text-[10.5px] font-mono-tech inline-flex items-center gap-1 cursor-pointer"
+                title="Auto-stash dirty changes, reset git & rewind conversation to this turn"
+              >
+                <ArrowCounterClockwise size={11} />
+                <span>Rewind</span>
+              </button>
+            )}
+            {onForkFromCheckpoint && (
+              <button
+                type="button"
+                onClick={() => onForkFromCheckpoint(threadId, m.checkpoint!.id)}
+                className="btn-ghost px-2 py-0.5 text-[10.5px] font-mono-tech inline-flex items-center gap-1 cursor-pointer"
+                title="Create a new forked thread from this checkpoint"
+              >
+                <GitFork size={11} />
+                <span>Fork</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => onRevertToCheckpoint(threadId, m.checkpoint!.id)}
@@ -1269,6 +1340,8 @@ export function ChatPane({
   onCompactThread,
   onUpdateThreadConfig,
   onRevertToCheckpoint,
+  onRewindCheckpoint,
+  onForkFromCheckpoint,
   onViewCheckpointDiff,
   onForkAtMessage,
   attachedChips,
@@ -1324,6 +1397,122 @@ export function ChatPane({
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const timelineCloseTimerRef = useRef<number | null>(null);
+
+  // Voice Mode (STT + TTS)
+  const [isRecording, setIsRecording] = useState(false);
+  const [ttsEnabled, setTtsEnabled] = useState(false);
+  const [voiceEngine, setVoiceEngine] = useState<string>('auto');
+  const [voiceLang, setVoiceLang] = useState<string>('en-US');
+  const recognitionRef = useRef<any>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const lastSpokenMsgIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    tauriApi.getVoiceConfig().then((cfg) => {
+      setTtsEnabled(Boolean(cfg.ttsEnabled));
+      setVoiceEngine(cfg.engine || 'auto');
+      setVoiceLang(cfg.language || 'en-US');
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!ttsEnabled || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    if (thread.status === 'RUNNING') return;
+    const last = [...thread.messages].reverse().find((m) => m.role === 'assistant' && m.text.trim());
+    if (!last || last.id === lastSpokenMsgIdRef.current) return;
+    lastSpokenMsgIdRef.current = last.id;
+    try {
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(last.text.slice(0, 1200));
+      utter.lang = voiceLang || 'en-US';
+      window.speechSynthesis.speak(utter);
+    } catch {
+      // ignore TTS errors
+    }
+  }, [thread.messages, thread.status, ttsEnabled, voiceLang]);
+
+  const toggleVoiceRecording = useCallback(async () => {
+    if (isRecording) {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+        recognitionRef.current = null;
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+      setIsRecording(false);
+      return;
+    }
+
+    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRec && voiceEngine !== 'whisper') {
+      try {
+        const rec = new SpeechRec();
+        rec.lang = voiceLang || 'en-US';
+        rec.interimResults = false;
+        rec.continuous = false;
+        rec.onresult = (ev: any) => {
+          const transcript = Array.from(ev.results || [])
+            .map((r: any) => r[0]?.transcript || '')
+            .join(' ')
+            .trim();
+          if (transcript) {
+            setInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
+          }
+        };
+        rec.onerror = () => setIsRecording(false);
+        rec.onend = () => setIsRecording(false);
+        recognitionRef.current = rec;
+        setIsRecording(true);
+        rec.start();
+        return;
+      } catch {
+        setIsRecording(false);
+      }
+    }
+
+    // Fallback: MediaRecorder -> backend Whisper transcribe_audio
+    if (!navigator.mediaDevices?.getUserMedia) {
+      onToast('Microphone access is not available in this environment');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      mr.ondataavailable = (ev) => {
+        if (ev.data.size > 0) audioChunksRef.current.push(ev.data);
+      };
+      mr.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(audioChunksRef.current, { type: mr.mimeType || 'audio/webm' });
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          const dataUrl = String(reader.result || '');
+          const b64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+          if (!b64) return;
+          try {
+            const res = await tauriApi.transcribeAudio(b64, blob.type, voiceLang);
+            if (res?.text) {
+              setInput((prev) => (prev ? `${prev} ${res.text}` : res.text));
+            }
+          } catch (e) {
+            onToast(`Transcription failed: ${String(e)}`);
+          }
+        };
+        reader.readAsDataURL(blob);
+      };
+      mediaRecorderRef.current = mr;
+      mr.start();
+      setIsRecording(true);
+    } catch (e) {
+      onToast(`Mic error: ${String(e)}`);
+      setIsRecording(false);
+    }
+  }, [isRecording, onToast, voiceEngine, voiceLang]);
 
   const openTimeline = () => {
     if (timelineCloseTimerRef.current !== null) {
@@ -1780,6 +1969,8 @@ export function ChatPane({
                   onForkAtMessage={onForkAtMessage}
                   onViewCheckpointDiff={onViewCheckpointDiff}
                   onRevertToCheckpoint={onRevertToCheckpoint}
+                  onRewindCheckpoint={onRewindCheckpoint}
+                  onForkFromCheckpoint={onForkFromCheckpoint}
                   onToast={onToast}
                   onOpenFile={onOpenFile}
                 />
@@ -2038,6 +2229,8 @@ export function ChatPane({
                       onForkAtMessage={onForkAtMessage}
                       onViewCheckpointDiff={onViewCheckpointDiff}
                       onRevertToCheckpoint={onRevertToCheckpoint}
+                  onRewindCheckpoint={onRewindCheckpoint}
+                  onForkFromCheckpoint={onForkFromCheckpoint}
                       onToast={onToast}
                       onOpenFile={onOpenFile}
                     />
@@ -2813,6 +3006,40 @@ export function ChatPane({
                       e.target.value = '';
                     }}
                   />
+                  <button
+                    type="button"
+                    onClick={() => void toggleVoiceRecording()}
+                    className="w-7 h-7 rounded-[7px] flex items-center justify-center hover:bg-[var(--bg-hover)] cursor-pointer"
+                    style={{
+                      color: isRecording ? 'var(--accent-red)' : 'var(--text-muted)',
+                      backgroundColor: isRecording ? 'rgba(239,68,68,0.12)' : 'transparent',
+                    }}
+                    title={isRecording ? 'Stop voice dictation' : 'Voice dictation (STT)'}
+                    aria-label={isRecording ? 'Stop voice dictation' : 'Voice dictation'}
+                  >
+                    {isRecording ? <MicrophoneSlash size={14} weight="fill" /> : <Microphone size={14} />}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = !ttsEnabled;
+                      setTtsEnabled(next);
+                      if (!next && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                        window.speechSynthesis.cancel();
+                      }
+                      tauriApi.getVoiceConfig().then((cfg) =>
+                        tauriApi.updateVoiceConfig({ ...cfg, ttsEnabled: next }),
+                      ).catch(() => {});
+                    }}
+                    className="w-7 h-7 rounded-[7px] flex items-center justify-center hover:bg-[var(--bg-hover)] cursor-pointer"
+                    style={{
+                      color: ttsEnabled ? 'var(--accent-blue)' : 'var(--text-muted)',
+                    }}
+                    title={ttsEnabled ? 'Disable spoken replies (TTS)' : 'Enable spoken replies (TTS)'}
+                    aria-label="Toggle text-to-speech"
+                  >
+                    {ttsEnabled ? <SpeakerHigh size={14} weight="fill" /> : <SpeakerSlash size={14} />}
+                  </button>
                   <button
                     type="button"
                     onClick={() => {

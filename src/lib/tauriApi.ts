@@ -59,6 +59,17 @@ import type {
   UpdateStaffInput,
   WorkspaceFile,
   WslDistro,
+  VoiceConfig,
+  TranscribeResult,
+  FailoverConfig,
+  TurnFailoverEvent,
+  RewindResult,
+  RaceContestantInput,
+  RaceRun,
+  SearchHit,
+  OfficeBlueprint,
+  TelemetrySummary,
+  AuditLogEntry,
 } from '../types';
 
 declare global {
@@ -308,15 +319,30 @@ export const tauriApi = {
   removeWorktree: (sessionId: string, projectCwd: string) =>
     tauriInvoke<void>('remove_worktree', { sessionId, projectCwd }),
 
-  listBranches: (cwd: string) =>
-    tauriInvoke<string[]>('list_branches', { cwd }),
+  listBranches: (cwd: string, wslDistro?: string) =>
+    tauriInvoke<string[]>('list_branches', {
+      cwd,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
-  checkoutBranch: (cwd: string, branch: string) =>
-    tauriInvoke<void>('checkout_branch', { cwd, branch }),
+  checkoutBranch: (cwd: string, branch: string, wslDistro?: string) =>
+    tauriInvoke<void>('checkout_branch', {
+      cwd,
+      branch,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
-  gitPull: (cwd: string) => tauriInvoke<string>('git_pull', { cwd }),
+  gitPull: (cwd: string, wslDistro?: string) =>
+    tauriInvoke<string>('git_pull', {
+      cwd,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
-  gitPush: (cwd: string) => tauriInvoke<string>('git_push', { cwd }),
+  gitPush: (cwd: string, wslDistro?: string) =>
+    tauriInvoke<string>('git_push', {
+      cwd,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
   createCheckpoint: (
     sessionId: string,
@@ -376,11 +402,18 @@ export const tauriApi = {
       ...(wslDistro ? { wslDistro } : {}),
     }),
 
-  draftCommitMessage: (cwd: string) =>
-    tauriInvoke<string>('draft_commit_message', { cwd }),
+  draftCommitMessage: (cwd: string, wslDistro?: string) =>
+    tauriInvoke<string>('draft_commit_message', {
+      cwd,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
-  gitCommit: (cwd: string, message: string) =>
-    tauriInvoke<string>('git_commit', { cwd, message }),
+  gitCommit: (cwd: string, message: string, wslDistro?: string) =>
+    tauriInvoke<string>('git_commit', {
+      cwd,
+      message,
+      ...(wslDistro ? { wslDistro } : {}),
+    }),
 
   createPr: (
     cwd: string,
@@ -843,4 +876,185 @@ export const tauriApi = {
       'sakana:sync-updated',
       handler,
     ),
+
+  // Feature 1: Voice Mode (STT + TTS)
+  getVoiceConfig: async (): Promise<VoiceConfig> =>
+    (await tauriInvoke<VoiceConfig>('get_voice_config')) ?? {
+      engine: 'auto',
+      language: 'en-US',
+      whisperUrl: '',
+      whisperModel: 'whisper-1',
+      whisperCliPath: '',
+      autoSend: false,
+      silenceMs: 1500,
+      ttsEnabled: false,
+      ttsVoice: '',
+      ttsRate: 1.05,
+    },
+
+  updateVoiceConfig: async (config: VoiceConfig): Promise<VoiceConfig> =>
+    (await tauriInvoke<VoiceConfig>('update_voice_config', { config })) ?? config,
+
+  transcribeAudio: async (
+    audioB64: string,
+    mimeType?: string,
+    language?: string,
+  ): Promise<TranscribeResult | null> =>
+    tauriInvoke<TranscribeResult>('transcribe_audio', {
+      audioB64,
+      mimeType: mimeType ?? null,
+      language: language ?? null,
+    }),
+
+  // Feature 2: Auto-Failover & Smart Quota Routing
+  getFailoverConfig: async (projectId?: string): Promise<FailoverConfig> =>
+    (await tauriInvoke<FailoverConfig>('get_failover_config', {
+      projectId: projectId ?? null,
+    })) ?? {
+      enabled: false,
+      quotaThresholdPct: 90,
+      rotateAccountsSameHarness: true,
+      fallbackChain: [],
+    },
+
+  updateFailoverConfig: async (
+    config: FailoverConfig,
+    projectId?: string,
+  ): Promise<FailoverConfig> =>
+    (await tauriInvoke<FailoverConfig>('update_failover_config', {
+      projectId: projectId ?? null,
+      config,
+    })) ?? config,
+
+  onTurnFailover: (handler: (payload: TurnFailoverEvent) => void) =>
+    tauriListen<TurnFailoverEvent>('turn:failover', handler),
+
+  // Feature 3: Time-Travel Checkpoint Rewind & Fork
+  rewindCheckpoint: async (
+    sessionId: string,
+    checkpointId: string,
+    resetGit = true,
+    autoStash = true,
+  ): Promise<RewindResult | null> =>
+    tauriInvoke<RewindResult>('rewind_checkpoint', {
+      sessionId,
+      checkpointId,
+      resetGit,
+      autoStash,
+    }),
+
+  forkFromCheckpoint: async (
+    sessionId: string,
+    checkpointId: string,
+    title?: string,
+  ): Promise<Thread | null> =>
+    tauriInvoke<Thread>('fork_from_checkpoint', {
+      sessionId,
+      checkpointId,
+      title: title ?? null,
+    }),
+
+  // Feature 4: Multi-Harness Parallel Race Mode
+  startRace: async (
+    projectId: string,
+    prompt: string,
+    contestants: RaceContestantInput[],
+    verifyCmd?: string,
+  ): Promise<RaceRun | null> =>
+    tauriInvoke<RaceRun>('start_race', {
+      projectId,
+      prompt,
+      contestants,
+      verifyCmd: verifyCmd ?? null,
+    }),
+
+  listRaces: async (): Promise<RaceRun[]> =>
+    (await tauriInvoke<RaceRun[]>('list_races')) ?? [],
+
+  getRace: async (raceId: string): Promise<RaceRun | null> =>
+    tauriInvoke<RaceRun>('get_race', { raceId }),
+
+  mergeRaceWinner: async (
+    raceId: string,
+    winnerSessionId: string,
+  ): Promise<RaceRun | null> =>
+    tauriInvoke<RaceRun>('merge_race_winner', { raceId, winnerSessionId }),
+
+  onRaceUpdate: (handler: (payload: RaceRun) => void) =>
+    tauriListen<RaceRun>('race:update', handler),
+
+  // Feature 5: Global Full-Text Search (FTS5)
+  searchHistory: async (
+    query: string,
+    projectId?: string,
+    harness?: string,
+    limit = 40,
+  ): Promise<SearchHit[]> =>
+    (await tauriInvoke<SearchHit[]>('search_history', {
+      query,
+      projectId: projectId ?? null,
+      harness: harness ?? null,
+      limit,
+    })) ?? [],
+
+  // Feature 6: Office Blueprints & Telemetry Analytics
+  listOfficeBlueprints: async (): Promise<OfficeBlueprint[]> =>
+    (await tauriInvoke<OfficeBlueprint[]>('list_office_blueprints')) ?? [],
+
+  saveOfficeBlueprint: async (
+    officeId: string,
+    name: string,
+    description?: string,
+  ): Promise<OfficeBlueprint | null> =>
+    tauriInvoke<OfficeBlueprint>('save_office_blueprint', {
+      officeId,
+      name,
+      description: description ?? null,
+    }),
+
+  deleteOfficeBlueprint: async (id: string): Promise<boolean> =>
+    (await tauriInvoke<boolean>('delete_office_blueprint', { id })) ?? false,
+
+  createOfficeFromBlueprint: async (
+    blueprintId: string,
+    projectId: string,
+    name?: string,
+  ): Promise<Office | null> =>
+    tauriInvoke<Office>('create_office_from_blueprint', {
+      blueprintId,
+      projectId,
+      name: name ?? null,
+    }),
+
+  getTelemetrySummary: async (days = 14): Promise<TelemetrySummary | null> =>
+    tauriInvoke<TelemetrySummary>('get_telemetry_summary', { days }),
+
+  // Feature 7: Security & Audit Log
+  listAuditLogs: async (
+    source?: string,
+    status?: string,
+    limit = 100,
+    query?: string,
+  ): Promise<AuditLogEntry[]> =>
+    (await tauriInvoke<AuditLogEntry[]>('list_audit_logs', {
+      query: query ?? null,
+      source: source ?? null,
+      status: status ?? null,
+      limit,
+    })) ?? [],
+
+  recordAuditLog: async (
+    source: string,
+    action: string,
+    status: string,
+    summary: string,
+    payloadJson?: string,
+  ): Promise<AuditLogEntry | null> =>
+    tauriInvoke<AuditLogEntry>('record_audit_log', {
+      source,
+      action,
+      status,
+      summary,
+      payloadJson: payloadJson ?? null,
+    }),
 };

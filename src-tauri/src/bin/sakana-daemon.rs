@@ -6,8 +6,7 @@ use sakana_lib::db::Database;
 use sakana_lib::platform;
 use sakana_lib::remote;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let mut port: u16 = std::env::var("SAKANA_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -43,12 +42,19 @@ async fn main() {
         i += 1;
     }
 
+    // Mutate process env before spawning the multi-threaded Tokio runtime.
     if lan_enabled {
         std::env::set_var("SAKANA_REMOTE_LAN", "1");
     }
     if let Some(ref t) = cli_token {
         std::env::set_var("SAKANA_TOKEN", t);
     }
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to build Tokio runtime");
+    rt.block_on(async_main(port, cli_token, lan_enabled));
+}
+
+async fn async_main(port: u16, cli_token: Option<String>, lan_enabled: bool) {
 
     let data_dir = platform::app_data_dir();
     platform::init_app_data_dir(data_dir.clone());

@@ -42,6 +42,7 @@ import { OfficeView } from './components/OfficeView';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { CommandPalette } from './components/CommandPalette';
 import { CreatePrModal } from './components/CreatePrModal';
+import { RaceModal } from './components/RaceModal';
 import { GitHubCloneModal } from './components/GitHubCloneModal';
 import { NewWorktreeModal } from './components/NewWorktreeModal';
 import { HARNESS_META } from './components/HarnessBadge';
@@ -184,6 +185,7 @@ export default function App() {
 
   const [attachedChips, setAttachedChips] = useState<AttachedContextChip[]>([]);
   const [queues, setQueues] = useState<Record<string, QueuedPrompt[]>>({});
+  const [raceOpen, setRaceOpen] = useState(false);
 
   // Dashboard state
   const [quotas, setQuotas] = useState<QuotaAccount[]>([]);
@@ -384,8 +386,14 @@ export default function App() {
     }
   }, []);
 
+  const switchHostReqRef = useRef(0);
+  const diffsReqRef = useRef(0);
+  const queuesRef = useRef(queues);
+  queuesRef.current = queues;
+
   const handleSwitchHost = useCallback(
     async (nextHostId: string) => {
+      const reqId = ++switchHostReqRef.current;
       const target = nextHostId || 'local';
       setActiveHost(target);
       setActiveHostId(target);
@@ -405,17 +413,21 @@ export default function App() {
           console.error('remote event bridge error:', err);
         }
       }
+      if (reqId !== switchHostReqRef.current) return;
       await bootstrapActiveHost();
+      if (reqId !== switchHostReqRef.current) return;
       await refreshOffices();
+      if (reqId !== switchHostReqRef.current) return;
       void refreshQuotasRef.current(true);
       try {
         const models = await tauriApi.listHarnessModels();
-        if (models && Object.keys(models).length > 0) {
+        if (reqId === switchHostReqRef.current && models && Object.keys(models).length > 0) {
           setHarnessModels(models);
         }
       } catch {
         // ignore
       }
+      if (reqId !== switchHostReqRef.current) return;
       const label =
         target === 'local'
           ? 'Local Machine'
@@ -674,6 +686,7 @@ export default function App() {
 
   const refreshDiffs = useCallback(
     async (turnId?: string) => {
+      const reqId = ++diffsReqRef.current;
       if (!isTauriRuntime()) return;
       if (!effectiveCwd) {
         setDiffs([]);
@@ -685,11 +698,13 @@ export default function App() {
           scope && scope !== 'all'
             ? await tauriApi.getCheckpointDiff(activeThread.id, scope)
             : await tauriApi.getGitDiffs(effectiveCwd, undefined, activeProject?.wslDistro);
-        if (nextDiffs) {
+        if (reqId === diffsReqRef.current && nextDiffs) {
           setDiffs(nextDiffs);
         }
       } catch (err) {
-        console.error('Failed to load git diffs:', err);
+        if (reqId === diffsReqRef.current) {
+          console.error('Failed to load git diffs:', err);
+        }
       }
     },
     [activeThread.id, effectiveCwd, turnScopeFilter, activeProject?.wslDistro],
@@ -967,14 +982,13 @@ export default function App() {
         }),
       );
 
-      // Auto-drain prompt queue if any
-      setQueues((prevQ) => {
-        const q = prevQ[threadId] || [];
-        if (q.length === 0) return prevQ;
+      // Auto-drain prompt queue if any (outside updater to prevent StrictMode double-dispatch)
+      const q = queuesRef.current[threadId] || [];
+      if (q.length > 0) {
         const [next, ...rest] = q;
+        setQueues((prevQ) => ({ ...prevQ, [threadId]: rest }));
         setTimeout(() => dispatchTurnRef.current(threadId, next.prompt), 250);
-        return { ...prevQ, [threadId]: rest };
-      });
+      }
     }, 1100);
   }, []);
 
@@ -1175,14 +1189,13 @@ export default function App() {
           // Refresh usage limits automatically after a turn finishes
           window.setTimeout(() => void refreshQuotasRef.current(true), 1500);
 
-          // Auto-dispatch next queued prompt for this thread
-          setQueues((prevQ) => {
-            const q = prevQ[sessionId] || [];
-            if (q.length === 0) return prevQ;
+          // Auto-dispatch next queued prompt for this thread (outside updater to prevent StrictMode double-dispatch)
+          const q = queuesRef.current[sessionId] || [];
+          if (q.length > 0) {
             const [next, ...rest] = q;
+            setQueues((prevQ) => ({ ...prevQ, [sessionId]: rest }));
             setTimeout(() => dispatchTurnRef.current(sessionId, next.prompt), 250);
-            return { ...prevQ, [sessionId]: rest };
-          });
+          }
         }),
         tauriApi.onTurnError(({ sessionId, messageId, error }) => {
           flushPendingTokens();
@@ -1199,6 +1212,20 @@ export default function App() {
             ),
           );
           showToast(`Turn error: ${error}`);
+        }),
+        tauriApi.onTurnFailover((ev) => {
+          setThreads((prev) =>
+            upsertAssistantMessage(
+              prev,
+              ev.sessionId,
+              ev.messageId,
+              (m) => ({
+                ...m,
+                failoverNotice: ev.notice,
+              }),
+            ),
+          );
+          showToast(ev.notice);
         }),
         tauriApi.onAutomationRun((updated) => {
           setAutomations((prev) => {
@@ -1317,7 +1344,16 @@ export default function App() {
               .then((state) => {
                 if (!state) return;
                 if (state.projects) setProjects(state.projects);
-                if (state.sessions) setThreads(state.sessions);
+                if (state.sessions) {
+                  // Preserve any in-flight streaming sessions so sync updates do not wipe live tokens
+                  setThreads((prev) => {
+                    const runningById = new Map(
+                      prev.filter((t) => t.status === 'RUNNING').map((t) => [t.id, t]),
+                    );
+                    if (runningById.size === 0) return state.sessions;
+                    return state.sessions.map((s) => runningById.get(s.id) ?? s);
+                  });
+                }
               })
               .catch(() => {});
           }
@@ -1992,6 +2028,36 @@ export default function App() {
             onUpdateThreadConfig={handleUpdateThreadConfig}
             skills={skills}
             theme={theme}
+            onRewindCheckpoint={async (threadId, checkpointId) => {
+              if (!isTauriRuntime()) return;
+              try {
+                const res = await tauriApi.rewindCheckpoint(threadId, checkpointId, true, true);
+                const refreshed = await tauriApi.listSessions();
+                if (refreshed?.length) {
+                  setThreads(refreshed);
+                }
+                await refreshDiffs('all');
+                if (res) {
+                  const stashMsg = res.stashed ? ` (stashed ${res.stashRef || 'changes'})` : '';
+                  showToast(`Rewound ${res.removedMessages} msgs${stashMsg}`);
+                }
+              } catch (err) {
+                showToast(`Rewind failed: ${String(err)}`);
+              }
+            }}
+            onForkFromCheckpoint={async (threadId, checkpointId) => {
+              if (!isTauriRuntime()) return;
+              try {
+                const forked = await tauriApi.forkFromCheckpoint(threadId, checkpointId);
+                if (forked) {
+                  setThreads((prev) => [forked, ...prev]);
+                  setSelectedThreadId(forked.id);
+                  showToast(`Forked thread: ${forked.title}`);
+                }
+              } catch (err) {
+                showToast(`Fork failed: ${String(err)}`);
+              }
+            }}
             onRevertToCheckpoint={async (threadId, checkpointId) => {
               if (isTauriRuntime()) {
                 try {
@@ -2679,6 +2745,19 @@ export default function App() {
         onToggleSplit={() => setSplitView((v) => !v)}
         onOpenNewWorktree={() => setNewWtOpen(true)}
         onOpenCreatePr={() => setPrOpen(true)}
+        onOpenRace={() => setRaceOpen(true)}
+      />
+
+      <RaceModal
+        open={raceOpen}
+        onClose={() => setRaceOpen(false)}
+        projects={projects}
+        activeProjectId={activeProject?.id}
+        harnessModels={harnessModels}
+        onToast={showToast}
+        onMerged={() => {
+          void refreshDiffs('all');
+        }}
       />
 
       <CreatePrModal

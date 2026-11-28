@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static NEXT_PTY_GEN: AtomicU64 = AtomicU64::new(1);
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use reqwest::Client;
@@ -10,6 +13,7 @@ use tauri::{AppHandle, State};
 use tokio::sync::Mutex;
 
 pub struct PtySession {
+    pub generation: u64,
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -115,16 +119,20 @@ pub async fn pty_spawn_inner(
             .map_err(|e| format!("Failed to take PTY writer: {}", e))?,
     ));
 
+    let generation = NEXT_PTY_GEN.fetch_add(1, Ordering::Relaxed);
     {
         let mut map = state.sessions.lock().await;
-        map.insert(
+        if let Some(mut old) = map.insert(
             session_id.clone(),
             PtySession {
+                generation,
                 master: pair.master,
                 writer,
                 child,
             },
-        );
+        ) {
+            let _ = old.child.kill();
+        }
     }
 
     let sid = session_id.clone();
@@ -135,33 +143,41 @@ pub async fn pty_spawn_inner(
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    if !pending_utf8.is_empty() {
-                        let tail = String::from_utf8_lossy(&pending_utf8).to_string();
+                    let removed = {
+                        let mut map = sessions_arc.blocking_lock();
+                        if map.get(&sid).map(|s| s.generation) == Some(generation) {
+                            map.remove(&sid)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(mut sess) = removed {
+                        if !pending_utf8.is_empty() {
+                            let tail = String::from_utf8_lossy(&pending_utf8).to_string();
+                            crate::platform::emit_app_and_remote(
+                                app.as_ref(),
+                                "pty:data",
+                                PtyDataEvent {
+                                    session_id: sid.clone(),
+                                    data: tail,
+                                },
+                            );
+                        }
+                        let code = sess
+                            .child
+                            .wait()
+                            .ok()
+                            .map(|s| s.exit_code())
+                            .unwrap_or(0);
                         crate::platform::emit_app_and_remote(
                             app.as_ref(),
-                            "pty:data",
-                            PtyDataEvent {
+                            "pty:exit",
+                            PtyExitEvent {
                                 session_id: sid.clone(),
-                                data: tail,
+                                code,
                             },
                         );
                     }
-                    let removed = {
-                        let mut map = sessions_arc.blocking_lock();
-                        map.remove(&sid)
-                    };
-                    let code = removed
-                        .and_then(|mut sess| sess.child.wait().ok())
-                        .map(|s| s.exit_code())
-                        .unwrap_or(0);
-                    crate::platform::emit_app_and_remote(
-                        app.as_ref(),
-                        "pty:exit",
-                        PtyExitEvent {
-                            session_id: sid.clone(),
-                            code,
-                        },
-                    );
                     break;
                 }
                 Ok(n) => {
@@ -207,20 +223,28 @@ pub async fn pty_spawn_inner(
                 Err(_) => {
                     let removed = {
                         let mut map = sessions_arc.blocking_lock();
-                        map.remove(&sid)
+                        if map.get(&sid).map(|s| s.generation) == Some(generation) {
+                            map.remove(&sid)
+                        } else {
+                            None
+                        }
                     };
-                    let code = removed
-                        .and_then(|mut sess| sess.child.wait().ok())
-                        .map(|s| s.exit_code())
-                        .unwrap_or(1);
-                    crate::platform::emit_app_and_remote(
-                        app.as_ref(),
-                        "pty:exit",
-                        PtyExitEvent {
-                            session_id: sid.clone(),
-                            code,
-                        },
-                    );
+                    if let Some(mut sess) = removed {
+                        let code = sess
+                            .child
+                            .wait()
+                            .ok()
+                            .map(|s| s.exit_code())
+                            .unwrap_or(1);
+                        crate::platform::emit_app_and_remote(
+                            app.as_ref(),
+                            "pty:exit",
+                            PtyExitEvent {
+                                session_id: sid.clone(),
+                                code,
+                            },
+                        );
+                    }
                     break;
                 }
             }
@@ -387,7 +411,7 @@ fn sanitize_nl_command(raw: &str) -> String {
 }
 
 pub async fn translate_nl_command_inner(
-    db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
+    _db: &std::sync::Arc<tokio::sync::Mutex<crate::db::Database>>,
     prompt: String,
     os: String,
     shell: String,

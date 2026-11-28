@@ -6,10 +6,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::models::{
-    AutomationHistoryItem, AutomationItem, BootstrapState, ChatMessage, CreateProjectInput,
-    CreateSessionInput, DiscordUserRule, HarnessAccountRow, McpServer, Office, OfficeEvent,
-    OfficeStaff, PendingApproval, Project, QuotaAccount, RemoteHost, Session, Thread, TraceSpan,
-    TurnCheckpoint, UpdateSessionInput, UpdateStaffInput, UpsertRemoteHostInput,
+    AuditLogEntry, AutomationHistoryItem, AutomationItem, BootstrapState, ChatMessage,
+    CreateProjectInput, CreateSessionInput, DiscordUserRule, FailoverConfig, HarnessAccountRow,
+    McpServer, Office, OfficeBlueprint, OfficeBlueprintConfig, OfficeBlueprintStaff, OfficeEvent,
+    OfficeStaff, PendingApproval, Project, QuotaAccount, RemoteHost, SearchHit, Session,
+    TelemetryBucket, TelemetryDayPoint, TelemetrySummary, Thread, TraceSpan, TurnCheckpoint,
+    UpdateSessionInput, UpdateStaffInput, UpsertRemoteHostInput, VoiceConfig,
 };
 
 pub struct Database {
@@ -34,7 +36,8 @@ impl Database {
             .with_context(|| format!("failed to open sqlite db: {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
         )?;
         let db = Self { conn };
         db.init_schema()?;
@@ -275,25 +278,84 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_office_staff_office ON office_staff(office_id, desk_order);
             CREATE INDEX IF NOT EXISTS idx_office_events_office ON office_events(office_id, timestamp);
+
+            CREATE TABLE IF NOT EXISTS office_blueprints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                is_builtin INTEGER NOT NULL DEFAULT 0,
+                config_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                payload_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(timestamp DESC);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
+                kind UNINDEXED,
+                entity_id UNINDEXED,
+                session_id UNINDEXED,
+                project_id UNINDEXED,
+                harness UNINDEXED,
+                title,
+                body,
+                timestamp UNINDEXED
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_messages_fts_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO search_index(kind, entity_id, session_id, project_id, harness, title, body, timestamp)
+                SELECT 'message', NEW.id, NEW.session_id, COALESCE(s.project_id, ''), COALESCE(s.harness, ''), COALESCE(s.title, ''),
+                       COALESCE(NEW.text, '') || ' ' || COALESCE(NEW.thinking, ''), NEW.timestamp
+                FROM sessions s WHERE s.id = NEW.session_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_messages_fts_delete AFTER DELETE ON messages BEGIN
+                DELETE FROM search_index WHERE kind = 'message' AND entity_id = OLD.id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_messages_fts_update AFTER UPDATE OF text, thinking ON messages BEGIN
+                DELETE FROM search_index WHERE kind = 'message' AND entity_id = OLD.id;
+                INSERT INTO search_index(kind, entity_id, session_id, project_id, harness, title, body, timestamp)
+                SELECT 'message', NEW.id, NEW.session_id, COALESCE(s.project_id, ''), COALESCE(s.harness, ''), COALESCE(s.title, ''),
+                       COALESCE(NEW.text, '') || ' ' || COALESCE(NEW.thinking, ''), NEW.timestamp
+                FROM sessions s WHERE s.id = NEW.session_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_office_events_fts_insert AFTER INSERT ON office_events BEGIN
+                INSERT INTO search_index(kind, entity_id, session_id, project_id, harness, title, body, timestamp)
+                SELECT 'office', NEW.id, NEW.office_id, COALESCE(o.project_id, ''), 'office', COALESCE(o.name, ''),
+                       COALESCE(NEW.summary, '') || ' ' || COALESCE(NEW.detail, ''), NEW.timestamp
+                FROM offices o WHERE o.id = NEW.office_id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_office_events_fts_delete AFTER DELETE ON office_events BEGIN
+                DELETE FROM search_index WHERE kind = 'office' AND entity_id = OLD.id;
+            END;
             ",
         )?;
-        // Idempotent migrations for native WSL support on projects
-        let _ = self.conn.execute(
+        // Idempotent migrations for native WSL support and ordering (only ignore duplicate column errors)
+        for sql in [
             "ALTER TABLE projects ADD COLUMN runtime TEXT NOT NULL DEFAULT 'native'",
-            [],
-        );
-        let _ = self.conn.execute(
             "ALTER TABLE projects ADD COLUMN wsl_distro TEXT",
-            [],
-        );
-        let _ = self.conn.execute(
             "ALTER TABLE projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = self.conn.execute(
             "ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+            "ALTER TABLE messages ADD COLUMN failover_notice TEXT",
+        ] {
+            match self.conn.execute(sql, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.to_ascii_lowercase().contains("duplicate column name") => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         // Idempotently add office_id column to sessions
         let has_office_id = {
             let mut stmt = self.conn.prepare("PRAGMA table_info(sessions)")?;
@@ -311,6 +373,28 @@ impl Database {
             self.conn
                 .execute("ALTER TABLE sessions ADD COLUMN office_id TEXT", [])?;
         }
+        // One-time FTS5 backfill if search_index is empty while messages or office_events exist
+        let fts_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM search_index", [], |r| r.get(0))
+            .unwrap_or(0);
+        if fts_count == 0 {
+            let _ = self.conn.execute(
+                "INSERT INTO search_index(kind, entity_id, session_id, project_id, harness, title, body, timestamp)
+                 SELECT 'message', m.id, m.session_id, COALESCE(s.project_id, ''), COALESCE(s.harness, ''), COALESCE(s.title, ''),
+                        COALESCE(m.text, '') || ' ' || COALESCE(m.thinking, ''), m.timestamp
+                 FROM messages m JOIN sessions s ON s.id = m.session_id",
+                [],
+            );
+            let _ = self.conn.execute(
+                "INSERT INTO search_index(kind, entity_id, session_id, project_id, harness, title, body, timestamp)
+                 SELECT 'office', e.id, e.office_id, COALESCE(o.project_id, ''), 'office', COALESCE(o.name, ''),
+                        COALESCE(e.summary, '') || ' ' || COALESCE(e.detail, ''), e.timestamp
+                 FROM office_events e JOIN offices o ON o.id = e.office_id",
+                [],
+            );
+        }
+
         if current_version < SCHEMA_VERSION {
             self.conn
                 .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION))?;
@@ -350,6 +434,145 @@ impl Database {
                  VALUES (?1, ?2, ?3, '', '', ?4, 1, 'unauthenticated', ?5)",
                 params![id, harness, label, auth_type, now],
             )?;
+        }
+
+        // Seed built-in Office Blueprints if missing
+        let builtin_blueprints = vec![
+            (
+                "bp-pr-review-squad",
+                "PR Review Squad",
+                "Lead reviewer coordinates security, performance, and test-coverage audits in parallel.",
+                OfficeBlueprintConfig {
+                    max_rounds: 6,
+                    staff: vec![
+                        OfficeBlueprintStaff {
+                            name: "Lead Reviewer".to_string(),
+                            role: "Tech Lead & PR Coordinator".to_string(),
+                            is_master: true,
+                            harness: "claude-code".to_string(),
+                            model: String::new(),
+                            effort: "high".to_string(),
+                            permission_mode: "supervised".to_string(),
+                            system_prompt: "Coordinate a thorough PR review. Delegate security and quality checks to your staff and synthesize an actionable verdict.".to_string(),
+                            isolated_worktree: false,
+                            avatar_color: "#6366f1".to_string(),
+                        },
+                        OfficeBlueprintStaff {
+                            name: "SecOps Auditor".to_string(),
+                            role: "Security & Auth Auditor".to_string(),
+                            is_master: false,
+                            harness: "claude-code".to_string(),
+                            model: String::new(),
+                            effort: "high".to_string(),
+                            permission_mode: "supervised".to_string(),
+                            system_prompt: "Audit diffs for injection, path traversal, auth bypasses, secret leaks, and unsafe subprocess calls.".to_string(),
+                            isolated_worktree: false,
+                            avatar_color: "#ec4899".to_string(),
+                        },
+                        OfficeBlueprintStaff {
+                            name: "QA & Perf".to_string(),
+                            role: "Tests & Performance Reviewer".to_string(),
+                            is_master: false,
+                            harness: "agy-cli".to_string(),
+                            model: String::new(),
+                            effort: "medium".to_string(),
+                            permission_mode: "supervised".to_string(),
+                            system_prompt: "Check edge cases, missing tests, race conditions, and performance regressions.".to_string(),
+                            isolated_worktree: false,
+                            avatar_color: "#10b981".to_string(),
+                        },
+                    ],
+                },
+            ),
+            (
+                "bp-fullstack-team",
+                "Fullstack Feature Team",
+                "Architect delegates backend, frontend, and test tasks across isolated worktrees.",
+                OfficeBlueprintConfig {
+                    max_rounds: 10,
+                    staff: vec![
+                        OfficeBlueprintStaff {
+                            name: "Architect".to_string(),
+                            role: "Principal Architect".to_string(),
+                            is_master: true,
+                            harness: "claude-code".to_string(),
+                            model: String::new(),
+                            effort: "high".to_string(),
+                            permission_mode: "auto-edit".to_string(),
+                            system_prompt: "Break down the feature spec into backend API and frontend UI tasks, delegate cleanly, and integrate.".to_string(),
+                            isolated_worktree: false,
+                            avatar_color: "#8b5cf6".to_string(),
+                        },
+                        OfficeBlueprintStaff {
+                            name: "Backend Dev".to_string(),
+                            role: "Systems & API Engineer".to_string(),
+                            is_master: false,
+                            harness: "claude-code".to_string(),
+                            model: String::new(),
+                            effort: "high".to_string(),
+                            permission_mode: "auto-edit".to_string(),
+                            system_prompt: "Implement clean, well-typed backend schemas, commands, and unit tests.".to_string(),
+                            isolated_worktree: true,
+                            avatar_color: "#0ea5e9".to_string(),
+                        },
+                        OfficeBlueprintStaff {
+                            name: "Frontend Dev".to_string(),
+                            role: "UI/UX Engineer".to_string(),
+                            is_master: false,
+                            harness: "agy-cli".to_string(),
+                            model: String::new(),
+                            effort: "medium".to_string(),
+                            permission_mode: "auto-edit".to_string(),
+                            system_prompt: "Build responsive, accessible React + Tailwind UI components wired to the backend API.".to_string(),
+                            isolated_worktree: true,
+                            avatar_color: "#f59e0b".to_string(),
+                        },
+                    ],
+                },
+            ),
+            (
+                "bp-bug-triage",
+                "Bug Triage & Fix Crew",
+                "Investigator reproduces bugs while Fixer patches and verifies tests.",
+                OfficeBlueprintConfig {
+                    max_rounds: 8,
+                    staff: vec![
+                        OfficeBlueprintStaff {
+                            name: "Triage Lead".to_string(),
+                            role: "Incident Commander".to_string(),
+                            is_master: true,
+                            harness: "claude-code".to_string(),
+                            model: String::new(),
+                            effort: "medium".to_string(),
+                            permission_mode: "auto-edit".to_string(),
+                            system_prompt: "Locate root cause, delegate minimal safe fix, and verify regression tests pass.".to_string(),
+                            isolated_worktree: false,
+                            avatar_color: "#06b6d4".to_string(),
+                        },
+                        OfficeBlueprintStaff {
+                            name: "Debugger".to_string(),
+                            role: "Root Cause & Patch Engineer".to_string(),
+                            is_master: false,
+                            harness: "agy-cli".to_string(),
+                            model: String::new(),
+                            effort: "high".to_string(),
+                            permission_mode: "auto-edit".to_string(),
+                            system_prompt: "Reproduce the bug, apply a focused fix, and verify with build/test commands.".to_string(),
+                            isolated_worktree: true,
+                            avatar_color: "#10b981".to_string(),
+                        },
+                    ],
+                },
+            ),
+        ];
+        for (id, name, desc, cfg) in builtin_blueprints {
+            if let Ok(cfg_json) = serde_json::to_string(&cfg) {
+                let _ = self.conn.execute(
+                    "INSERT OR IGNORE INTO office_blueprints (id, name, description, is_builtin, config_json, created_at)
+                     VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                    params![id, name, desc, cfg_json, now],
+                );
+            }
         }
 
         Ok(())
@@ -1105,8 +1328,8 @@ impl Database {
             tx.execute(
                 "INSERT INTO messages (
                     id, session_id, role, author, timestamp, text, thinking, thinking_duration,
-                    tools_json, subagent_json, widget_json, checkpoint_json, sort_order
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    tools_json, subagent_json, widget_json, checkpoint_json, sort_order, failover_notice
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     cloned_id,
                     new_id,
@@ -1120,7 +1343,8 @@ impl Database {
                     subagent_json,
                     widget_json,
                     checkpoint_json,
-                    idx as i64
+                    idx as i64,
+                    msg.failover_notice
                 ],
             )?;
         }
@@ -1155,7 +1379,7 @@ impl Database {
     pub fn list_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, role, author, timestamp, text, thinking, thinking_duration,
-                    tools_json, subagent_json, widget_json, checkpoint_json
+                    tools_json, subagent_json, widget_json, checkpoint_json, failover_notice
              FROM messages
              WHERE session_id = ?1
              ORDER BY sort_order ASC, rowid ASC",
@@ -1179,6 +1403,7 @@ impl Database {
                 subagent: subagent_json.and_then(|s| serde_json::from_str(&s).ok()),
                 widget: widget_json.and_then(|s| serde_json::from_str(&s).ok()),
                 checkpoint: checkpoint_json.and_then(|s| serde_json::from_str(&s).ok()),
+                failover_notice: row.get(11)?,
             })
         })?;
 
@@ -1192,7 +1417,7 @@ impl Database {
     pub fn list_recent_messages(&self, session_id: &str, limit: usize) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, role, author, timestamp, text, thinking, thinking_duration,
-                    tools_json, subagent_json, widget_json, checkpoint_json
+                    tools_json, subagent_json, widget_json, checkpoint_json, failover_notice
              FROM messages
              WHERE session_id = ?1
              ORDER BY sort_order DESC, rowid DESC
@@ -1217,6 +1442,7 @@ impl Database {
                 subagent: subagent_json.and_then(|s| serde_json::from_str(&s).ok()),
                 widget: widget_json.and_then(|s| serde_json::from_str(&s).ok()),
                 checkpoint: checkpoint_json.and_then(|s| serde_json::from_str(&s).ok()),
+                failover_notice: row.get(11)?,
             })
         })?;
 
@@ -1335,8 +1561,8 @@ impl Database {
         self.conn.execute(
             "INSERT INTO messages (
                 id, session_id, role, author, timestamp, text, thinking, thinking_duration,
-                tools_json, subagent_json, widget_json, checkpoint_json, sort_order
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                tools_json, subagent_json, widget_json, checkpoint_json, sort_order, failover_notice
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 msg.id,
                 session_id,
@@ -1350,7 +1576,8 @@ impl Database {
                 subagent_json,
                 widget_json,
                 checkpoint_json,
-                next_order
+                next_order,
+                msg.failover_notice
             ],
         )?;
 
@@ -1908,9 +2135,9 @@ impl Database {
                 "UPDATE mcp_servers SET transport = ?2, endpoint = ?3 WHERE id = ?1",
                 params![id, transport, endpoint],
             )?;
-            return Ok(self
+            return self
                 .get_mcp_server(&id)?
-                .expect("mcp server must exist after update"));
+                .ok_or_else(|| anyhow::anyhow!("mcp server '{}' missing after update", id));
         }
         self.add_mcp_server(name, transport, endpoint)
     }
@@ -2682,6 +2909,499 @@ impl Database {
         }
         Ok(events)
     }
+
+    // ── Feature 1: Voice Config ────────────────────────────────────
+    pub fn get_voice_config(&self) -> Result<VoiceConfig> {
+        let raw = self.get_setting("voice_config")?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<VoiceConfig>(&s).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_voice_config(&self, cfg: &VoiceConfig) -> Result<()> {
+        let json = serde_json::to_string(cfg)?;
+        self.set_setting("voice_config", &json)
+    }
+
+    // ── Feature 2: Auto-Failover & Smart Quota Routing ─────────────
+    pub fn get_failover_config(&self, project_id: Option<&str>) -> Result<FailoverConfig> {
+        if let Some(pid) = project_id.filter(|s| !s.trim().is_empty()) {
+            let key = format!("failover_config:{}", pid);
+            if let Some(raw) = self.get_setting(&key)? {
+                if let Ok(cfg) = serde_json::from_str::<FailoverConfig>(&raw) {
+                    return Ok(cfg);
+                }
+            }
+        }
+        let raw = self.get_setting("failover_config")?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<FailoverConfig>(&s).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_failover_config(
+        &self,
+        project_id: Option<&str>,
+        cfg: &FailoverConfig,
+    ) -> Result<()> {
+        let key = match project_id.filter(|s| !s.trim().is_empty()) {
+            Some(pid) => format!("failover_config:{}", pid),
+            None => "failover_config".to_string(),
+        };
+        let json = serde_json::to_string(cfg)?;
+        self.set_setting(&key, &json)
+    }
+
+    // ── Feature 3: Checkpoint Rewind & Fork helpers ────────────────
+    pub fn truncate_after_checkpoint_counted(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+        turn_number: i64,
+    ) -> Result<usize> {
+        self.conn.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1 AND turn_number > ?2",
+            params![session_id, turn_number],
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT sort_order, checkpoint_json
+             FROM messages
+             WHERE session_id = ?1
+             ORDER BY sort_order ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+
+        let mut cutoff_sort_order: Option<i64> = None;
+        for row in rows {
+            let (sort_order, cp_json) = row?;
+            if let Some(json_str) = cp_json {
+                if let Ok(cp) = serde_json::from_str::<TurnCheckpoint>(&json_str) {
+                    if cp.id == checkpoint_id || cp.turn_number == turn_number {
+                        cutoff_sort_order = Some(sort_order);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let removed = if let Some(cutoff) = cutoff_sort_order {
+            self.conn.execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND sort_order > ?2",
+                params![session_id, cutoff],
+            )?
+        } else {
+            0
+        };
+
+        self.conn.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![session_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(removed)
+    }
+
+    pub fn find_message_index_for_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint_id: &str,
+        turn_number: i64,
+    ) -> Result<Option<usize>> {
+        let msgs = self.list_messages(session_id)?;
+        for (idx, m) in msgs.iter().enumerate() {
+            if let Some(ref cp) = m.checkpoint {
+                if cp.id == checkpoint_id || cp.turn_number == turn_number {
+                    return Ok(Some(idx));
+                }
+            }
+        }
+        Ok(if msgs.is_empty() { None } else { Some(msgs.len() - 1) })
+    }
+
+    // ── Feature 5: Global Full-Text Search (FTS5) ──────────────────
+    pub fn search_history(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        harness: Option<&str>,
+        source_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Build safe FTS5 prefix query from whitespace-separated tokens
+        let tokens: Vec<String> = trimmed
+            .split_whitespace()
+            .map(|t| {
+                let clean: String = t
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+                    .collect();
+                clean
+            })
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("\"{}\"*", t))
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query = tokens.join(" AND ");
+        let cap = limit.clamp(1, 100) as i64;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT si.kind, si.entity_id, si.session_id, si.project_id,
+                    COALESCE(p.name, '') AS project_name,
+                    si.title, si.harness,
+                    snippet(search_index, 6, '<mark>', '</mark>', '…', 20) AS snip,
+                    si.timestamp,
+                    COALESCE(s.is_discord, 0) AS is_discord
+             FROM search_index si
+             LEFT JOIN projects p ON p.id = si.project_id
+             LEFT JOIN sessions s ON s.id = si.session_id AND si.kind = 'message'
+             WHERE search_index MATCH ?1
+               AND (?2 IS NULL OR si.project_id = ?2)
+               AND (?3 IS NULL OR si.harness = ?3)
+               AND (?4 IS NULL
+                    OR (?4 = 'office' AND si.kind = 'office')
+                    OR (?4 = 'discord' AND si.kind = 'message' AND COALESCE(s.is_discord, 0) = 1)
+                    OR (?4 = 'chat' AND si.kind = 'message' AND COALESCE(s.is_discord, 0) = 0))
+             ORDER BY bm25(search_index)
+             LIMIT ?5",
+        )?;
+
+        let pid_opt = project_id.filter(|s| !s.trim().is_empty());
+        let harness_opt = harness.filter(|s| !s.trim().is_empty());
+        let src_opt = source_filter.filter(|s| !s.trim().is_empty() && *s != "all");
+
+        let rows = stmt.query_map(params![fts_query, pid_opt, harness_opt, src_opt, cap], |row| {
+            let is_disc: i64 = row.get(9)?;
+            Ok(SearchHit {
+                kind: row.get(0)?,
+                entity_id: row.get(1)?,
+                session_id: row.get(2)?,
+                project_id: row.get(3)?,
+                project_name: row.get(4)?,
+                session_title: row.get(5)?,
+                harness: row.get(6)?,
+                snippet: row.get(7)?,
+                timestamp: row.get(8)?,
+                is_discord: is_disc != 0,
+            })
+        })?;
+
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
+        }
+        Ok(hits)
+    }
+
+    // ── Feature 6: Office Blueprints ───────────────────────────────
+    pub fn list_office_blueprints(&self) -> Result<Vec<OfficeBlueprint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, is_builtin, config_json, created_at
+             FROM office_blueprints
+             ORDER BY is_builtin DESC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let is_builtin_int: i64 = row.get(3)?;
+            let cfg_json: String = row.get(4)?;
+            let config = serde_json::from_str::<OfficeBlueprintConfig>(&cfg_json)
+                .unwrap_or(OfficeBlueprintConfig { max_rounds: 6, staff: vec![] });
+            Ok(OfficeBlueprint {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                is_builtin: is_builtin_int != 0,
+                config,
+                created_at: row.get(5)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for row in rows {
+            list.push(row?);
+        }
+        Ok(list)
+    }
+
+    pub fn get_office_blueprint(&self, id_or_name: &str) -> Result<Option<OfficeBlueprint>> {
+        let q = id_or_name.trim();
+        let all = self.list_office_blueprints()?;
+        Ok(all
+            .into_iter()
+            .find(|b| b.id == q || b.name.eq_ignore_ascii_case(q)))
+    }
+
+    pub fn save_office_blueprint(
+        &self,
+        name: &str,
+        description: &str,
+        config: &OfficeBlueprintConfig,
+    ) -> Result<OfficeBlueprint> {
+        let id = format!("bp-{}", Uuid::new_v4());
+        let now = Utc::now().to_rfc3339();
+        let cfg_json = serde_json::to_string(config)?;
+        self.conn.execute(
+            "INSERT INTO office_blueprints (id, name, description, is_builtin, config_json, created_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            params![id, name.trim(), description.trim(), cfg_json, now],
+        )?;
+        Ok(OfficeBlueprint {
+            id,
+            name: name.trim().to_string(),
+            description: description.trim().to_string(),
+            is_builtin: false,
+            config: config.clone(),
+            created_at: now,
+        })
+    }
+
+    pub fn delete_office_blueprint(&self, id: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "DELETE FROM office_blueprints WHERE id = ?1 AND is_builtin = 0",
+            params![id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    // ── Feature 6: Token & Latency Telemetry Aggregation ───────────
+    pub fn get_telemetry_summary(&self, days: i64) -> Result<TelemetrySummary> {
+        let window_days = days.clamp(1, 90);
+        let cutoff = (Utc::now() - chrono::Duration::days(window_days)).to_rfc3339();
+
+        fn parse_tokens(raw: &str) -> i64 {
+            let mut total = 0i64;
+            for part in raw.split(|c: char| !c.is_ascii_digit() && c != '.' && c != 'k' && c != 'K' && c != 'm' && c != 'M') {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                if let Some(num) = p.strip_suffix('k').or_else(|| p.strip_suffix('K')) {
+                    if let Ok(v) = num.parse::<f64>() {
+                        total += (v * 1000.0) as i64;
+                    }
+                } else if let Some(num) = p.strip_suffix('m').or_else(|| p.strip_suffix('M')) {
+                    if let Ok(v) = num.parse::<f64>() {
+                        total += (v * 1_000_000.0) as i64;
+                    }
+                } else if let Ok(v) = p.parse::<i64>() {
+                    total += v;
+                }
+            }
+            total
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT ts.harness, ts.duration_ms, ts.tokens, ts.created_at,
+                    COALESCE(s.project_id, '') AS project_id,
+                    COALESCE(p.name, 'Unassigned') AS project_name
+             FROM trace_spans ts
+             LEFT JOIN sessions s ON s.id = ts.session_id
+             LEFT JOIN projects p ON p.id = s.project_id
+             WHERE ts.created_at >= ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut total_spans = 0i64;
+        let mut total_tokens = 0i64;
+        let mut total_duration_ms = 0i64;
+        let mut harness_map: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
+        let mut project_map: std::collections::HashMap<String, (String, i64, i64, i64)> = std::collections::HashMap::new();
+        let mut day_map: std::collections::BTreeMap<String, (i64, i64, i64)> = std::collections::BTreeMap::new();
+
+        for row in rows {
+            let (harness, dur, tok_str, created_at, pid, pname) = row?;
+            let toks = parse_tokens(&tok_str);
+            total_spans += 1;
+            total_tokens += toks;
+            total_duration_ms += dur.max(0);
+
+            let h_key = if harness.trim().is_empty() { "unknown".to_string() } else { harness };
+            let h_e = harness_map.entry(h_key).or_insert((0, 0, 0));
+            h_e.0 += 1;
+            h_e.1 += toks;
+            h_e.2 += dur.max(0);
+
+            let p_key = if pid.is_empty() { "none".to_string() } else { pid };
+            let p_e = project_map.entry(p_key).or_insert((pname, 0, 0, 0));
+            p_e.1 += 1;
+            p_e.2 += toks;
+            p_e.3 += dur.max(0);
+
+            let day: String = created_at.chars().take(10).collect();
+            if !day.is_empty() {
+                let d_e = day_map.entry(day).or_insert((0, 0, 0));
+                d_e.0 += 1;
+                d_e.1 += toks;
+                d_e.2 += dur.max(0);
+            }
+        }
+
+        let mut by_harness: Vec<TelemetryBucket> = harness_map
+            .into_iter()
+            .map(|(k, (s, t, d))| TelemetryBucket {
+                label: k.clone(),
+                key: k,
+                spans: s,
+                total_tokens: t,
+                total_duration_ms: d,
+                avg_duration_ms: if s > 0 { d / s } else { 0 },
+            })
+            .collect();
+        by_harness.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens).then_with(|| b.spans.cmp(&a.spans)));
+
+        let mut by_project: Vec<TelemetryBucket> = project_map
+            .into_iter()
+            .map(|(k, (label, s, t, d))| TelemetryBucket {
+                key: k,
+                label,
+                spans: s,
+                total_tokens: t,
+                total_duration_ms: d,
+                avg_duration_ms: if s > 0 { d / s } else { 0 },
+            })
+            .collect();
+        by_project.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens).then_with(|| b.spans.cmp(&a.spans)));
+
+        let by_day: Vec<TelemetryDayPoint> = day_map
+            .into_iter()
+            .map(|(day, (s, t, d))| TelemetryDayPoint {
+                day,
+                spans: s,
+                total_tokens: t,
+                total_duration_ms: d,
+            })
+            .collect();
+
+        Ok(TelemetrySummary {
+            total_spans,
+            total_tokens,
+            avg_duration_ms: if total_spans > 0 { total_duration_ms / total_spans } else { 0 },
+            total_duration_ms,
+            by_harness,
+            by_project,
+            by_day,
+        })
+    }
+
+    // ── Feature 7: Security & Audit Log ────────────────────────────
+    pub fn insert_audit_log(
+        &self,
+        source: &str,
+        action: &str,
+        status: &str,
+        summary: &str,
+        payload_json: Option<&str>,
+    ) -> Result<AuditLogEntry> {
+        let entry = AuditLogEntry {
+            id: format!("aud-{}", Uuid::new_v4()),
+            timestamp: Utc::now().to_rfc3339(),
+            source: source.to_string(),
+            action: action.to_string(),
+            status: status.to_string(),
+            summary: summary.to_string(),
+            payload_json: payload_json.map(|s| s.to_string()),
+        };
+        self.conn.execute(
+            "INSERT INTO audit_logs (id, timestamp, source, action, status, summary, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                entry.id,
+                entry.timestamp,
+                entry.source,
+                entry.action,
+                entry.status,
+                entry.summary,
+                entry.payload_json,
+            ],
+        )?;
+        Ok(entry)
+    }
+
+    pub fn list_audit_logs(
+        &self,
+        query: Option<&str>,
+        source: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AuditLogEntry>> {
+        let cap = limit.clamp(1, 200) as i64;
+        let q_like = query
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", s));
+        let src_opt = source.filter(|s| !s.trim().is_empty() && *s != "all");
+        let status_opt = status.filter(|s| !s.trim().is_empty() && *s != "all");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, source, action, status, summary, payload_json
+             FROM audit_logs
+             WHERE (?1 IS NULL OR summary LIKE ?1 OR action LIKE ?1)
+               AND (?2 IS NULL OR source = ?2)
+               AND (?3 IS NULL OR status = ?3)
+             ORDER BY timestamp DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![q_like, src_opt, status_opt, cap], |row| {
+            Ok(AuditLogEntry {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                source: row.get(2)?,
+                action: row.get(3)?,
+                status: row.get(4)?,
+                summary: row.get(5)?,
+                payload_json: row.get(6)?,
+            })
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    pub fn get_audit_log(&self, id: &str) -> Result<Option<AuditLogEntry>> {
+        let entry = self
+            .conn
+            .query_row(
+                "SELECT id, timestamp, source, action, status, summary, payload_json
+                 FROM audit_logs WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(AuditLogEntry {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        source: row.get(2)?,
+                        action: row.get(3)?,
+                        status: row.get(4)?,
+                        summary: row.get(5)?,
+                        payload_json: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(entry)
+    }
+
+    pub fn update_audit_log_status(&self, id: &str, status: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE audit_logs SET status = ?2 WHERE id = ?1",
+            params![id, status],
+        )?;
+        Ok(changed > 0)
+    }
 }
 
 #[cfg(test)]
@@ -2730,6 +3450,7 @@ mod tests {
             subagent: None,
             widget: None,
             checkpoint: None,
+            failover_notice: None,
         }
     }
 

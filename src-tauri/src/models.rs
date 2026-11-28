@@ -95,6 +95,8 @@ pub struct ChatMessage {
     pub widget: Option<InlineWidgetData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<TurnCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,4 +660,291 @@ pub struct UpdateStaffInput {
     pub isolated_worktree: Option<bool>,
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
+}
+
+// ── Feature 1: Voice Mode ──────────────────────────────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceConfig {
+    #[serde(default = "default_voice_engine")]
+    pub engine: String, // "auto" | "browser" | "whisper"
+    #[serde(default = "default_voice_lang")]
+    pub language: String,
+    #[serde(default)]
+    pub whisper_url: String,
+    #[serde(default = "default_whisper_model")]
+    pub whisper_model: String,
+    #[serde(default)]
+    pub whisper_cli_path: String,
+    #[serde(default)]
+    pub auto_send: bool,
+    #[serde(default = "default_silence_ms")]
+    pub silence_ms: u64,
+    #[serde(default)]
+    pub tts_enabled: bool,
+    #[serde(default)]
+    pub tts_voice: String,
+    #[serde(default = "default_tts_rate")]
+    pub tts_rate: f64,
+}
+
+fn default_voice_engine() -> String {
+    "auto".to_string()
+}
+fn default_voice_lang() -> String {
+    "en-US".to_string()
+}
+fn default_whisper_model() -> String {
+    "whisper-1".to_string()
+}
+fn default_silence_ms() -> u64 {
+    1500
+}
+fn default_tts_rate() -> f64 {
+    1.05
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            engine: default_voice_engine(),
+            language: default_voice_lang(),
+            whisper_url: String::new(),
+            whisper_model: default_whisper_model(),
+            whisper_cli_path: String::new(),
+            auto_send: false,
+            silence_ms: default_silence_ms(),
+            tts_enabled: false,
+            tts_voice: String::new(),
+            tts_rate: default_tts_rate(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeResult {
+    pub text: String,
+    pub engine: String,
+    pub duration_ms: i64,
+}
+
+// ── Feature 2: Auto-Failover & Smart Quota Routing ─────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverTarget {
+    pub harness: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_quota_threshold")]
+    pub quota_threshold_pct: i64,
+    #[serde(default = "default_true")]
+    pub rotate_accounts_same_harness: bool,
+    #[serde(default)]
+    pub fallback_chain: Vec<FailoverTarget>,
+}
+
+fn default_quota_threshold() -> i64 {
+    90
+}
+
+impl Default for FailoverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            quota_threshold_pct: 90,
+            rotate_accounts_same_harness: true,
+            fallback_chain: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnFailoverEvent {
+    pub session_id: String,
+    pub message_id: String,
+    pub from_harness: String,
+    pub from_account: String,
+    pub to_harness: String,
+    pub to_account: String,
+    pub to_model: String,
+    pub reason: String,
+    pub hop: u8,
+    pub notice: String,
+}
+
+// ── Feature 3: Checkpoint Rewind ───────────────────────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindResult {
+    pub session: Session,
+    pub stashed: bool,
+    pub stash_ref: Option<String>,
+    pub removed_messages: usize,
+    pub reset_git: bool,
+}
+
+// ── Feature 4: Multi-Harness Parallel Race Mode ────────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaceContestantInput {
+    pub harness: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaceContestant {
+    pub session_id: String,
+    pub harness: String,
+    pub model: String,
+    pub branch: String,
+    pub worktree_path: String,
+    #[serde(default)]
+    pub worktree_slug: String,
+    pub status: String, // "running" | "done" | "error" | "merged"
+    pub output: String,
+    pub duration_ms: i64,
+    pub files_changed: i64,
+    pub additions: i64,
+    pub deletions: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaceRun {
+    pub id: String,
+    pub project_id: String,
+    pub base_branch: String,
+    pub base_cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_distro: Option<String>,
+    pub prompt: String,
+    pub status: String, // "running" | "completed" | "merged"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_cmd: Option<String>,
+    pub created_at: String,
+    pub contestants: Vec<RaceContestant>,
+}
+
+// ── Feature 5: Global Full-Text Search (FTS5) ──────────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub kind: String, // "message" | "office"
+    pub entity_id: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub session_title: String,
+    pub harness: String,
+    pub snippet: String,
+    pub timestamp: String,
+    pub is_discord: bool,
+}
+
+// ── Feature 6: Office Blueprints & Telemetry ───────────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeBlueprintStaff {
+    pub name: String,
+    pub role: String,
+    pub is_master: bool,
+    pub harness: String,
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+    #[serde(default)]
+    pub permission_mode: String,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub isolated_worktree: bool,
+    #[serde(default)]
+    pub avatar_color: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeBlueprintConfig {
+    #[serde(default)]
+    pub max_rounds: i64,
+    pub staff: Vec<OfficeBlueprintStaff>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeBlueprint {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub is_builtin: bool,
+    pub config: OfficeBlueprintConfig,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryBucket {
+    pub key: String,
+    pub label: String,
+    pub spans: i64,
+    pub total_tokens: i64,
+    pub total_duration_ms: i64,
+    pub avg_duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryDayPoint {
+    pub day: String,
+    pub spans: i64,
+    pub total_tokens: i64,
+    pub total_duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetrySummary {
+    pub total_spans: i64,
+    pub total_tokens: i64,
+    pub avg_duration_ms: i64,
+    pub total_duration_ms: i64,
+    pub by_harness: Vec<TelemetryBucket>,
+    pub by_project: Vec<TelemetryBucket>,
+    pub by_day: Vec<TelemetryDayPoint>,
+}
+
+// ── Feature 7: Security & Audit Log ────────────────────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditLogEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub source: String, // "desktop" | "remote" | "discord" | "automation"
+    pub action: String,
+    pub status: String, // "allowed" | "blocked" | "approved" | "denied"
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_json: Option<String>,
 }

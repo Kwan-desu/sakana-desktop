@@ -118,9 +118,23 @@ pub fn write_env_entries(entries: &[(String, String)]) -> Result<(), String> {
     let path = resolve_env_path();
     let mut out = String::new();
     for (k, v) in entries {
-        out.push_str(&format!("{k}={v}\n"));
+        let key = k.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let safe_val: String = v
+            .chars()
+            .filter(|&c| c != '\n' && c != '\r' && c != '\0')
+            .collect();
+        out.push_str(&format!("{key}={safe_val}\n"));
     }
-    std::fs::write(&path, out).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+    std::fs::write(&path, out).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// Look up an environment variable from the process environment first, then app-managed `.env`.
@@ -142,17 +156,54 @@ pub fn get_env_or_dotenv(key: &str) -> Option<String> {
     None
 }
 
+/// On Windows, attempt to resolve an npm-generated `.cmd` shim directly to `(node_exe, script_js)`
+/// so arguments are passed straight to `node.exe` without `cmd.exe /C` metacharacter parsing.
+#[cfg(target_os = "windows")]
+fn resolve_npm_cmd_shim(program: &str) -> Option<(PathBuf, PathBuf)> {
+    let shim_path = Path::new(program);
+    let shim_dir = shim_path.parent()?;
+    let content = std::fs::read_to_string(shim_path).ok()?;
+    // Standard npm shims contain: "%_prog%"  "%dp0%\node_modules\...\cli.js" %*
+    for line in content.lines() {
+        let Some(idx) = line.find("%dp0%\\").or_else(|| line.find("%dp0%/")) else {
+            continue;
+        };
+        let after = &line[idx + 6..];
+        let Some(end) = after.find('"') else {
+            continue;
+        };
+        let rel = after[..end].replace('/', "\\");
+        let script = shim_dir.join(&rel);
+        if script.is_file() {
+            let local_node = shim_dir.join("node.exe");
+            let node_exe = if local_node.is_file() {
+                local_node
+            } else {
+                PathBuf::from("node.exe")
+            };
+            return Some((node_exe, script));
+        }
+    }
+    None
+}
+
 /// Build a cross-platform `tokio::process::Command` that:
-/// - Wraps `.cmd` / `.bat` shims via `cmd /C` on Windows
+/// - Resolves npm `.cmd` shims directly to `node.exe <script>` on Windows (avoiding `cmd /C` injection)
 /// - Sets `CREATE_NO_WINDOW` (`0x0800_0000`) on Windows so no console window flashes
 pub fn tokio_command(program: &str) -> tokio::process::Command {
     #[cfg(target_os = "windows")]
     {
         let lower = program.to_ascii_lowercase();
         let mut cmd = if lower.ends_with(".cmd") || lower.ends_with(".bat") {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(program);
-            c
+            if let Some((node_exe, script)) = resolve_npm_cmd_shim(program) {
+                let mut c = tokio::process::Command::new(node_exe);
+                c.arg(script);
+                c
+            } else {
+                let mut c = tokio::process::Command::new("cmd");
+                c.arg("/C").arg(program);
+                c
+            }
         } else {
             tokio::process::Command::new(program)
         };
@@ -165,16 +216,22 @@ pub fn tokio_command(program: &str) -> tokio::process::Command {
     }
 }
 
-/// Build a cross-platform `std::process::Command` with `.cmd`/`.bat` handling and `CREATE_NO_WINDOW` on Windows.
+/// Build a cross-platform `std::process::Command` with direct npm `.cmd` resolution and `CREATE_NO_WINDOW` on Windows.
 pub fn std_command(program: &str) -> std::process::Command {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         let lower = program.to_ascii_lowercase();
         let mut cmd = if lower.ends_with(".cmd") || lower.ends_with(".bat") {
-            let mut c = std::process::Command::new("cmd");
-            c.arg("/C").arg(program);
-            c
+            if let Some((node_exe, script)) = resolve_npm_cmd_shim(program) {
+                let mut c = std::process::Command::new(node_exe);
+                c.arg(script);
+                c
+            } else {
+                let mut c = std::process::Command::new("cmd");
+                c.arg("/C").arg(program);
+                c
+            }
         } else {
             std::process::Command::new(program)
         };

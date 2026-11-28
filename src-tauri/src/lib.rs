@@ -1,3 +1,4 @@
+pub mod acp_pool;
 pub mod auth;
 pub mod automation;
 pub mod db;
@@ -180,7 +181,12 @@ async fn update_session(
 }
 
 #[tauri::command]
-async fn delete_session(state: State<'_, DbState>, id: String) -> Result<bool, String> {
+async fn delete_session(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    id: String,
+) -> Result<bool, String> {
+    acp_pool::sleep_session_inner(Some(&app), &id).await;
     let db = state.0.lock().await;
     db.delete_session(&id).map_err(|e| e.to_string())
 }
@@ -511,6 +517,10 @@ pub fn run() {
             save_clipboard_attachment,
             harness::send_turn,
             harness::cancel_turn,
+            acp_pool::list_awake_sessions,
+            acp_pool::sleep_session,
+            acp_pool::sleep_all_sessions,
+            acp_pool::wake_session,
             harness::compact_session,
             harness::get_compaction_config,
             harness::update_compaction_config,
@@ -634,6 +644,11 @@ pub fn run() {
             office::delete_office_blueprint,
             office::create_office_from_blueprint,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Sakana");
+        .build(tauri::generate_context!())
+        .expect("error while building Sakana")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                tauri::async_runtime::block_on(acp_pool::sleep_all_sessions_inner(None));
+            }
+        });
 }

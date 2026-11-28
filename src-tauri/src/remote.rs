@@ -621,6 +621,24 @@ async fn dispatch_rpc(ctx: &ServerContext, cmd: &str, args: Value) -> Result<Val
             }
             Ok(Value::Null)
         }
+        "list_awake_sessions" => {
+            let list = crate::acp_pool::list_awake_sessions_inner().await;
+            serde_json::to_value(list).map_err(|e| e.to_string())
+        }
+        "sleep_session" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let slept = crate::acp_pool::sleep_session_inner(ctx.app.as_ref(), &session_id).await;
+            Ok(json!(slept))
+        }
+        "sleep_all_sessions" => {
+            let count = crate::acp_pool::sleep_all_sessions_inner(ctx.app.as_ref()).await;
+            Ok(json!(count))
+        }
+        "wake_session" => {
+            let session_id = get_str(&args, "sessionId").or_else(|_| get_str(&args, "session_id"))?;
+            let awake = crate::acp_pool::wake_session_inner(ctx.app.as_ref(), &ctx.db, &session_id).await?;
+            Ok(json!(awake))
+        }
         "list_harness_models" => {
             let refresh = args.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
             let models = crate::harness::list_harness_models_with_db(&ctx.db, refresh).await?;

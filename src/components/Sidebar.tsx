@@ -16,8 +16,10 @@ import {
   GitBranch,
   GithubLogo,
   Globe,
+  Lightning,
   ListChecks,
   MagnifyingGlass,
+  Moon,
   PencilSimple,
   Play,
   Plugs,
@@ -51,6 +53,9 @@ interface SidebarProps {
   onSwitchSection: (sec: PrimarySection) => void;
   projects: Project[];
   threads: Thread[];
+  awakeSessionIds?: string[];
+  onSleepSession?: (id: string) => Promise<void> | void;
+  onWakeSession?: (id: string) => Promise<void> | void;
   selectedThreadId: string;
   onSelectThread: (id: string) => void;
   onQuickNewThread: (projectId?: string) => Promise<void> | void;
@@ -106,6 +111,9 @@ export function Sidebar({
   onSwitchSection,
   projects,
   threads,
+  awakeSessionIds = [],
+  onSleepSession,
+  onWakeSession,
   selectedThreadId,
   onSelectThread,
   onQuickNewThread,
@@ -1336,6 +1344,19 @@ export function Sidebar({
                                       style={{ color: active ? 'var(--text-body)' : 'var(--text-muted)' }}
                                     >
                                       <HarnessIcon harness={t.harness} size={11} />
+                                      {awakeSessionIds.includes(t.id) && (
+                                        <span
+                                          className="inline-flex items-center gap-0.5 px-1 py-0.2 rounded-[4px] text-[9px] font-medium shrink-0"
+                                          style={{
+                                            backgroundColor: 'var(--accent-green-bg)',
+                                            color: 'var(--accent-green)',
+                                          }}
+                                          title="Persistent agy-cli ACP worker is awake & warm"
+                                        >
+                                          <Lightning size={8} weight="fill" />
+                                          <span>Awake</span>
+                                        </span>
+                                      )}
                                       {t.isDiscord ? (
                                         <DiscordIcon size={10} style={{ color: 'var(--accent-discord)' }} />
                                       ) : (
@@ -1953,6 +1974,35 @@ export function Sidebar({
             </div>
           )}
           <div className="my-0.5 border-t" style={{ borderColor: 'var(--border-line)' }} />
+          {awakeSessionIds.includes(threadCtxMenu.thread.id) && onSleepSession ? (
+            <button
+              type="button"
+              onClick={() => {
+                const id = threadCtxMenu.thread.id;
+                setThreadCtxMenu(null);
+                void onSleepSession(id);
+              }}
+              className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+              style={{ color: 'var(--text-main)' }}
+            >
+              <Moon size={13} style={{ color: 'var(--accent-amber)' }} />
+              <span>Put thread to sleep</span>
+            </button>
+          ) : threadCtxMenu.thread.harness === 'agy-cli' && onWakeSession ? (
+            <button
+              type="button"
+              onClick={() => {
+                const id = threadCtxMenu.thread.id;
+                setThreadCtxMenu(null);
+                void onWakeSession(id);
+              }}
+              className="w-full px-2.5 py-1.5 rounded-[6px] text-[12px] flex items-center gap-2 cursor-pointer hover:bg-[var(--bg-hover)]"
+              style={{ color: 'var(--text-main)' }}
+            >
+              <Lightning size={13} style={{ color: 'var(--accent-green)' }} />
+              <span>Wake persistent worker</span>
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={() => {

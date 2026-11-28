@@ -403,17 +403,17 @@ fn parse_sakana_ui_widget(text: &str) -> Option<InlineWidgetData> {
     })
 }
 
-struct TurnAccumulator {
-    text: String,
-    thinking: String,
-    thinking_ms: i64,
-    tools: Vec<ToolCall>,
-    subagent: Option<SubagentInfo>,
-    stream_error: Option<String>,
-    input_tokens: i64,
-    output_tokens: i64,
-    cost_usd: f64,
-    failover_notice: Option<String>,
+pub(crate) struct TurnAccumulator {
+    pub(crate) text: String,
+    pub(crate) thinking: String,
+    pub(crate) thinking_ms: i64,
+    pub(crate) tools: Vec<ToolCall>,
+    pub(crate) subagent: Option<SubagentInfo>,
+    pub(crate) stream_error: Option<String>,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cost_usd: f64,
+    pub(crate) failover_notice: Option<String>,
 }
 
 impl TurnAccumulator {
@@ -513,7 +513,7 @@ pub async fn update_failover_config(
     update_failover_config_inner(&db_state.0, project_id, config).await
 }
 
-fn emit_token(app: Option<&AppHandle>, session_id: &str, message_id: &str, token: &str, acc: &mut TurnAccumulator) {
+pub(crate) fn emit_token(app: Option<&AppHandle>, session_id: &str, message_id: &str, token: &str, acc: &mut TurnAccumulator) {
     if token.is_empty() {
         return;
     }
@@ -529,7 +529,7 @@ fn emit_token(app: Option<&AppHandle>, session_id: &str, message_id: &str, token
     );
 }
 
-fn emit_thinking(
+pub(crate) fn emit_thinking(
     app: Option<&AppHandle>,
     session_id: &str,
     message_id: &str,
@@ -554,7 +554,7 @@ fn emit_thinking(
     );
 }
 
-fn emit_tool(app: Option<&AppHandle>, session_id: &str, message_id: &str, tool: ToolCall, acc: &mut TurnAccumulator) {
+pub(crate) fn emit_tool(app: Option<&AppHandle>, session_id: &str, message_id: &str, tool: ToolCall, acc: &mut TurnAccumulator) {
     if let Some(existing) = acc.tools.iter_mut().find(|t| t.id == tool.id) {
         *existing = tool.clone();
     } else {
@@ -872,6 +872,7 @@ async fn run_cli_harness(
     crate::auth::apply_account_env(&mut cmd, harness, account);
     cmd.current_dir(cwd)
         .kill_on_drop(true)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -994,7 +995,7 @@ async fn run_cli_harness(
     Ok(())
 }
 
-fn wsl_posix_cwd(cwd: &str) -> String {
+pub(crate) fn wsl_posix_cwd(cwd: &str) -> String {
     if let Some((_, linux_path)) = crate::platform::parse_wsl_path(cwd) {
         linux_path
     } else {
@@ -1002,7 +1003,7 @@ fn wsl_posix_cwd(cwd: &str) -> String {
     }
 }
 
-fn build_wsl_env_exports(
+pub(crate) fn build_wsl_env_exports(
     harness: &str,
     account: Option<&crate::models::HarnessAccountRow>,
 ) -> Vec<String> {
@@ -1151,7 +1152,7 @@ async fn run_wsl_cli_harness(
     let posix_cwd = wsl_posix_cwd(cwd);
     let mut cmd = crate::platform::wsl_tokio_shell(distro, &posix_cwd, &cli_cmd);
     crate::auth::apply_account_env(&mut cmd, harness, account);
-    cmd.kill_on_drop(true).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn {} in WSL ({}): {}", harness, distro, e))?;
@@ -2153,6 +2154,26 @@ pub async fn send_turn_with_options(
                         attempt_cancel_rx,
                     )
                     .await
+                } else if cur_harness == "agy-cli" && cross_cmd.is_none() {
+                    crate::acp_pool::run_persistent_agy_turn(
+                        None,
+                        Some(distro.as_str()),
+                        cur_account.as_ref(),
+                        &resolved_model,
+                        &resolved_effort,
+                        &session.permission_mode,
+                        &enabled_mcp_servers,
+                        &effective_cwd,
+                        &full_prompt_with_ctx,
+                        &effective_prompt,
+                        app_handle.as_ref(),
+                        &sid,
+                        &msg_id_clone,
+                        started,
+                        &mut acc,
+                        attempt_cancel_rx,
+                    )
+                    .await
                 } else {
                     run_wsl_cli_harness(
                         distro,
@@ -2174,24 +2195,46 @@ pub async fn send_turn_with_options(
                     .await
                 }
             } else if let Some(bin) = resolve_harness_binary(&cur_harness) {
-                run_cli_harness(
-                    &bin,
-                    &cur_harness,
-                    cur_account.as_ref(),
-                    &resolved_model,
-                    &resolved_effort,
-                    &session.permission_mode,
-                    &enabled_mcp_servers,
-                    &effective_cwd,
-                    &full_prompt_with_ctx,
-                    app_handle.as_ref(),
-                    &sid,
-                    &msg_id_clone,
-                    started,
-                    &mut acc,
-                    attempt_cancel_rx,
-                )
-                .await
+                if cur_harness == "agy-cli" && cross_cmd.is_none() {
+                    crate::acp_pool::run_persistent_agy_turn(
+                        Some(&bin),
+                        None,
+                        cur_account.as_ref(),
+                        &resolved_model,
+                        &resolved_effort,
+                        &session.permission_mode,
+                        &enabled_mcp_servers,
+                        &effective_cwd,
+                        &full_prompt_with_ctx,
+                        &effective_prompt,
+                        app_handle.as_ref(),
+                        &sid,
+                        &msg_id_clone,
+                        started,
+                        &mut acc,
+                        attempt_cancel_rx,
+                    )
+                    .await
+                } else {
+                    run_cli_harness(
+                        &bin,
+                        &cur_harness,
+                        cur_account.as_ref(),
+                        &resolved_model,
+                        &resolved_effort,
+                        &session.permission_mode,
+                        &enabled_mcp_servers,
+                        &effective_cwd,
+                        &full_prompt_with_ctx,
+                        app_handle.as_ref(),
+                        &sid,
+                        &msg_id_clone,
+                        started,
+                        &mut acc,
+                        attempt_cancel_rx,
+                    )
+                    .await
+                }
             } else if cur_harness == "sakana" {
                 run_http_sse_fallback(
                     &effective_cwd,
@@ -2992,7 +3035,7 @@ pub fn resolve_agy_model_and_effort(
     (Some(entry.id.clone()), resolved_effort)
 }
 
-async fn resolve_agy_model_and_effort_with_db(
+pub(crate) async fn resolve_agy_model_and_effort_with_db(
     db: &Arc<Mutex<crate::db::Database>>,
     model: &str,
     effort: &str,

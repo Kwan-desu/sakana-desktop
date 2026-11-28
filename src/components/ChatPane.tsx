@@ -17,8 +17,10 @@ import {
   ArrowsLeftRight,
   GitBranch,
   GitFork,
+  Lightning,
   Microphone,
   MicrophoneSlash,
+  Moon,
   Paperclip,
   PencilSimple,
   Plus,
@@ -49,6 +51,9 @@ import { DiscordIcon, HARNESS_META, HarnessIcon } from './HarnessBadge';
 
 interface ChatPaneProps {
   thread: Thread;
+  isAwake?: boolean;
+  onSleepSession?: (threadId: string) => void | Promise<void>;
+  onWakeSession?: (threadId: string) => void | Promise<void>;
   secondaryThread?: Thread;
   secondaryThreadId?: string;
   onSelectSecondaryThread?: (id: string) => void;
@@ -1486,6 +1491,9 @@ const MessageRow = memo(function MessageRow({
 
 export function ChatPane({
   thread,
+  isAwake = false,
+  onSleepSession,
+  onWakeSession,
   secondaryThread,
   secondaryThreadId,
   onSelectSecondaryThread,
@@ -2088,6 +2096,36 @@ export function ChatPane({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {thread.id !== 'empty' && (isAwake || thread.harness === 'agy-cli') && (
+            isAwake ? (
+              <button
+                type="button"
+                onClick={() => onSleepSession?.(thread.id)}
+                className="px-2 py-1 rounded-[6px] border text-[11px] font-medium inline-flex items-center gap-1.5 cursor-pointer transition-colors hover:opacity-85"
+                style={{
+                  backgroundColor: 'var(--accent-green-bg)',
+                  borderColor: 'var(--accent-green)',
+                  color: 'var(--accent-green)',
+                }}
+                title="Persistent agy-cli ACP worker is awake & warm (prompt cache preserved) — click to put to sleep"
+                aria-label="Session is awake; click to put to sleep"
+              >
+                <Lightning size={12} weight="fill" />
+                <span>Awake</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onWakeSession?.(thread.id)}
+                className="btn-ghost px-2 py-1 text-[11px] font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                title="agy-cli worker is asleep — click to pre-warm persistent ACP session"
+                aria-label="Session is asleep; click to wake"
+              >
+                <Moon size={12} />
+                <span className="hidden sm:inline">Asleep</span>
+              </button>
+            )
+          )}
           {onCompactThread && thread.id !== 'empty' && thread.messages.length > 0 && (
             <button
               type="button"

@@ -154,6 +154,7 @@ export default function App() {
 
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
+  const [awakeSessionIds, setAwakeSessionIds] = useState<string[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string>('');
   const [secondaryThreadId, setSecondaryThreadId] = useState<string>('');
   const [harnessModels, setHarnessModels] = useState<Record<string, HarnessModelOption[]>>({});
@@ -402,6 +403,7 @@ export default function App() {
       setOffices([]);
       setSelectedOfficeId('');
       setOfficeDelegations([]);
+      setAwakeSessionIds([]);
       if (isTauriRuntime()) {
         try {
           if (target === 'local') {
@@ -423,6 +425,14 @@ export default function App() {
         const models = await tauriApi.listHarnessModels();
         if (reqId === switchHostReqRef.current && models && Object.keys(models).length > 0) {
           setHarnessModels(models);
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        const awakeIds = await tauriApi.listAwakeSessions();
+        if (reqId === switchHostReqRef.current && Array.isArray(awakeIds)) {
+          setAwakeSessionIds(awakeIds);
         }
       } catch {
         // ignore
@@ -638,6 +648,12 @@ export default function App() {
         if (st) setSyncStatus(st);
       })
       .catch(() => {});
+    void tauriApi
+      .listAwakeSessions()
+      .then((ids) => {
+        if (Array.isArray(ids)) setAwakeSessionIds(ids);
+      })
+      .catch(() => {});
   }, [applyCustomizationToDom]);
 
   const handleOpenFileInSidebar = useCallback((path: string) => {
@@ -654,6 +670,29 @@ export default function App() {
       console.error('set_theme failed:', err);
     });
   };
+
+  const handleSleepSession = useCallback(async (sessionId: string) => {
+    if (!isTauriRuntime()) return;
+    try {
+      await tauriApi.sleepSession(sessionId);
+      setAwakeSessionIds((prev) => prev.filter((id) => id !== sessionId));
+      showToast('Session put to sleep');
+    } catch (err) {
+      showToast(`Sleep failed: ${String(err)}`);
+    }
+  }, []);
+
+  const handleWakeSession = useCallback(async (sessionId: string) => {
+    if (!isTauriRuntime()) return;
+    try {
+      showToast('Waking persistent agy-cli worker…');
+      await tauriApi.wakeSession(sessionId);
+      setAwakeSessionIds((prev) => (prev.includes(sessionId) ? prev : [...prev, sessionId]));
+      showToast('Session is now awake');
+    } catch (err) {
+      showToast(`Wake failed: ${String(err)}`);
+    }
+  }, []);
 
   const activeThread: Thread =
     threads.find((t) => t.id === selectedThreadId) ||
@@ -1316,6 +1355,14 @@ export default function App() {
         tauriApi.onNotify(({ title, body }) => {
           showToast(body ? `${title}: ${body}` : title);
         }),
+        tauriApi.onSessionAwakeChanged(({ sessionId, awake }) => {
+          setAwakeSessionIds((prev) => {
+            if (awake) {
+              return prev.includes(sessionId) ? prev : [...prev, sessionId];
+            }
+            return prev.filter((id) => id !== sessionId);
+          });
+        }),
         tauriApi.onPeerMessage((payload) => {
           const sp = splitStateRef.current;
           if (!sp.splitView || !sp.splitBridgeEnabled) return;
@@ -1904,6 +1951,9 @@ export default function App() {
         onSwitchSection={setPrimarySection}
         projects={projects}
         threads={threads}
+        awakeSessionIds={awakeSessionIds}
+        onSleepSession={handleSleepSession}
+        onWakeSession={handleWakeSession}
         selectedThreadId={activeThread.id}
         onSelectThread={(id) => {
           setSelectedThreadId(id);
@@ -2003,6 +2053,9 @@ export default function App() {
           <ErrorBoundary paneName="Chat">
             <ChatPane
               thread={activeThread}
+            isAwake={awakeSessionIds.includes(activeThread.id)}
+            onSleepSession={handleSleepSession}
+            onWakeSession={handleWakeSession}
             secondaryThread={secondaryThread}
             secondaryThreadId={secondaryThread?.id}
             onSelectSecondaryThread={setSecondaryThreadId}

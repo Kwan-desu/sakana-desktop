@@ -1057,4 +1057,21 @@ export const tauriApi = {
       summary,
       payloadJson: payloadJson ?? null,
     }),
+
+  // Persistent ACP Session Pool (Warm/Awake Threads)
+  listAwakeSessions: async (): Promise<string[]> =>
+    (await tauriInvoke<string[]>('list_awake_sessions')) ?? [],
+
+  sleepSession: async (sessionId: string): Promise<boolean> =>
+    (await tauriInvoke<boolean>('sleep_session', { sessionId })) ?? false,
+
+  sleepAllSessions: async (): Promise<number> =>
+    (await tauriInvoke<number>('sleep_all_sessions')) ?? 0,
+
+  wakeSession: async (sessionId: string): Promise<boolean> =>
+    (await tauriInvoke<boolean>('wake_session', { sessionId })) ?? false,
+
+  onSessionAwakeChanged: (
+    handler: (payload: { sessionId: string; awake: boolean }) => void,
+  ) => tauriListen<{ sessionId: string; awake: boolean }>('session:awake-changed', handler),
 };
